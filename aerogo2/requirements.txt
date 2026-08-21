@@ -1,0 +1,12 @@
+PyYAML>=6.0,<7
+prompt-toolkit>=3.0,<4
+rich>=13.0,<15
+pymavlink>=2.4,<3
+pyserial>=3.5,<4
+pyserial-asyncio>=0.6,<1
+pytest>=7.4,<9
+pytest-asyncio>=0.21,<1
+mypy>=1.8,<1.15
+ruff>=0.5,<1
+types-PyYAML>=6.0,<7
+

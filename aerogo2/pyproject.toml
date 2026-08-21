@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aerogo2"
+version = "0.3.2"
+description = "Safety-first simulation and supervised hardware console for the AeroGo2 dual-mode robot"
+readme = {file = "PACKAGE_README.md", content-type = "text/markdown"}
+requires-python = ">=3.8"
+license = {text = "LicenseRef-Proprietary"}
+authors = [{name = "AeroGo2 Project"}]
+dependencies = [
+  "PyYAML>=6.0,<7",
+  "prompt-toolkit>=3.0,<4",
+  "rich>=13.0,<15",
+  "pymavlink>=2.4,<3",
+  "pyserial>=3.5,<4",
+  "pyserial-asyncio>=0.6,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.8,<1.15",
+  "pytest>=7.4,<9",
+  "pytest-asyncio>=0.21,<1",
+  "ruff>=0.5,<1",
+  "types-PyYAML>=6.0,<7",
+]
+
+[project.scripts]
+aerogo2 = "aerogo2.main:main"
+aerogo2-configure-landing = "aerogo2.tools.configure_landing_compliance:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+aerogo2 = ["default_configs/*.yaml"]
+
+[tool.setuptools.data-files]
+"share/aerogo2/ardupilot" = ["ardupilot/scripts/aerogo2_arm_gate.lua"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --basetemp=.pytest-tmp"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py38"
+line-length = 100
+extend-exclude = ["../motor_main.c", ".pytest-tmp", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+ignore = ["UP006", "UP007", "UP035", "UP045", "ASYNC240", "E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.8"
+files = ["src/aerogo2"]
+strict = true
+warn_unused_ignores = true
+show_error_codes = true
+

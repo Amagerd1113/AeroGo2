@@ -1,0 +1,2 @@
+# Keep a binary wheel available on the Python 3.8/aarch64 deployment target.
+lxml==5.3.2

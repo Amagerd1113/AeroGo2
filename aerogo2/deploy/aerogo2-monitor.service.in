@@ -1,0 +1,31 @@
+[Unit]
+Description=AeroGo2 fail-closed hardware telemetry monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@AEROGO2_USER@
+Group=@AEROGO2_GROUP@
+SupplementaryGroups=dialout
+EnvironmentFile=@AEROGO2_ENV@
+WorkingDirectory=@AEROGO2_ROOT@
+ExecStart=@AEROGO2_ROOT@/venv/bin/aerogo2 monitor --config @AEROGO2_CONFIG@ --confirm-hardware I_UNDERSTAND_HARDWARE_RISK
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=@AEROGO2_LOG@
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+state=LIMIT_REACHED_FWD duty=0 manual_limit=350 sense=max R_IS=123/99mV L_IS=456/367mV used=456/367mV threshold=1800/1450mV blank=500ms overms=180ms timeout=5000ms over_active=0
+FORWARD LIMIT REACHED: IS_max=1900 (1531mV), threshold=1800 (1450mV)
+state=LIMIT_REACHED_REV duty=0 manual_limit=350 sense=max R_IS=95/76mV L_IS=101/81mV used=101/81mV threshold=1800/1450mV blank=500ms overms=180ms timeout=5000ms over_active=0
+REVERSE LIMIT REACHED: IS_max=1900 (1531mV), threshold=1800 (1450mV)
+FAULT: move timeout
+fault=move timeout

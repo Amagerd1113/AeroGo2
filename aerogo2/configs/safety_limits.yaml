@@ -1,0 +1,16 @@
+safety:
+  stationary_velocity_mps: 0.05
+  stationary_confirm_s: 1.0
+  maximum_safe_esc_rpm_for_transform: 50
+  touchdown_confirm_s: 2.0
+  touchdown_max_vertical_speed_mps: 0.1
+  touchdown_max_tilt_rad: 0.2
+  touchdown_max_height_delta_m: 0.02
+  touchdown_max_esc_rpm: 50.0
+  pixhawk_timeout_s: 1.0
+  f446_timeout_s: 0.5
+  go2_timeout_s: 0.5
+  rc_timeout_s: 0.5
+  controller_timeout_s: 0.1
+  maximum_transform_current_adc: 1600
+

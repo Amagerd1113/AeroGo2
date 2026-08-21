@@ -1,0 +1,1854 @@
+diff --git a/base/configs/system.yaml b/target/configs/system.yaml
+index 68727fc..5c10f25 100644
+--- a/base/configs/system.yaml
++++ b/target/configs/system.yaml
+@@ -18,6 +18,13 @@ go2:
+   domain_id: 0
+   sport_state_topic: "rt/sportmodestate"
+   command_timeout_s: 2.0
++  # Keep disabled until all four raw foot-force channels have been calibrated
++  # on this exact robot. Threshold order is the SDK foot_force[0..3] order.
++  landing_compliance_enabled: false
++  foot_force_contact_thresholds: [0, 0, 0, 0]
++  landing_contact_min_feet: 3
++  landing_contact_confirm_s: 0.5
++  landing_compliance_settle_s: 1.5
+ 
+ esc:
+   # Hobbywing NodeID/ThrottleID/output order validated by pixhawk_x8_cli_diag.py:
+@@ -26,3 +33,4 @@ esc:
+   slot_2: "LF"
+   slot_3: "LR"
+   slot_4: "RF"
++
+diff --git a/target/docs/RELEASE_0.3.2_ZH.md b/target/docs/RELEASE_0.3.2_ZH.md
+new file mode 100644
+index 0000000..f023d9f
+--- /dev/null
++++ b/target/docs/RELEASE_0.3.2_ZH.md
+@@ -0,0 +1,131 @@
++# AeroGo2 0.3.2 真机部署与落地适应操作
++
++本文所有终端命令均为单行。0.3.2 包含从 0.3.0 起的全部运行时修改，包括 F446 慢速逐字节串口、高层 Go2 飞行关节锁、两把钥匙 Arm、ESC 遥测一致性修复，以及本次受控落地适应。
++
++## 安全边界
++
++- 真机自动降落 setpoint 仍未开放；降落、Arm 和 Disarm 继续由 RadioMaster/Pixhawk 完成。
++- 首次触地仍保持 `JOINT_LOCK`。只有 Pixhawk landed、RadioMaster 已 Disarm、四个配置的 X8 全部在线健康且 RPM 精确为 0、F446 停止无故障、脚底压力满足校准条件时才进入 `BalanceStand`。
++- `LANDING_COMPLIANT` 期间 Unitree 原装遥控保持禁用。`transform walk` 会先恢复并确认 mode=6 `JOINT_LOCK`，然后才允许 F446 动作。
++- 任一 X8 缺失或离线都禁止进入落地适应和形态转换。三脚接触是 Go2 四个脚底传感器中的最少接触数，不代表允许只安装三个 X8。
++- 未校准时功能默认关闭；四个阈值中任一为 0 都不能启用。
++
++## 安装完整wheel
++
++把 `aerogo2-0.3.2-py3-none-any.whl` 放到 Unitree 的 `~/aerogo2/release/` 后执行：
++
++```bash
++sudo /opt/aerogo2/venv/bin/pip install --no-deps --force-reinstall ~/aerogo2/release/aerogo2-0.3.2-py3-none-any.whl
++```
++
++确认加载的是 0.3.2：
++
++```bash
++/opt/aerogo2/venv/bin/python -c "import aerogo2; print(aerogo2.__version__, aerogo2.__file__)"
++```
++
++确认单行配置工具已经安装：
++
++```bash
++/opt/aerogo2/venv/bin/aerogo2-configure-landing --help
++```
++
++## 仅用于干净0.3.0源码树的统一补丁
++
++如果目录是未经修改的0.3.0源码树，可先检查、再应用统一补丁：
++
++```bash
++cd ~/aerogo2 && git apply -p2 --check release/aerogo2-0.3.0-to-0.3.2.patch
++```
++
++```bash
++cd ~/aerogo2 && git apply -p2 --whitespace=nowarn release/aerogo2-0.3.0-to-0.3.2.patch
++```
++
++然后重装源码：
++
++```bash
++cd ~/aerogo2 && sudo /opt/aerogo2/venv/bin/pip install --no-deps --no-build-isolation --force-reinstall .
++```
++
++如果目录已经包含0.3.1改动或之前的手工修复，不要重复应用此补丁，直接安装上面的完整0.3.2 wheel。
++
++## 第一次只读采集四脚压力
++
++先不要启用落地适应。保持 Pixhawk Disarm、X8 停转、F446 停止，然后启动只读Shell：
++
++```bash
++set -a; source /etc/aerogo2/aerogo2.env; set +a; MAVLINK20=1 /opt/aerogo2/venv/bin/aerogo2 shell --hardware-readonly --config /etc/aerogo2/hardware.yaml --confirm-hardware I_UNDERSTAND_HARDWARE_RISK
++```
++
++进入Shell后依次输入：
++
++```text
++connect all
++landing compliance
++go2 status
++```
++
++在安全吊起、四脚完全无载时记录多组 `foot_force[0..3]`，再让Go2正常站立并分别轻压四个脚，记录各通道有载值。只有每个通道在受力时都稳定增大，才可继续。每脚阈值应位于该脚“无载最大值”和“可靠有载最小值”之间，并留出噪声余量；不要复制另一台Go2的阈值。
++
++## 一条命令写入并启用
++
++将下面的 `F0 F1 F2 F3` 替换为四个实际正整数阈值：
++
++```bash
++sudo /opt/aerogo2/venv/bin/aerogo2-configure-landing --config /etc/aerogo2/hardware.yaml --enable --thresholds F0 F1 F2 F3 --minimum-contact-feet 3 --contact-confirm-s 0.5 --settle-s 1.5
++```
++
++工具会先构造候选文件并调用完整配置加载器验证，通过后备份为 `/etc/aerogo2/hardware.yaml.bak`，再原子替换原文件。验证最终值：
++
++```bash
++/opt/aerogo2/venv/bin/python -c "from aerogo2.common.config import load_config; c=load_config(\"/etc/aerogo2/hardware.yaml\"); print(c.go2)"
++```
++
++如需立即关闭功能：
++
++```bash
++sudo /opt/aerogo2/venv/bin/aerogo2-configure-landing --config /etc/aerogo2/hardware.yaml --disable
++```
++
++## 无桨地面验收
++
++第一次必须拆除全部桨叶、固定机体、保持Pixhawk Disarm，并确认四个X8遥测全部在线。启动可写真机Shell：
++
++```bash
++set -a; source /etc/aerogo2/aerogo2.env; set +a; MAVLINK20=1 /opt/aerogo2/venv/bin/aerogo2 shell --hardware --enable-hardware-write --config /etc/aerogo2/hardware.yaml --confirm-hardware I_UNDERSTAND_HARDWARE_RISK
++```
++
++在Shell中检查：
++
++```text
++connect all
++devices
++esc health
++landing compliance
++```
++
++完整落地后的状态顺序应为：
++
++```text
++FLIGHT_MANUAL -> TOUCHDOWN_VERIFY -> LANDING_COMPLIANT -> FLIGHT_READY -> FLIGHT_TO_WALK_PRECHECK -> TRANSFORM_TO_WALK -> WALK
++```
++
++实际操作顺序：
++
++1. 使用RadioMaster人工降落；AeroGo2确认触地前一直保持 `JOINT_LOCK`。
++2. 使用RadioMaster Disarm；等待 `pixhawk status` 显示 `armed=false`，并用 `esc health` 确认四个X8在线、健康且RPM全部为0。
++3. 输入 `landing compliance`；脚接触持续0.5秒后状态应自动进入 `LANDING_COMPLIANT`，Go2模式应为 `BALANCE_STAND`。
++4. 等 `settle_elapsed_s` 达到1.5秒，再输入 `preflight transform-walk`。
++5. 输入 `transform walk`，再输入精确确认词 `TRANSFORM_TO_WALK`。
++6. 变形成功进入 `WALK` 后关节仍保持锁定；输入 `walk stand` 才恢复 `BalanceStand` 并重新启用Unitree原装遥控。
++
++任何一步出现 `FAULT` 时不要反复执行变形。依次只读检查 `faults active`、`landing compliance`、`go2 status`、`pixhawk status` 和 `esc health`。系统不会替你Disarm或停止旋翼。
++
++## 0.3.2验收结果
++
++- `ruff check`：通过。
++- strict `mypy`：通过。
++- 完整自动测试：`595 passed`。
++- 统一补丁：`release/aerogo2-0.3.0-to-0.3.2.patch`。
++- 完整安装包：`release/aerogo2-0.3.2-py3-none-any.whl`。
+diff --git a/base/pyproject.toml b/target/pyproject.toml
+index e997206..28c353d 100644
+--- a/base/pyproject.toml
++++ b/target/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "aerogo2"
+-version = "0.3.0"
++version = "0.3.2"
+ description = "Safety-first simulation and supervised hardware console for the AeroGo2 dual-mode robot"
+ readme = {file = "PACKAGE_README.md", content-type = "text/markdown"}
+ requires-python = ">=3.8"
+@@ -30,6 +30,7 @@ dev = [
+ 
+ [project.scripts]
+ aerogo2 = "aerogo2.main:main"
++aerogo2-configure-landing = "aerogo2.tools.configure_landing_compliance:main"
+ 
+ [tool.setuptools]
+ package-dir = {"" = "src"}
+diff --git a/base/src/aerogo2/__init__.py b/target/src/aerogo2/__init__.py
+index 2b93fb9..fed9d7c 100644
+--- a/base/src/aerogo2/__init__.py
++++ b/target/src/aerogo2/__init__.py
+@@ -4,4 +4,4 @@ from aerogo2.common.enums import SystemState
+ 
+ __all__ = ["SystemState", "__version__"]
+ 
+-__version__ = "0.3.0"
++__version__ = "0.3.2"
+diff --git a/base/src/aerogo2/bridges/fake_go2.py b/target/src/aerogo2/bridges/fake_go2.py
+index ab19efe..7744849 100644
+--- a/base/src/aerogo2/bridges/fake_go2.py
++++ b/target/src/aerogo2/bridges/fake_go2.py
+@@ -18,6 +18,7 @@ class FakeGo2:
+         self._clock = clock or RealClock()
+         self._status = Go2Status(locomotion_mode="STAND")
+         self._stop_failure = False
++        self._flight_lock_failure = False
+         self._shutdown = asyncio.Event()
+ 
+     async def connect(self) -> None:
+@@ -44,11 +45,14 @@ class FakeGo2:
+     async def request_stop(self) -> bool:
+         if not self._status.connected or self._stop_failure:
+             return False
++        if self._status.joints_locked:
++            return True
+         self.inject_status(
+             velocity_mps=0.0,
+             stable=True,
+             controller_active=False,
+             locomotion_mode="STOPPED",
++            joints_locked=False,
+         )
+         return True
+ 
+@@ -61,18 +65,20 @@ class FakeGo2:
+             standing=True,
+             controller_active=True,
+             locomotion_mode="STAND",
++            joints_locked=False,
+         )
+         return True
+ 
+     async def request_flight_pose(self) -> bool:
+-        if not self._status.connected or self._status.moving:
++        if not self._status.connected or self._status.moving or self._flight_lock_failure:
+             return False
+         self.inject_status(
+             velocity_mps=0.0,
+             stable=True,
+             standing=True,
+             controller_active=False,
+-            locomotion_mode="FLIGHT_POSE",
++            locomotion_mode="JOINT_LOCK",
++            joints_locked=True,
+         )
+         return True
+ 
+@@ -84,7 +90,8 @@ class FakeGo2:
+             stable=True,
+             standing=True,
+             controller_active=False,
+-            locomotion_mode="LANDING_POSE",
++            locomotion_mode="BALANCE_STAND",
++            joints_locked=False,
+         )
+         return True
+ 
+@@ -132,5 +139,8 @@ class FakeGo2:
+     def inject_stop_failure(self, enabled: bool = True) -> None:
+         self._stop_failure = enabled
+ 
++    def inject_flight_lock_failure(self, enabled: bool = True) -> None:
++        self._flight_lock_failure = enabled
++
+ 
+ __all__ = ["FakeGo2"]
+diff --git a/base/src/aerogo2/bridges/go2_sdk_bridge.py b/target/src/aerogo2/bridges/go2_sdk_bridge.py
+index fcf826c..554f1ab 100644
+--- a/base/src/aerogo2/bridges/go2_sdk_bridge.py
++++ b/target/src/aerogo2/bridges/go2_sdk_bridge.py
+@@ -31,6 +31,21 @@ def _vector3(raw: Any) -> Tuple[float, float, float]:
+     return (values[0], values[1], values[2])
+ 
+ 
++def _vector4_int(raw: Any) -> Tuple[Tuple[int, int, int, int], bool]:
++    try:
++        values = tuple(float(item) for item in raw)
++    except (TypeError, ValueError):
++        return (0, 0, 0, 0), False
++    if (
++        len(values) < 4
++        or any(not math.isfinite(item) or not item.is_integer() for item in values[:4])
++        or any(item < -32768 or item > 32767 for item in values[:4])
++    ):
++        return (0, 0, 0, 0), False
++    parsed = tuple(int(item) for item in values[:4])
++    return (parsed[0], parsed[1], parsed[2], parsed[3]), True
++
++
+ class UnitreeGo2Bridge:
+     """Subscribe to SportModeState and issue only conservative SportClient calls."""
+ 
+@@ -67,6 +82,7 @@ class UnitreeGo2Bridge:
+         self._subscriber: Optional[Any] = None
+         self._client: Optional[Any] = None
+         self._connected = False
++        self._joystick_disabled = False
+         self._disconnect_event = asyncio.Event()
+ 
+     async def connect(self) -> None:
+@@ -118,6 +134,15 @@ class UnitreeGo2Bridge:
+ 
+     async def disconnect(self) -> None:
+         subscriber = self._subscriber
++        client = self._client
++        if self._allow_control and client is not None and self._joystick_disabled:
++            enable_joystick = getattr(client, "SwitchJoystick", None)
++            if callable(enable_joystick):
++                try:
++                    await run_blocking(enable_joystick, True)
++                except Exception:
++                    pass
++        self._joystick_disabled = False
+         self._subscriber = None
+         self._client = None
+         self._connected = False
+@@ -143,18 +168,41 @@ class UnitreeGo2Bridge:
+         return self.get_status()
+ 
+     async def request_stop(self) -> bool:
++        if self.get_status().joints_locked:
++            return True
+         return await self._call("StopMove")
+ 
+     async def request_stand(self) -> bool:
++        if self._joystick_disabled:
++            if not await self._call("SwitchJoystick", True):
++                return False
++            self._joystick_disabled = False
+         return await self._call("BalanceStand")
+ 
+     async def request_flight_pose(self) -> bool:
+-        return await self.request_stop()
++        already_locked = self.get_status().joints_locked
++        if not already_locked and not await self._call("StopMove"):
++            return False
++        if not self._joystick_disabled:
++            if not await self._call("SwitchJoystick", False):
++                return False
++            self._joystick_disabled = True
++        if already_locked:
++            return True
++        if not await self._call("StandUp"):
++            return False
++        return await self._wait_for_joint_lock()
+ 
+     async def request_landing_pose(self) -> bool:
+-        return await self.request_stop()
++        if not self._joystick_disabled:
++            if not await self._call("SwitchJoystick", False):
++                return False
++            self._joystick_disabled = True
++        if not await self._call("BalanceStand"):
++            return False
++        return await self._wait_for_locomotion_mode("BALANCE_STAND")
+ 
+-    async def _call(self, method: str) -> bool:
++    async def _call(self, method: str, *args: Any) -> bool:
+         if not self._allow_control:
+             raise BridgeError(
+                 "Go2 high-level control is locked; restart with the per-process hardware unlock"
+@@ -166,21 +214,59 @@ class UnitreeGo2Bridge:
+         if not callable(operation):
+             raise BridgeError(f"Unitree SportClient does not provide {method}")
+         try:
+-            result = await run_blocking(operation)
++            result = await run_blocking(operation, *args)
+         except Exception as exc:
+             raise BridgeError(f"Go2 {method} failed: {exc}") from exc
+         return int(result) == 0
+ 
++    async def _wait_for_joint_lock(self) -> bool:
++        loop = asyncio.get_running_loop()
++        deadline = loop.time() + max(
++            self._config.command_timeout_s,
++            self._config.status_timeout_s * 5.0,
++        )
++        while loop.time() < deadline:
++            if self.get_status().joints_locked:
++                return True
++            await asyncio.sleep(min(0.02, self._config.status_timeout_s))
++        return self.get_status().joints_locked
++
++    async def _wait_for_locomotion_mode(self, expected: str) -> bool:
++        loop = asyncio.get_running_loop()
++        deadline = loop.time() + max(
++            self._config.command_timeout_s,
++            self._config.status_timeout_s * 5.0,
++        )
++        while loop.time() < deadline:
++            status = self.get_status()
++            if (
++                status.locomotion_mode == expected
++                and status.standing
++                and status.stable
++                and not status.moving
++            ):
++                return True
++            await asyncio.sleep(min(0.02, self._config.status_timeout_s))
++        status = self.get_status()
++        return (
++            status.locomotion_mode == expected
++            and status.standing
++            and status.stable
++            and not status.moving
++        )
++
+     def _on_state(self, message: Any) -> None:
+         now = self._clock.monotonic()
+         velocity = _vector3(_value(message, "velocity", (0.0, 0.0, 0.0)))
+         imu = _value(message, "imu_state", None)
+         rpy = _vector3(_value(imu, "rpy", (0.0, 0.0, 0.0)))
++        foot_force, foot_force_valid = _vector4_int(_value(message, "foot_force", ()))
+         mode = int(_value(message, "mode", -1))
+         state_code = int(_value(message, "error_code", 0))
+         speed = math.hypot(velocity[0], velocity[1])
+         posture_code_ok = state_code in self._STABLE_STATE_CODES
+-        standing = mode in {0, 1, 2} and posture_code_ok
++        joints_locked = mode == 6 and posture_code_ok
++        standing = mode in {0, 1, 2, 6} and posture_code_ok
+         moving = mode == 3 or speed >= 0.02 or abs(velocity[2]) >= 0.02
+         stable = standing and abs(rpy[0]) < 0.35 and abs(rpy[1]) < 0.35 and not moving
+         status = Go2Status(
+@@ -192,6 +278,9 @@ class UnitreeGo2Bridge:
+             moving=moving,
+             locomotion_mode=self._MODE_NAMES.get(mode, f"MODE_{mode}"),
+             fault_code=state_code,
++            joints_locked=joints_locked,
++            foot_force=foot_force,
++            foot_force_valid=foot_force_valid,
+             velocity_mps=speed,
+             stable=stable,
+             controller_active=moving,
+diff --git a/base/src/aerogo2/cli/commands/landing.py b/target/src/aerogo2/cli/commands/landing.py
+index 850fe99..7dd503a 100644
+--- a/base/src/aerogo2/cli/commands/landing.py
++++ b/target/src/aerogo2/cli/commands/landing.py
+@@ -10,6 +10,12 @@ from aerogo2.common.enums import SystemState
+ def command_specs() -> Tuple[CommandSpec, ...]:
+     return (
+         readonly("autoland status", "Show automatic landing state", "landing", "query_controller"),
++        readonly(
++            "landing compliance",
++            "Show calibrated foot contact and landing compliance progress",
++            "landing",
++            "query_controller",
++        ),
+         command(
+             "autoland prepare",
+             "Initialize controller and estimator without sending setpoints",
+diff --git a/base/src/aerogo2/cli/commands/transition.py b/target/src/aerogo2/cli/commands/transition.py
+index 962dc6a..f926cec 100644
+--- a/base/src/aerogo2/cli/commands/transition.py
++++ b/target/src/aerogo2/cli/commands/transition.py
+@@ -53,6 +53,7 @@ def command_specs() -> Tuple[CommandSpec, ...]:
+                     SystemState.FLIGHT_READY,
+                     SystemState.FLIGHT_MANUAL,
+                     SystemState.TOUCHDOWN_VERIFY,
++                    SystemState.LANDING_COMPLIANT,
+                 }
+             ),
+             confirmation=ConfirmationPolicy.exact("TRANSFORM_TO_WALK"),
+diff --git a/base/src/aerogo2/cli/renderer.py b/target/src/aerogo2/cli/renderer.py
+index ba31c73..b704d9a 100644
+--- a/base/src/aerogo2/cli/renderer.py
++++ b/target/src/aerogo2/cli/renderer.py
+@@ -35,6 +35,7 @@ STATE_COLORS: Final[Mapping[SystemState, str]] = MappingProxyType(
+         SystemState.AUTO_LANDING_READY: "blue",
+         SystemState.AUTO_LANDING: "blue",
+         SystemState.TOUCHDOWN_VERIFY: "yellow",
++        SystemState.LANDING_COMPLIANT: "yellow",
+         SystemState.FLIGHT_TO_WALK_PRECHECK: "yellow",
+         SystemState.TRANSFORM_TO_WALK: "yellow",
+         SystemState.FAULT: "bold red",
+diff --git a/base/src/aerogo2/common/config.py b/target/src/aerogo2/common/config.py
+index 9109bf9..9f605c5 100644
+--- a/base/src/aerogo2/common/config.py
++++ b/target/src/aerogo2/common/config.py
+@@ -76,6 +76,11 @@ class Go2Config:
+     domain_id: int = 0
+     sport_state_topic: str = "rt/sportmodestate"
+     command_timeout_s: float = 2.0
++    landing_compliance_enabled: bool = False
++    foot_force_contact_thresholds: Tuple[int, int, int, int] = (0, 0, 0, 0)
++    landing_contact_min_feet: int = 3
++    landing_contact_confirm_s: float = 0.5
++    landing_compliance_settle_s: float = 1.5
+ 
+ 
+ @dataclass(frozen=True)
+@@ -267,6 +272,35 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
+             errors.append(f"{label} must be at most {maximum}")
+         return item
+ 
++    def integer_quad(
++        section: Mapping[str, Any],
++        key: str,
++        label: str,
++        *,
++        minimum: int,
++        maximum: int,
++    ) -> Optional[Tuple[int, int, int, int]]:
++        item = value(section, key, label)
++        if item is None:
++            return None
++        if not isinstance(item, (list, tuple)) or len(item) != 4:
++            errors.append(f"{label} must contain exactly four integers")
++            return None
++        parsed: List[int] = []
++        valid = True
++        for index, raw_item in enumerate(item):
++            if type(raw_item) is not int:
++                errors.append(f"{label}[{index}] must be an integer")
++                valid = False
++                continue
++            if raw_item < minimum or raw_item > maximum:
++                errors.append(f"{label}[{index}] must be within {minimum}..{maximum}")
++                valid = False
++            parsed.append(raw_item)
++        if not valid or len(parsed) != 4:
++            return None
++        return (parsed[0], parsed[1], parsed[2], parsed[3])
++
+     def finite_number(
+         section: Mapping[str, Any],
+         key: str,
+@@ -403,6 +437,51 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
+     if "command_timeout_s" in go2:
+         finite_number(go2, "command_timeout_s", "go2.command_timeout_s", positive=True)
+ 
++    compliance_enabled: Optional[bool] = False
++    if "landing_compliance_enabled" in go2:
++        compliance_enabled = boolean(
++            go2,
++            "landing_compliance_enabled",
++            "go2.landing_compliance_enabled",
++        )
++    foot_force_thresholds: Optional[Tuple[int, int, int, int]] = None
++    if "foot_force_contact_thresholds" in go2:
++        foot_force_thresholds = integer_quad(
++            go2,
++            "foot_force_contact_thresholds",
++            "go2.foot_force_contact_thresholds",
++            minimum=0,
++            maximum=32767,
++        )
++    if "landing_contact_min_feet" in go2:
++        integer(
++            go2,
++            "landing_contact_min_feet",
++            "go2.landing_contact_min_feet",
++            minimum=1,
++            maximum=4,
++        )
++    for key in ("landing_contact_confirm_s", "landing_compliance_settle_s"):
++        if key in go2:
++            finite_number(go2, key, f"go2.{key}", positive=True)
++    if compliance_enabled is True:
++        required_compliance_keys = (
++            "foot_force_contact_thresholds",
++            "landing_contact_min_feet",
++            "landing_contact_confirm_s",
++            "landing_compliance_settle_s",
++        )
++        for key in required_compliance_keys:
++            if key not in go2:
++                errors.append(
++                    f"Missing configuration key 'go2.{key}' while landing compliance is enabled"
++                )
++        if foot_force_thresholds is not None and any(item <= 0 for item in foot_force_thresholds):
++            errors.append(
++                "go2.foot_force_contact_thresholds must all be positive when "
++                "landing compliance is enabled"
++            )
++
+     channel_keys = (
+         "flight_enable_channel",
+         "flight_mode_channel",
+@@ -504,6 +583,17 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
+     landing = _section(raw, "landing")
+     esc = _section(raw, "esc")
+ 
++    raw_foot_force_thresholds = go2.get(
++        "foot_force_contact_thresholds",
++        (0, 0, 0, 0),
++    )
++    foot_force_thresholds = (
++        int(raw_foot_force_thresholds[0]),
++        int(raw_foot_force_thresholds[1]),
++        int(raw_foot_force_thresholds[2]),
++        int(raw_foot_force_thresholds[3]),
++    )
++
+     log_directory = Path(_required(system, "log_directory"))
+     if not log_directory.is_absolute():
+         packaged_config_directory = Path(__file__).resolve().parents[1] / "default_configs"
+@@ -553,6 +643,11 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
+             domain_id=int(go2.get("domain_id", 0)),
+             sport_state_topic=str(go2.get("sport_state_topic", "rt/sportmodestate")),
+             command_timeout_s=float(go2.get("command_timeout_s", 2.0)),
++            landing_compliance_enabled=bool(go2.get("landing_compliance_enabled", False)),
++            foot_force_contact_thresholds=foot_force_thresholds,
++            landing_contact_min_feet=int(go2.get("landing_contact_min_feet", 3)),
++            landing_contact_confirm_s=float(go2.get("landing_contact_confirm_s", 0.5)),
++            landing_compliance_settle_s=float(go2.get("landing_compliance_settle_s", 1.5)),
+         ),
+         rc=RCConfig(
+             flight_enable_channel=_required(rc, "flight_enable_channel"),
+diff --git a/base/src/aerogo2/common/enums.py b/target/src/aerogo2/common/enums.py
+index 8a3e11b..0a8acee 100644
+--- a/base/src/aerogo2/common/enums.py
++++ b/target/src/aerogo2/common/enums.py
+@@ -19,6 +19,7 @@ class SystemState(Enum):
+     AUTO_LANDING_READY = auto()
+     AUTO_LANDING = auto()
+     TOUCHDOWN_VERIFY = auto()
++    LANDING_COMPLIANT = auto()
+     FLIGHT_TO_WALK_PRECHECK = auto()
+     TRANSFORM_TO_WALK = auto()
+     FAULT = auto()
+diff --git a/base/src/aerogo2/common/models.py b/target/src/aerogo2/common/models.py
+index 27a2a7e..20da1f6 100644
+--- a/base/src/aerogo2/common/models.py
++++ b/target/src/aerogo2/common/models.py
+@@ -148,6 +148,9 @@ class Go2Status:
+     moving: bool = False
+     locomotion_mode: str = "UNKNOWN"
+     fault_code: int = 0
++    joints_locked: bool = False
++    foot_force: Tuple[int, int, int, int] = (0, 0, 0, 0)
++    foot_force_valid: bool = False
+ 
+     # Compatibility/detail fields used by Phase 1 high-level motion guards.
+     velocity_mps: float = 0.0
+@@ -157,6 +160,7 @@ class Go2Status:
+     def __post_init__(self) -> None:
+         object.__setattr__(self, "body_velocity", tuple(self.body_velocity))
+         object.__setattr__(self, "body_rpy", tuple(self.body_rpy))
++        object.__setattr__(self, "foot_force", tuple(self.foot_force))
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/base/src/aerogo2/default_configs/system.yaml b/target/src/aerogo2/default_configs/system.yaml
+index 68727fc..7d824f7 100644
+--- a/base/src/aerogo2/default_configs/system.yaml
++++ b/target/src/aerogo2/default_configs/system.yaml
+@@ -18,6 +18,13 @@ go2:
+   domain_id: 0
+   sport_state_topic: "rt/sportmodestate"
+   command_timeout_s: 2.0
++  # Keep disabled until all four raw foot-force channels have been calibrated
++  # on this exact robot. Threshold order is the SDK foot_force[0..3] order.
++  landing_compliance_enabled: false
++  foot_force_contact_thresholds: [0, 0, 0, 0]
++  landing_contact_min_feet: 3
++  landing_contact_confirm_s: 0.5
++  landing_compliance_settle_s: 1.5
+ 
+ esc:
+   # Hobbywing NodeID/ThrottleID/output order validated by pixhawk_x8_cli_diag.py:
+diff --git a/base/src/aerogo2/manager/permissions.py b/target/src/aerogo2/manager/permissions.py
+index d68536a..507e1d3 100644
+--- a/base/src/aerogo2/manager/permissions.py
++++ b/target/src/aerogo2/manager/permissions.py
+@@ -61,6 +61,7 @@ STATE_ACTIONS: Final[Mapping[str, FrozenSet[SystemState]]] = MappingProxyType(
+             {
+                 SystemState.FLIGHT_READY,
+                 SystemState.TOUCHDOWN_VERIFY,
++                SystemState.LANDING_COMPLIANT,
+             }
+         ),
+         "autoland_prepare": frozenset({SystemState.FLIGHT_MANUAL}),
+diff --git a/base/src/aerogo2/manager/system_manager.py b/target/src/aerogo2/manager/system_manager.py
+index 12334dc..2efc13e 100644
+--- a/base/src/aerogo2/manager/system_manager.py
++++ b/target/src/aerogo2/manager/system_manager.py
+@@ -40,6 +40,7 @@ from aerogo2.landing.safety_filter import LandingSafetyFilter
+ from aerogo2.manager.state_machine import StateMachine
+ from aerogo2.manager.transition_guards import TRANSFORM_STATES, TransitionGuards
+ from aerogo2.safety.esc_telemetry import assess_esc_telemetry
++from aerogo2.safety.go2_contact import assess_foot_contact
+ from aerogo2.safety.interlocks import SafetyInterlocks
+ from aerogo2.safety.safety_monitor import SafetyMonitor
+ from aerogo2.safety.watchdog import timestamp_age, timestamp_is_fresh
+@@ -93,6 +94,10 @@ class SystemManager:
+             SystemState.FLIGHT_READY,
+             self._leave_manual_positioning,
+         )
++        self._state_machine.set_entry_action(
++            SystemState.LANDING_COMPLIANT,
++            self._enter_landing_compliant,
++        )
+         self._state_machine.set_entry_action(SystemState.FAULT, self._enter_fault_state)
+         self._state_machine.set_entry_action(SystemState.EMERGENCY_STOP, self._enter_emergency_stop)
+         self._state_machine.subscribe(self._on_state_transition)
+@@ -108,6 +113,8 @@ class SystemManager:
+         self._next_landing_update_at: Optional[float] = None
+         self._touchdown_since: Optional[float] = None
+         self._touchdown_height_reference: Optional[float] = None
++        self._landing_contact_since: Optional[float] = None
++        self._landing_compliant_since: Optional[float] = None
+         self._go2_stationary_since: Optional[float] = None
+         self._f446_current_clear_since: Optional[float] = None
+         self._f446_current_clear_key: Optional[Tuple[Any, ...]] = None
+@@ -629,9 +636,22 @@ class SystemManager:
+         messages: List[str] = []
+         target = target_by_profile.get(normalized)
+         if target is not None:
+-            guard = TransitionGuards(self.config).evaluate(self.state, target, self._snapshot)
+-            codes.extend(guard.codes)
+-            messages.extend(guard.messages)
++            if normalized == "transform-walk" and self.state is SystemState.LANDING_COMPLIANT:
++                for result in (
++                    self._landing_compliance_hold_result(),
++                    self._landing_compliance_settle_result(),
++                ):
++                    if not result.ok and result.code not in codes:
++                        codes.append(result.code)
++                        messages.append(result.message)
++            else:
++                guard = TransitionGuards(self.config).evaluate(
++                    self.state,
++                    target,
++                    self._snapshot,
++                )
++                codes.extend(guard.codes)
++                messages.extend(guard.messages)
+         elif normalized == "flight":
+             guard = self._flight_readiness_guard(require_flight_enable_low=True)
+             for code, message in zip(guard.codes, guard.messages):
+@@ -662,6 +682,17 @@ class SystemManager:
+             codes.append("TOUCHDOWN_NOT_CONFIRMED")
+             messages.append("Touchdown must be continuously verified before transformation")
+ 
++        if (
++            normalized == "transform-walk"
++            and self.config.go2.landing_compliance_enabled
++            and self.state is SystemState.TOUCHDOWN_VERIFY
++        ):
++            codes.append("LANDING_COMPLIANCE_REQUIRED")
++            messages.append(
++                "Wait for Disarm, exact zero X8 RPM, calibrated foot contact, and "
++                "LANDING_COMPLIANT entry"
++            )
++
+         monitor_violations = tuple(self._safety_monitor.evaluate(self._snapshot))
+         for violation in monitor_violations:
+             if violation.severity not in (SafetySeverity.FAULT, SafetySeverity.EMERGENCY):
+@@ -1025,6 +1056,19 @@ class SystemManager:
+         if not current_clear.ok:
+             return current_clear
+ 
++        if target is Configuration.FLIGHT:
++            try:
++                if not await self._go2.request_flight_pose():
++                    raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected the request")
++            except (BridgeError, OSError, RuntimeError) as exc:
++                return OperationResult.failure("GO2_JOINT_LOCK_FAILED", str(exc))
++            await self.refresh_snapshot()
++            if not self._snapshot.go2.joints_locked:
++                return OperationResult.failure(
++                    "GO2_JOINT_LOCK_UNCONFIRMED",
++                    "Go2 did not authoritatively report mode=6 JOINT_LOCK",
++                )
++
+         self._operator_confirmed_configuration = target
+         await self.refresh_snapshot()
+         target_state = (
+@@ -1192,6 +1236,13 @@ class SystemManager:
+             if not move_result.ok:
+                 raise BridgeError(f"{move_result.code}: {move_result.message}")
+             await self.refresh_snapshot()
++            if not await self._go2.request_flight_pose():
++                raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected the request")
++            await self.refresh_snapshot()
++            if not self._snapshot.go2.joints_locked:
++                raise BridgeError(
++                    "GO2_JOINT_LOCK_UNCONFIRMED: Go2 did not report mode=6 JOINT_LOCK"
++                )
+             self._emit("FLIGHT_LIMIT_REACHED")
+             await self._state_machine.transition_to(
+                 SystemState.FLIGHT_READY,
+@@ -1235,12 +1286,36 @@ class SystemManager:
+             SystemState.FLIGHT_READY,
+             SystemState.FLIGHT_MANUAL,
+             SystemState.TOUCHDOWN_VERIFY,
++            SystemState.LANDING_COMPLIANT,
+         ):
+             return OperationResult.failure(
+                 "INVALID_STATE", "transform walk requires a landed FLIGHT state"
+             )
+         try:
+             await self.refresh_snapshot()
++            if (
++                self.config.go2.landing_compliance_enabled
++                and self.state is SystemState.TOUCHDOWN_VERIFY
++            ):
++                return OperationResult.failure(
++                    "LANDING_COMPLIANCE_REQUIRED",
++                    "Wait for calibrated foot contact, Disarm, zero X8 RPM, and "
++                    "automatic LANDING_COMPLIANT entry before transforming",
++                    data=dict(self._landing_compliance_report()),
++                )
++            if self.state is SystemState.LANDING_COMPLIANT:
++                settled = self._landing_compliance_settle_result()
++                if not settled.ok:
++                    return settled
++                hold = self._landing_compliance_hold_result()
++                if not hold.ok:
++                    return hold
++                relock = await self._finish_landing_compliance(
++                    "operator confirmed transform to WALK"
++                )
++                if not relock.ok:
++                    raise BridgeError(f"{relock.code}: {relock.message}")
++
+             current_clear = self._current_clear_dwell_result()
+             if not current_clear.ok:
+                 return current_clear
+@@ -1291,6 +1366,8 @@ class SystemManager:
+                 snapshot=self._snapshot,
+             )
+             self._touchdown_confirmed = False
++            self._landing_contact_since = None
++            self._landing_compliant_since = None
+             self._emit("WALK_CONFIGURATION_VERIFIED")
+             await self.refresh_snapshot()
+             return OperationResult.success("WALK verified; walking may resume")
+@@ -1578,6 +1655,8 @@ class SystemManager:
+             await self.update_autoland()
+         if self.state in (SystemState.FLIGHT_MANUAL, SystemState.AUTO_LANDING):
+             await self._check_touchdown()
++        if self.state is SystemState.TOUCHDOWN_VERIFY:
++            await self._check_landing_compliance()
+         return violations
+ 
+     async def _stop_transform_outputs(self) -> OperationResult:
+@@ -1638,7 +1717,11 @@ class SystemManager:
+             failures.append(transform_result.message)
+         if self._control_writes_allowed() and self._snapshot.go2.connected:
+             try:
+-                if not await self._go2.request_stop():
++                if initial_state is SystemState.LANDING_COMPLIANT:
++                    relock = await self._finish_landing_compliance("supervised stop")
++                    if not relock.ok:
++                        raise BridgeError(f"{relock.code}: {relock.message}")
++                elif not await self._go2.request_stop():
+                     raise BridgeError("Go2 rejected the stop request")
+             except (BridgeError, OSError, RuntimeError) as exc:
+                 failures.append(f"Go2: {exc}")
+@@ -1982,6 +2065,8 @@ class SystemManager:
+ 
+         if name == "go2 status":
+             return {"go2": go2}
++        if name == "landing compliance":
++            return self._landing_compliance_report()
+         if name == "go2 motion":
+             return {
+                 "body_velocity": list(self._snapshot.go2.body_velocity),
+@@ -2212,6 +2297,203 @@ class SystemManager:
+         self._emit("TOUCHDOWN_CONFIRMED")
+         await self.refresh_snapshot()
+ 
++    def _landing_compliance_entry_result(self) -> OperationResult:
++        if not self.config.go2.landing_compliance_enabled:
++            return OperationResult.failure(
++                "LANDING_COMPLIANCE_DISABLED",
++                "Calibrate all four foot-force thresholds before enabling landing compliance",
++            )
++        if self.state is not SystemState.TOUCHDOWN_VERIFY:
++            return OperationResult.failure(
++                "INVALID_STATE",
++                "Landing compliance entry requires TOUCHDOWN_VERIFY",
++            )
++        snapshot = self._snapshot
++        contact = assess_foot_contact(snapshot.go2, self.config.go2)
++        if not snapshot.pixhawk.landed:
++            return OperationResult.failure("TOUCHDOWN_NOT_CONFIRMED", "Pixhawk is not landed")
++        if snapshot.pixhawk.armed:
++            return OperationResult.failure("PIXHAWK_ARMED", "Disarm with RadioMaster first")
++        if not assess_esc_telemetry(
++            snapshot,
++            self.config.esc.slots,
++            exact_zero=True,
++        ).safe:
++            return OperationResult.failure(
++                "ESC_RPM_NOT_ZERO",
++                "Every configured X8 must be online, healthy, finite, and exactly zero RPM",
++            )
++        if snapshot.configuration is not Configuration.FLIGHT:
++            return OperationResult.failure(
++                "FLIGHT_CONFIGURATION_NOT_CONFIRMED",
++                "The mechanism must remain in verified FLIGHT configuration",
++            )
++        if snapshot.f446.duty != 0 or snapshot.f446.faulted:
++            return OperationResult.failure("F446_NOT_SAFE", "F446 must be stopped and fault-free")
++        if not snapshot.go2.joints_locked:
++            return OperationResult.failure(
++                "GO2_JOINT_LOCK_REQUIRED",
++                "Go2 must remain JOINT_LOCKED until compliance entry",
++            )
++        if not snapshot.go2.stable or snapshot.go2.moving or snapshot.go2.controller_active:
++            return OperationResult.failure(
++                "GO2_NOT_STATIONARY",
++                "Go2 must be stable and stationary before releasing joint lock",
++            )
++        if not contact.valid:
++            return OperationResult.failure(
++                "GO2_FOOT_FORCE_INVALID",
++                "All four calibrated foot-force channels must be valid",
++            )
++        if not contact.safe:
++            return OperationResult.failure(
++                "GO2_FOOT_CONTACT_INSUFFICIENT",
++                f"Only {contact.contact_count} feet report contact; "
++                f"{contact.required_count} are required",
++            )
++        if snapshot.active_fault_codes:
++            return OperationResult.failure(
++                "ACTIVE_FAULTS_PRESENT",
++                "Active safety faults prevent landing compliance",
++            )
++        return OperationResult.success("Landing compliance entry conditions are held")
++
++    def _landing_compliance_hold_result(self) -> OperationResult:
++        if self.state is not SystemState.LANDING_COMPLIANT:
++            return OperationResult.failure(
++                "INVALID_STATE",
++                "Landing compliance hold requires LANDING_COMPLIANT",
++            )
++        snapshot = self._snapshot
++        contact = assess_foot_contact(snapshot.go2, self.config.go2)
++        if snapshot.pixhawk.armed:
++            return OperationResult.failure(
++                "PIXHAWK_ARMED_DURING_LANDING_COMPLIANCE",
++                "Pixhawk must remain disarmed",
++            )
++        if not snapshot.pixhawk.landed:
++            return OperationResult.failure("TOUCHDOWN_LOST", "Pixhawk landed state was lost")
++        if not assess_esc_telemetry(
++            snapshot,
++            self.config.esc.slots,
++            exact_zero=True,
++        ).safe:
++            return OperationResult.failure(
++                "ESC_RPM_NONZERO_DURING_LANDING_COMPLIANCE",
++                "Every configured X8 must remain exactly zero RPM",
++            )
++        if snapshot.configuration is not Configuration.FLIGHT:
++            return OperationResult.failure(
++                "FLIGHT_CONFIGURATION_NOT_CONFIRMED",
++                "The mechanism must remain in FLIGHT configuration",
++            )
++        if snapshot.f446.duty != 0 or snapshot.f446.faulted:
++            return OperationResult.failure("F446_NOT_SAFE", "F446 must remain stopped")
++        if not contact.valid:
++            return OperationResult.failure(
++                "GO2_FOOT_FORCE_INVALID",
++                "All four calibrated foot-force channels must remain valid",
++            )
++        if not contact.safe:
++            return OperationResult.failure(
++                "GO2_FOOT_CONTACT_LOST",
++                f"Only {contact.contact_count} feet report contact; "
++                f"{contact.required_count} are required",
++            )
++        if (
++            snapshot.go2.locomotion_mode != "BALANCE_STAND"
++            or snapshot.go2.joints_locked
++            or not snapshot.go2.stable
++            or snapshot.go2.moving
++        ):
++            return OperationResult.failure(
++                "GO2_LANDING_COMPLIANCE_LOST",
++                "Go2 must authoritatively report a stable BALANCE_STAND posture",
++            )
++        return OperationResult.success("Landing compliance remains safe")
++
++    def _landing_compliance_settle_result(self) -> OperationResult:
++        since = self._landing_compliant_since
++        now = self._clock.monotonic()
++        if since is None or not math.isfinite(since) or not math.isfinite(now):
++            return OperationResult.failure(
++                "LANDING_COMPLIANCE_SETTLE_REQUIRED",
++                "Landing compliance settle timing has not started",
++            )
++        elapsed = now - since
++        required = self.config.go2.landing_compliance_settle_s
++        if elapsed < required:
++            return OperationResult.failure(
++                "LANDING_COMPLIANCE_SETTLE_REQUIRED",
++                f"Keep BalanceStand stable for {required - elapsed:.2f}s more",
++                data={"elapsed_s": elapsed, "required_s": required},
++            )
++        return OperationResult.success(
++            "Landing compliance settle complete",
++            data={"elapsed_s": elapsed, "required_s": required},
++        )
++
++    async def _check_landing_compliance(self) -> None:
++        if not self.config.go2.landing_compliance_enabled:
++            self._landing_contact_since = None
++            return
++        entry = self._landing_compliance_entry_result()
++        now = self._clock.monotonic()
++        if not entry.ok:
++            self._landing_contact_since = None
++            return
++        if self._landing_contact_since is None:
++            self._landing_contact_since = now
++            return
++        if now - self._landing_contact_since < self.config.go2.landing_contact_confirm_s:
++            return
++        try:
++            await self._state_machine.transition_to(
++                SystemState.LANDING_COMPLIANT,
++                reason="calibrated foot contact, Disarm, and zero X8 RPM held",
++                snapshot=self._snapshot,
++            )
++        except TransitionRejected as exc:
++            self._landing_contact_since = None
++            self._emit("LANDING_COMPLIANCE_REJECTED", message=str(exc))
++            return
++        self._landing_contact_since = None
++        await self.refresh_snapshot()
++
++    def _landing_compliance_report(self) -> Mapping[str, Any]:
++        contact = assess_foot_contact(self._snapshot.go2, self.config.go2)
++        now = self._clock.monotonic()
++        contact_elapsed = (
++            0.0
++            if self._landing_contact_since is None
++            else max(0.0, now - self._landing_contact_since)
++        )
++        settle_elapsed = (
++            0.0
++            if self._landing_compliant_since is None
++            else max(0.0, now - self._landing_compliant_since)
++        )
++        return {
++            "enabled": self.config.go2.landing_compliance_enabled,
++            "state": self.state.name,
++            "foot_force": list(self._snapshot.go2.foot_force),
++            "foot_force_valid": self._snapshot.go2.foot_force_valid,
++            "thresholds": list(self.config.go2.foot_force_contact_thresholds),
++            "contacts": list(contact.contacts),
++            "contact_count": contact.contact_count,
++            "required_contact_count": contact.required_count,
++            "contact_safe": contact.safe,
++            "contact_confirm_elapsed_s": contact_elapsed,
++            "contact_confirm_required_s": self.config.go2.landing_contact_confirm_s,
++            "settle_elapsed_s": settle_elapsed,
++            "settle_required_s": self.config.go2.landing_compliance_settle_s,
++            "pixhawk_armed": self._snapshot.pixhawk.armed,
++            "pixhawk_landed": self._snapshot.pixhawk.landed,
++            "maximum_esc_rpm": self._snapshot.pixhawk.maximum_esc_rpm,
++            "go2_mode": self._snapshot.go2.locomotion_mode,
++            "joints_locked": self._snapshot.go2.joints_locked,
++        }
++
+     async def _fault(
+         self,
+         code: str,
+@@ -2304,6 +2586,22 @@ class SystemManager:
+         if configuration is Configuration.WALK:
+             target = SystemState.WALK
+         elif configuration is Configuration.FLIGHT:
++            if not self._control_writes_allowed():
++                self._emit(
++                    "GO2_JOINT_LOCK_REQUIRED",
++                    message=(
++                        "FLIGHT configuration detected, but read-only mode cannot disable "
++                        "the Go2 original remote and confirm JOINT_LOCK"
++                    ),
++                )
++                return
++            if not await self._go2.request_flight_pose():
++                raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected the request")
++            await self.refresh_snapshot()
++            if not self._snapshot.go2.joints_locked:
++                raise BridgeError(
++                    "GO2_JOINT_LOCK_UNCONFIRMED: Go2 did not report mode=6 JOINT_LOCK"
++                )
+             target = SystemState.FLIGHT_READY
+         else:
+             self._emit("F446_CONFIGURATION_UNKNOWN", state=self._snapshot.f446.state.value)
+@@ -2485,6 +2783,75 @@ class SystemManager:
+         self._manual_last_direction = None
+         self._manual_motion_started = False
+ 
++    async def _enter_landing_compliant(self, snapshot: SystemSnapshot) -> None:
++        if not self._control_writes_allowed():
++            raise BridgeError("Go2 landing compliance requires unlocked hardware writes")
++        failure: Optional[Exception] = None
++        try:
++            if not await self._go2.request_landing_pose():
++                raise BridgeError("Go2 rejected the BalanceStand landing posture")
++            await self.refresh_snapshot()
++            hold = self._landing_compliance_hold_result()
++            if not hold.ok:
++                raise BridgeError(f"{hold.code}: {hold.message}")
++            self._landing_compliant_since = self._clock.monotonic()
++            self._emit(
++                "LANDING_COMPLIANCE_STARTED",
++                settle_s=self.config.go2.landing_compliance_settle_s,
++            )
++            return
++        except (AeroGo2Error, OSError, RuntimeError, ValueError) as exc:
++            failure = exc
++        self._landing_compliant_since = None
++        relock_error: Optional[str] = None
++        try:
++            if not await self._go2.request_flight_pose():
++                relock_error = "Go2 rejected emergency JOINT_LOCK restoration"
++            await self.refresh_snapshot()
++            if not self._snapshot.go2.joints_locked:
++                relock_error = "Go2 did not confirm emergency JOINT_LOCK restoration"
++        except (AeroGo2Error, OSError, RuntimeError, ValueError) as exc:
++            relock_error = str(exc)
++        message = str(failure) if failure is not None else "unknown landing compliance failure"
++        if relock_error is not None:
++            message += f"; relock failed: {relock_error}"
++        raise BridgeError(message)
++
++    async def _finish_landing_compliance(self, reason: str) -> OperationResult:
++        if self.state is not SystemState.LANDING_COMPLIANT:
++            return OperationResult.failure(
++                "INVALID_STATE",
++                "Go2 landing compliance can only finish from LANDING_COMPLIANT",
++            )
++        try:
++            if not await self._go2.request_flight_pose():
++                raise BridgeError("Go2 rejected the JOINT_LOCK restoration request")
++            await self.refresh_snapshot()
++            if not self._snapshot.go2.joints_locked:
++                raise BridgeError("Go2 did not authoritatively report mode=6 JOINT_LOCK")
++            await self._state_machine.transition_to(
++                SystemState.FLIGHT_READY,
++                reason=f"landing compliance finished: {reason}",
++                snapshot=self._snapshot,
++            )
++            self._landing_compliant_since = None
++            self._emit("LANDING_COMPLIANCE_FINISHED", reason=reason)
++            await self.refresh_snapshot()
++        except (
++            AeroGo2Error,
++            asyncio.TimeoutError,
++            OSError,
++            RuntimeError,
++            ValueError,
++        ) as exc:
++            return OperationResult.failure("GO2_LANDING_RELOCK_FAILED", str(exc))
++        if self._snapshot.state is not SystemState.FLIGHT_READY:
++            return OperationResult.failure(
++                "GO2_LANDING_RELOCK_FAILED",
++                f"Expected FLIGHT_READY after relock, received {self._snapshot.state.name}",
++            )
++        return OperationResult.success("Go2 JOINT_LOCK restored after landing compliance")
++
+     async def _enter_fault_state(self, snapshot: SystemSnapshot) -> None:
+         self._autoland_active = False
+         self._maintenance_mode = False
+@@ -2507,6 +2874,8 @@ class SystemManager:
+     @staticmethod
+     def _specific_f446_failure_code(message: str, fallback: str) -> str:
+         for code in (
++            "GO2_JOINT_LOCK_FAILED",
++            "GO2_JOINT_LOCK_UNCONFIRMED",
+             "F446_OVERCURRENT",
+             "F446_FAULT",
+             "F446_TRANSFORM_TIMEOUT",
+diff --git a/base/src/aerogo2/manager/transition_guards.py b/target/src/aerogo2/manager/transition_guards.py
+index fde2c1f..4d4bbdc 100644
+--- a/base/src/aerogo2/manager/transition_guards.py
++++ b/target/src/aerogo2/manager/transition_guards.py
+@@ -17,6 +17,7 @@ from aerogo2.common.enums import (
+ from aerogo2.common.models import SystemSnapshot
+ from aerogo2.common.results import GuardResult
+ from aerogo2.safety.esc_telemetry import assess_esc_telemetry
++from aerogo2.safety.go2_contact import assess_foot_contact
+ from aerogo2.safety.rc_interlock import assess_flight_enable
+ from aerogo2.safety.watchdog import timestamp_is_fresh
+ 
+@@ -88,6 +89,12 @@ _MUTABLE_ALLOWED_TRANSITIONS: Dict[SystemState, Set[SystemState]] = {
+     SystemState.TOUCHDOWN_VERIFY: {
+         SystemState.FLIGHT_MANUAL,
+         SystemState.FLIGHT_TO_WALK_PRECHECK,
++        SystemState.LANDING_COMPLIANT,
++        SystemState.FAULT,
++        SystemState.EMERGENCY_STOP,
++    },
++    SystemState.LANDING_COMPLIANT: {
++        SystemState.FLIGHT_READY,
+         SystemState.FAULT,
+         SystemState.EMERGENCY_STOP,
+     },
+@@ -267,6 +274,8 @@ class TransitionGuards:
+                     "F446 final duty must be zero",
+                 )
+             self._require_disarmed(snapshot, codes, messages)
++            if snapshot.configuration is Configuration.FLIGHT:
++                self._require_go2_joint_lock(snapshot, codes, messages)
+ 
+         if new_state is SystemState.FLIGHT_MANUAL:
+             if current is SystemState.FLIGHT_READY and not snapshot.ground_arm_authorized:
+@@ -353,6 +362,42 @@ class TransitionGuards:
+                     "Pixhawk landed state is not confirmed",
+                 )
+ 
++        if new_state is SystemState.LANDING_COMPLIANT:
++            if not self._config.go2.landing_compliance_enabled:
++                self._reject(
++                    codes,
++                    messages,
++                    "LANDING_COMPLIANCE_DISABLED",
++                    "Landing compliance is disabled until foot-force calibration is configured",
++                )
++            self._require_fresh_devices(snapshot, codes, messages, include_rc=False)
++            self._require_disarmed(snapshot, codes, messages)
++            self._require_rotors_stopped(snapshot, codes, messages)
++            self._require_no_active_faults(snapshot, codes, messages)
++            self._require_go2_joint_lock(snapshot, codes, messages)
++            self._require_go2_foot_contact(snapshot, codes, messages)
++            if not snapshot.pixhawk.landed:
++                self._reject(
++                    codes,
++                    messages,
++                    "TOUCHDOWN_NOT_CONFIRMED",
++                    "Pixhawk must continue to report landed",
++                )
++            if snapshot.configuration is not Configuration.FLIGHT:
++                self._reject(
++                    codes,
++                    messages,
++                    "FLIGHT_CONFIGURATION_NOT_CONFIRMED",
++                    "Landing compliance requires the verified FLIGHT configuration",
++                )
++            if snapshot.f446.duty != 0 or snapshot.f446.faulted:
++                self._reject(
++                    codes,
++                    messages,
++                    "F446_NOT_SAFE",
++                    "F446 must remain stopped and fault-free",
++                )
++
+         if new_state is SystemState.FLIGHT_TO_WALK_PRECHECK:
+             self._require_disarmed(snapshot, codes, messages)
+             self._require_rotors_stopped(snapshot, codes, messages)
+@@ -638,6 +683,45 @@ class TransitionGuards:
+                 "Go2 must be stable and stationary",
+             )
+ 
++    @staticmethod
++    def _require_go2_joint_lock(
++        snapshot: SystemSnapshot,
++        codes: List[str],
++        messages: List[str],
++    ) -> None:
++        if not snapshot.go2.joints_locked:
++            TransitionGuards._reject(
++                codes,
++                messages,
++                "GO2_JOINT_LOCK_REQUIRED",
++                "Go2 must report JOINT_LOCK before entering FLIGHT_READY",
++            )
++
++    def _require_go2_foot_contact(
++        self,
++        snapshot: SystemSnapshot,
++        codes: List[str],
++        messages: List[str],
++    ) -> None:
++        if not self._config.go2.landing_compliance_enabled:
++            return
++        assessment = assess_foot_contact(snapshot.go2, self._config.go2)
++        if not assessment.valid:
++            self._reject(
++                codes,
++                messages,
++                "GO2_FOOT_FORCE_INVALID",
++                "All four calibrated Go2 foot-force channels must be valid",
++            )
++        elif not assessment.safe:
++            self._reject(
++                codes,
++                messages,
++                "GO2_FOOT_CONTACT_INSUFFICIENT",
++                f"Only {assessment.contact_count} feet report contact; "
++                f"{assessment.required_count} are required",
++            )
++
+     @staticmethod
+     def _require_no_active_faults(
+         snapshot: SystemSnapshot, codes: List[str], messages: List[str]
+diff --git a/target/src/aerogo2/safety/go2_contact.py b/target/src/aerogo2/safety/go2_contact.py
+new file mode 100644
+index 0000000..a8e6eb7
+--- /dev/null
++++ b/target/src/aerogo2/safety/go2_contact.py
+@@ -0,0 +1,57 @@
++"""Fail-closed assessment of Unitree Go2 raw foot-force contact telemetry."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Tuple
++
++from aerogo2.common.config import Go2Config
++from aerogo2.common.models import Go2Status
++
++
++@dataclass(frozen=True)
++class FootContactAssessment:
++    enabled: bool
++    valid: bool
++    contacts: Tuple[bool, bool, bool, bool]
++    contact_count: int
++    required_count: int
++    safe: bool
++
++
++def assess_foot_contact(
++    status: Go2Status,
++    config: Go2Config,
++) -> FootContactAssessment:
++    """Compare all four authoritative raw channels against calibrated thresholds."""
++
++    forces = tuple(status.foot_force)
++    thresholds = tuple(config.foot_force_contact_thresholds)
++    shape_valid = len(forces) == 4 and len(thresholds) == 4
++    values_valid = shape_valid and all(
++        type(force) is int and type(threshold) is int and threshold > 0
++        for force, threshold in zip(forces, thresholds)
++    )
++    valid = bool(status.foot_force_valid and values_valid)
++    contacts = (False, False, False, False)
++    if valid:
++        contacts = (
++            forces[0] >= thresholds[0],
++            forces[1] >= thresholds[1],
++            forces[2] >= thresholds[2],
++            forces[3] >= thresholds[3],
++        )
++    count = sum(1 for contact in contacts if contact)
++    enabled = config.landing_compliance_enabled
++    required = config.landing_contact_min_feet
++    return FootContactAssessment(
++        enabled=enabled,
++        valid=valid,
++        contacts=contacts,
++        contact_count=count,
++        required_count=required,
++        safe=enabled and valid and count >= required,
++    )
++
++
++__all__ = ["FootContactAssessment", "assess_foot_contact"]
+diff --git a/base/src/aerogo2/safety/interlocks.py b/target/src/aerogo2/safety/interlocks.py
+index ade7c22..1756e17 100644
+--- a/base/src/aerogo2/safety/interlocks.py
++++ b/target/src/aerogo2/safety/interlocks.py
+@@ -44,6 +44,7 @@ class SafetyInterlocks:
+         else:
+             legal_states = (
+                 SystemState.TOUCHDOWN_VERIFY,
++                SystemState.LANDING_COMPLIANT,
+                 SystemState.FLIGHT_TO_WALK_PRECHECK,
+             )
+             expected_current = Configuration.FLIGHT
+@@ -185,6 +186,11 @@ class SafetyInterlocks:
+             )
+         if not self._go2_stationary(snapshot):
+             reject("GO2_NOT_STATIONARY", "Go2 must remain stationary.")
++        if not snapshot.go2.joints_locked:
++            reject(
++                "GO2_JOINT_LOCK_REQUIRED",
++                "Go2 must authoritatively report JOINT_LOCK before flight enable.",
++            )
+         if snapshot.active_fault_codes:
+             reject("ACTIVE_FAULTS", "Active faults prevent flight readiness.")
+         return self._result(codes, messages)
+diff --git a/base/src/aerogo2/safety/safety_monitor.py b/target/src/aerogo2/safety/safety_monitor.py
+index 86dc6d5..fd7fb76 100644
+--- a/base/src/aerogo2/safety/safety_monitor.py
++++ b/target/src/aerogo2/safety/safety_monitor.py
+@@ -14,6 +14,7 @@ from aerogo2.common.config import AppConfig
+ from aerogo2.common.enums import Configuration, F446State, SafetySeverity, SystemState
+ from aerogo2.common.models import SafetyViolation, SystemSnapshot
+ from aerogo2.safety.esc_telemetry import assess_esc_telemetry
++from aerogo2.safety.go2_contact import assess_foot_contact
+ from aerogo2.safety.rc_interlock import assess_flight_enable
+ from aerogo2.safety.watchdog import timestamp_is_fresh
+ 
+@@ -39,6 +40,17 @@ _SAFE_UNKNOWN_CONFIGURATION_STATES = frozenset(
+     (SystemState.BOOT_SAFE, SystemState.FAULT, SystemState.EMERGENCY_STOP)
+ )
+ _AUTOLAND_STATES = frozenset((SystemState.AUTO_LANDING_READY, SystemState.AUTO_LANDING))
++_FLIGHT_JOINT_LOCK_STATES = frozenset(
++    (
++        SystemState.FLIGHT_READY,
++        SystemState.FLIGHT_MANUAL,
++        SystemState.AUTO_LANDING_READY,
++        SystemState.AUTO_LANDING,
++        SystemState.TOUCHDOWN_VERIFY,
++        SystemState.FLIGHT_TO_WALK_PRECHECK,
++        SystemState.TRANSFORM_TO_WALK,
++    )
++)
+ 
+ 
+ class SafetyMonitor:
+@@ -92,6 +104,57 @@ class SafetyMonitor:
+                 "Pixhawk armed without a live AeroGo2 shell authorization.",
+                 "Stop supervised outputs; retain RadioMaster control and do not auto-disarm.",
+             )
++        if snapshot.state in _FLIGHT_JOINT_LOCK_STATES and not snapshot.go2.joints_locked:
++            add(
++                "GO2_JOINT_LOCK_LOST",
++                (SafetySeverity.EMERGENCY if snapshot.pixhawk.armed else SafetySeverity.FAULT),
++                "Go2 no longer reports JOINT_LOCK in a flight-configuration state.",
++                "Stop AeroGo2-owned outputs, retain RadioMaster/Pixhawk control, and do not auto-disarm.",
++            )
++
++        if snapshot.state is SystemState.LANDING_COMPLIANT:
++            contact = assess_foot_contact(snapshot.go2, self._config.go2)
++            if snapshot.pixhawk.armed:
++                add(
++                    "PIXHAWK_ARMED_DURING_LANDING_COMPLIANCE",
++                    SafetySeverity.EMERGENCY,
++                    "Pixhawk armed while Go2 joints were in the compliant landing posture.",
++                    "Re-lock Go2 immediately; retain RadioMaster control and never auto-disarm.",
++                )
++            if self._esc_is_unsafe(snapshot):
++                add(
++                    "ESC_RPM_NONZERO_DURING_LANDING_COMPLIANCE",
++                    SafetySeverity.EMERGENCY,
++                    "ESC telemetry is not complete, healthy, finite, and exactly zero.",
++                    "Re-lock Go2 immediately and keep rotor control with RadioMaster/Pixhawk.",
++                )
++            if not contact.valid:
++                add(
++                    "GO2_FOOT_FORCE_INVALID",
++                    SafetySeverity.FAULT,
++                    "One or more calibrated Go2 foot-force channels are invalid.",
++                    "Re-lock Go2 and inspect live foot-force telemetry before retrying.",
++                )
++            elif not contact.safe:
++                add(
++                    "GO2_FOOT_CONTACT_LOST",
++                    SafetySeverity.FAULT,
++                    f"Only {contact.contact_count} feet report contact; "
++                    f"{contact.required_count} are required.",
++                    "Re-lock Go2 and stabilize the vehicle before retrying.",
++                )
++            if (
++                snapshot.go2.locomotion_mode != "BALANCE_STAND"
++                or snapshot.go2.joints_locked
++                or not snapshot.go2.stable
++                or snapshot.go2.moving
++            ):
++                add(
++                    "GO2_LANDING_COMPLIANCE_LOST",
++                    SafetySeverity.FAULT,
++                    "Go2 no longer reports a stable BALANCE_STAND landing posture.",
++                    "Re-lock Go2 before any morphology movement.",
++                )
+ 
+         if snapshot.state in _TRANSFORM_INTERLOCK_STATES:
+             if snapshot.pixhawk.failsafe or snapshot.pixhawk.rc_failsafe:
+@@ -365,6 +428,7 @@ class SafetyMonitor:
+             SystemState.AUTO_LANDING_READY,
+             SystemState.AUTO_LANDING,
+             SystemState.TOUCHDOWN_VERIFY,
++            SystemState.LANDING_COMPLIANT,
+             SystemState.FLIGHT_TO_WALK_PRECHECK,
+         ):
+             state_expected = Configuration.FLIGHT
+diff --git a/target/src/aerogo2/tools/__init__.py b/target/src/aerogo2/tools/__init__.py
+new file mode 100644
+index 0000000..e29d434
+--- /dev/null
++++ b/target/src/aerogo2/tools/__init__.py
+@@ -0,0 +1 @@
++"""Operator-facing offline configuration helpers."""
+diff --git a/target/src/aerogo2/tools/configure_landing_compliance.py b/target/src/aerogo2/tools/configure_landing_compliance.py
+new file mode 100644
+index 0000000..a977965
+--- /dev/null
++++ b/target/src/aerogo2/tools/configure_landing_compliance.py
+@@ -0,0 +1,123 @@
++"""Atomically configure calibrated Go2 landing-compliance thresholds."""
++
++from __future__ import annotations
++
++import argparse
++import os
++import shutil
++import sys
++from pathlib import Path
++from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
++
++import yaml
++
++from aerogo2.common.config import load_config
++from aerogo2.common.exceptions import AeroGo2Error
++
++
++def configure_landing_compliance(
++    config_path: Path,
++    *,
++    enabled: bool,
++    thresholds: Optional[Tuple[int, int, int, int]] = None,
++    minimum_contact_feet: int = 3,
++    contact_confirm_s: float = 0.5,
++    settle_s: float = 1.5,
++) -> Path:
++    """Validate and atomically replace one YAML overlay, returning its backup path."""
++
++    path = config_path.resolve()
++    if not path.is_file():
++        raise ValueError(f"Configuration file does not exist: {path}")
++    if enabled and thresholds is None:
++        raise ValueError("Four calibrated thresholds are required when enabling")
++    if thresholds is not None and any(item <= 0 or item > 32767 for item in thresholds):
++        raise ValueError("Every calibrated threshold must be within 1..32767")
++    if minimum_contact_feet < 1 or minimum_contact_feet > 4:
++        raise ValueError("minimum_contact_feet must be within 1..4")
++    if contact_confirm_s <= 0.0 or settle_s <= 0.0:
++        raise ValueError("Confirmation and settle times must be positive")
++
++    loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
++    if loaded is None:
++        document: Dict[str, Any] = {}
++    elif isinstance(loaded, Mapping):
++        document = dict(loaded)
++    else:
++        raise ValueError("Top-level hardware configuration must be a mapping")
++    existing_go2 = document.get("go2", {})
++    if not isinstance(existing_go2, Mapping):
++        raise ValueError("The go2 configuration section must be a mapping")
++    go2 = dict(existing_go2)
++    go2["landing_compliance_enabled"] = enabled
++    if thresholds is not None:
++        go2["foot_force_contact_thresholds"] = list(thresholds)
++        go2["landing_contact_min_feet"] = minimum_contact_feet
++        go2["landing_contact_confirm_s"] = contact_confirm_s
++        go2["landing_compliance_settle_s"] = settle_s
++    document["go2"] = go2
++
++    candidate = path.parent / f".{path.name}.aerogo2-candidate"
++    backup = path.parent / f"{path.name}.bak"
++    try:
++        candidate.write_text(
++            yaml.safe_dump(document, sort_keys=False),
++            encoding="utf-8",
++        )
++        load_config(candidate)
++        shutil.copy2(path, backup)
++        os.replace(candidate, path)
++    finally:
++        if candidate.exists():
++            candidate.unlink()
++    return backup
++
++
++def _parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        description="Configure calibrated AeroGo2 landing compliance",
++    )
++    parser.add_argument("--config", type=Path, required=True)
++    mode = parser.add_mutually_exclusive_group(required=True)
++    mode.add_argument("--enable", action="store_true")
++    mode.add_argument("--disable", action="store_true")
++    parser.add_argument("--thresholds", nargs=4, type=int, metavar=("F0", "F1", "F2", "F3"))
++    parser.add_argument("--minimum-contact-feet", type=int, default=3)
++    parser.add_argument("--contact-confirm-s", type=float, default=0.5)
++    parser.add_argument("--settle-s", type=float, default=1.5)
++    return parser
++
++
++def main(argv: Optional[Sequence[str]] = None) -> int:
++    parser = _parser()
++    args = parser.parse_args(argv)
++    raw_thresholds = args.thresholds
++    thresholds = (
++        None
++        if raw_thresholds is None
++        else (
++            raw_thresholds[0],
++            raw_thresholds[1],
++            raw_thresholds[2],
++            raw_thresholds[3],
++        )
++    )
++    try:
++        backup = configure_landing_compliance(
++            args.config,
++            enabled=bool(args.enable),
++            thresholds=thresholds,
++            minimum_contact_feet=args.minimum_contact_feet,
++            contact_confirm_s=args.contact_confirm_s,
++            settle_s=args.settle_s,
++        )
++    except (AeroGo2Error, OSError, TypeError, ValueError, yaml.YAMLError) as exc:
++        print(f"Configuration not changed: {exc}", file=sys.stderr)
++        return 2
++    state = "enabled" if args.enable else "disabled"
++    print(f"Landing compliance {state}; backup={backup}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/target/tests/state_machine/test_landing_compliance.py b/target/tests/state_machine/test_landing_compliance.py
+new file mode 100644
+index 0000000..609d23a
+--- /dev/null
++++ b/target/tests/state_machine/test_landing_compliance.py
+@@ -0,0 +1,173 @@
++from __future__ import annotations
++
++from dataclasses import replace
++from typing import List
++
++import pytest
++
++from aerogo2.common.config import AppConfig
++from aerogo2.common.enums import SystemState
++from aerogo2.common.models import LandingEstimate
++from aerogo2.simulation.world import SimulationWorld
++
++
++def _enabled_config(app_config: AppConfig) -> AppConfig:
++    return replace(
++        app_config,
++        go2=replace(
++            app_config.go2,
++            landing_compliance_enabled=True,
++            foot_force_contact_thresholds=(10, 20, 30, 40),
++            landing_contact_min_feet=3,
++            landing_contact_confirm_s=0.15,
++            landing_compliance_settle_s=0.20,
++        ),
++    )
++
++
++async def _reach_touchdown_verify(world: SimulationWorld) -> None:
++    states: List[SystemState] = []
++    assert (await world.start()).ok
++    assert (await world._reach_flight_manual(states)).ok
++    world._set_landing_estimate(
++        LandingEstimate(
++            valid=False,
++            ground_detected=False,
++            height_m=None,
++            timestamp=world.clock.monotonic(),
++            reason="manual landing",
++        )
++    )
++    world.pixhawk.inject_landed_state(
++        True,
++        vertical_velocity_mps=0.0,
++        relative_altitude_m=0.0,
++    )
++    world.pixhawk.inject_attitude(0.0, 0.0, 0.0)
++    for slot in world.config.esc.slots:
++        world.pixhawk.inject_esc_rpm(slot, 0.0)
++    steps = int(world.config.safety.touchdown_confirm_s / 0.05) + 3
++    for _ in range(steps):
++        await world.step(0.05)
++        if world.manager.state is SystemState.TOUCHDOWN_VERIFY:
++            break
++    assert world.manager.state is SystemState.TOUCHDOWN_VERIFY
++    assert world.manager.snapshot.go2.joints_locked
++    assert world.manager.snapshot.pixhawk.armed
++
++
++async def _enter_landing_compliant(world: SimulationWorld) -> None:
++    await _reach_touchdown_verify(world)
++    world.pixhawk.inject_armed_state(False)
++    world._set_switches(morphology=1000, autoland=1000, flight_enable=1000)
++    world.go2.inject_status(
++        foot_force=(100, 100, 100, 0),
++        foot_force_valid=True,
++    )
++    steps = int(world.config.go2.landing_contact_confirm_s / 0.05) + 4
++    for _ in range(steps):
++        await world.step(0.05)
++        if world.manager.state is SystemState.LANDING_COMPLIANT:
++            break
++    assert world.manager.state is SystemState.LANDING_COMPLIANT
++
++
++@pytest.mark.asyncio
++async def test_enabled_compliance_cannot_be_bypassed_without_foot_contact(
++    app_config: AppConfig,
++) -> None:
++    world = SimulationWorld(_enabled_config(app_config))
++    try:
++        await _reach_touchdown_verify(world)
++        world.pixhawk.inject_armed_state(False)
++        world._set_switches(morphology=1000, autoland=1000, flight_enable=1000)
++        world.go2.inject_status(
++            foot_force=(0, 0, 0, 0),
++            foot_force_valid=True,
++        )
++        await world.step(0.25)
++
++        result = await world.manager.request_transform_walk(operator_confirmed=True)
++
++        assert not result.ok
++        assert result.code == "LANDING_COMPLIANCE_REQUIRED"
++        assert world.manager.state is SystemState.TOUCHDOWN_VERIFY
++        assert world.manager.snapshot.go2.joints_locked
++    finally:
++        await world.shutdown()
++
++
++@pytest.mark.asyncio
++async def test_three_calibrated_feet_enter_balance_then_relock_before_transform(
++    app_config: AppConfig,
++) -> None:
++    world = SimulationWorld(_enabled_config(app_config))
++    try:
++        await _enter_landing_compliant(world)
++
++        assert world.manager.snapshot.go2.locomotion_mode == "BALANCE_STAND"
++        assert not world.manager.snapshot.go2.joints_locked
++        report = world.manager.query("landing compliance")
++        assert report["contact_count"] == 3
++        assert report["contact_safe"] is True
++
++        early = await world.manager.request_transform_walk(operator_confirmed=True)
++        assert not early.ok
++        assert early.code == "LANDING_COMPLIANCE_SETTLE_REQUIRED"
++
++        await world.step(world.config.go2.landing_compliance_settle_s + 0.05)
++        result = await world.manager.request_transform_walk(operator_confirmed=True)
++
++        assert result.ok
++        assert world.manager.state is SystemState.WALK
++        assert world.manager.snapshot.go2.joints_locked
++        assert (await world.manager.walk_stand()).ok
++        assert not world.manager.snapshot.go2.joints_locked
++    finally:
++        await world.shutdown()
++
++
++@pytest.mark.asyncio
++async def test_contact_loss_in_compliant_mode_relocks_then_faults(
++    app_config: AppConfig,
++) -> None:
++    world = SimulationWorld(_enabled_config(app_config))
++    try:
++        await _enter_landing_compliant(world)
++        world.go2.inject_status(
++            foot_force=(0, 0, 0, 0),
++            foot_force_valid=True,
++        )
++
++        await world.step(0.05)
++
++        assert world.manager.state is SystemState.FAULT
++        assert world.manager.snapshot.go2.joints_locked
++        assert any(item.code == "GO2_FOOT_CONTACT_LOST" for item in world.manager.violations)
++    finally:
++        await world.shutdown()
++
++
++@pytest.mark.asyncio
++async def test_disarm_and_exact_zero_rpm_are_required_before_unlock(
++    app_config: AppConfig,
++) -> None:
++    world = SimulationWorld(_enabled_config(app_config))
++    try:
++        await _reach_touchdown_verify(world)
++        world.go2.inject_status(
++            foot_force=(100, 100, 100, 100),
++            foot_force_valid=True,
++        )
++        await world.step(0.25)
++        assert world.manager.state is SystemState.TOUCHDOWN_VERIFY
++        assert world.manager.snapshot.go2.joints_locked
++
++        world.pixhawk.inject_armed_state(False)
++        world.pixhawk.inject_esc_rpm(1, 1.0)
++        world._set_switches(morphology=1000, autoland=1000, flight_enable=1000)
++        await world.step(0.25)
++        assert world.manager.state is SystemState.TOUCHDOWN_VERIFY
++        assert world.manager.snapshot.go2.joints_locked
++    finally:
++        await world.shutdown()
+diff --git a/target/tests/unit/test_landing_config_tool.py b/target/tests/unit/test_landing_config_tool.py
+new file mode 100644
+index 0000000..0f94ddf
+--- /dev/null
++++ b/target/tests/unit/test_landing_config_tool.py
+@@ -0,0 +1,62 @@
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++import yaml
++
++from aerogo2.common.config import AppConfig, load_config
++from aerogo2.common.immutable import deep_thaw
++from aerogo2.tools.configure_landing_compliance import configure_landing_compliance
++
++
++def _standalone_config(tmp_path: Path, app_config: AppConfig) -> Path:
++    path = tmp_path / "hardware.yaml"
++    path.write_text(
++        yaml.safe_dump(deep_thaw(app_config.raw), sort_keys=False),
++        encoding="utf-8",
++    )
++    return path
++
++
++def test_configuration_tool_validates_backs_up_and_atomically_enables(
++    tmp_path: Path,
++    app_config: AppConfig,
++) -> None:
++    path = _standalone_config(tmp_path, app_config)
++
++    backup = configure_landing_compliance(
++        path,
++        enabled=True,
++        thresholds=(101, 202, 303, 404),
++        minimum_contact_feet=3,
++        contact_confirm_s=0.6,
++        settle_s=1.7,
++    )
++
++    loaded = load_config(path)
++    original = load_config(backup)
++    assert loaded.go2.landing_compliance_enabled
++    assert loaded.go2.foot_force_contact_thresholds == (101, 202, 303, 404)
++    assert loaded.go2.landing_contact_min_feet == 3
++    assert loaded.go2.landing_contact_confirm_s == 0.6
++    assert loaded.go2.landing_compliance_settle_s == 1.7
++    assert not original.go2.landing_compliance_enabled
++
++
++def test_invalid_thresholds_leave_configuration_unchanged(
++    tmp_path: Path,
++    app_config: AppConfig,
++) -> None:
++    path = _standalone_config(tmp_path, app_config)
++    before = path.read_bytes()
++
++    with pytest.raises(ValueError, match="1..32767"):
++        configure_landing_compliance(
++            path,
++            enabled=True,
++            thresholds=(10, 20, 0, 40),
++        )
++
++    assert path.read_bytes() == before
++    assert not (tmp_path / "hardware.yaml.bak").exists()

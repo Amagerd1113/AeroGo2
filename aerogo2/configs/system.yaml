@@ -1,0 +1,36 @@
+includes:
+  - serial.yaml
+  - rc_channels.yaml
+  - safety_limits.yaml
+  - f446.yaml
+  - landing.yaml
+
+system:
+  loop_hz: 50
+  dry_run: true
+  hardware_write_enabled: false
+  log_directory: "./logs"
+
+go2:
+  enabled: true
+  status_timeout_s: 0.2
+  network_interface: "eth0"
+  domain_id: 0
+  sport_state_topic: "rt/sportmodestate"
+  command_timeout_s: 2.0
+  # Keep disabled until all four raw foot-force channels have been calibrated
+  # on this exact robot. Threshold order is the SDK foot_force[0..3] order.
+  landing_compliance_enabled: false
+  foot_force_contact_thresholds: [0, 0, 0, 0]
+  landing_contact_min_feet: 3
+  landing_contact_confirm_s: 0.5
+  landing_compliance_settle_s: 1.5
+
+esc:
+  # Hobbywing NodeID/ThrottleID/output order validated by pixhawk_x8_cli_diag.py:
+  # 1=rear-right, 2=left-front, 3=left-rear, 4=right-front.
+  slot_1: "RR"
+  slot_2: "LF"
+  slot_3: "LR"
+  slot_4: "RF"
+

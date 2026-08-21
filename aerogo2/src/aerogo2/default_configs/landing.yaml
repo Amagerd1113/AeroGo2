@@ -1,0 +1,8 @@
+landing:
+  controller_hz: 30
+  maximum_descent_speed_mps: 0.5
+  maximum_horizontal_speed_mps: 0.5
+  maximum_yaw_rate_rad_s: 0.5
+  controller_timeout_s: 0.1
+  manual_override_deadband_us: 150
+  default_abort_mode: "LOITER"

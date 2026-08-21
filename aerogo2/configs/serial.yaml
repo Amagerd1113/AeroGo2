@@ -1,0 +1,13 @@
+pixhawk:
+  connection: "/dev/ttyACM0"
+  baud: 115200
+  heartbeat_timeout_s: 30.0
+  target_system: 1
+  target_component: 1
+  rc9_option: 0
+  rc10_option: 0
+
+f446:
+  port: "/dev/serial/by-id/F446_DEVICE"
+  baud: 115200
+

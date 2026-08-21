@@ -1,0 +1,10 @@
+include requirements.txt
+recursive-include configs *.yaml
+recursive-include scripts *.py
+recursive-include tests *.py *.json *.txt
+recursive-include deploy *
+recursive-include docs *.md
+
+global-exclude *.py[cod]
+global-exclude __pycache__
+prune logs

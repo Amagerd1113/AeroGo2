@@ -1,0 +1,19 @@
+[
+  {
+    "message": "HEARTBEAT",
+    "armed": false,
+    "flight_mode": "LOITER",
+    "timestamp": 10.0
+  },
+  {
+    "message": "ESC_TELEMETRY",
+    "rpm": [0, 0, 0, 0],
+    "timestamp": 10.0
+  },
+  {
+    "message": "EXTENDED_SYS_STATE",
+    "landed": true,
+    "timestamp": 10.0
+  }
+]
+

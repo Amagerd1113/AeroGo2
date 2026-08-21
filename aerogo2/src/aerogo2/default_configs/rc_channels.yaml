@@ -1,0 +1,18 @@
+rc:
+  flight_enable_channel: 5
+  flight_mode_channel: 6
+  rtl_channel: 7
+  land_channel: 8
+  morphology_channel: 9
+  auto_landing_channel: 10
+  brake_channel: 11
+  buzzer_channel: 12
+
+  low_max: 1200
+  middle_min: 1300
+  middle_max: 1700
+  high_min: 1800
+
+  debounce_s: 0.2
+  timeout_s: 0.5
+  manual_override_deadband_us: 150

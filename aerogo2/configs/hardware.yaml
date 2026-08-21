@@ -1,0 +1,19 @@
+includes:
+  - system.yaml
+
+# Production overlay. Hardware write remains locked on disk. The operator must
+# explicitly unlock it for each process invocation with the CLI safety flags.
+system:
+  dry_run: false
+  hardware_write_enabled: false
+  log_directory: "/var/log/aerogo2"
+
+pixhawk:
+  connection: "/dev/serial/by-id/REPLACE_WITH_PIXHAWK_ID"
+
+f446:
+  port: "/dev/serial/by-id/REPLACE_WITH_F446_ID"
+
+go2:
+  network_interface: "eth0"
+  domain_id: 0

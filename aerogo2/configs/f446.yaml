@@ -1,0 +1,17 @@
+f446:
+  flight_direction: "forward"
+  walk_direction: "reverse"
+
+  flight_duty: 120
+  walk_duty: 120
+
+  expected_flight_state: "LIMIT_REACHED_FWD"
+  expected_walk_state: "LIMIT_REACHED_REV"
+
+  response_timeout_s: 0.5
+  transform_timeout_s: 6.0
+  status_poll_hz: 10
+
+  current_safe_margin_adc: 200
+  current_clear_hold_s: 1.0
+
