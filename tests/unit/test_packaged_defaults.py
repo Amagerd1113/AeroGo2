@@ -25,6 +25,7 @@ def test_default_config_falls_back_to_packaged_copy(
     assert config.pixhawk.baud == 115200
     assert config.pixhawk.heartbeat_timeout_s == 30.0
     assert config.esc.slots == {1: "RR", 2: "LF", 3: "LR", 4: "RF"}
+    assert config.esc.mavlink_display_shift == 0
     assert config.system.log_directory == (tmp_path / "logs").resolve()
 
 

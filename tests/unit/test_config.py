@@ -47,6 +47,21 @@ def test_f446_mapping_is_configuration_driven(app_config: AppConfig) -> None:
 
 def test_esc_mapping_is_fixed_and_unique(app_config: AppConfig) -> None:
     assert app_config.esc.slots == {1: "RR", 2: "LF", 3: "LR", 4: "RF"}
+    assert app_config.esc.mavlink_display_shift == 0
+
+
+def test_missing_esc_display_shift_defaults_to_zero(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    raw = deep_thaw(app_config.raw)
+    del raw["esc"]["mavlink_display_shift"]
+    path = tmp_path / "legacy-config.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    loaded = load_config(path)
+
+    assert loaded.esc.mavlink_display_shift == 0
 
 
 Mutator = Callable[[Dict[str, Any]], None]
@@ -88,6 +103,10 @@ def _duplicate_esc(raw: Dict[str, Any]) -> None:
     raw["esc"]["slot_4"] = "LR"
 
 
+def _invalid_esc_display_shift(raw: Dict[str, Any]) -> None:
+    raw["esc"]["mavlink_display_shift"] = 2
+
+
 def _zero_safety_timeout(raw: Dict[str, Any]) -> None:
     raw["safety"]["pixhawk_timeout_s"] = 0
 
@@ -108,6 +127,7 @@ def _negative_landing_speed(raw: Dict[str, Any]) -> None:
         (_overlap_rc, "thresholds"),
         (_rc9_option, "RC9_OPTION"),
         (_duplicate_esc, "ESC slots"),
+        (_invalid_esc_display_shift, "mavlink_display_shift"),
         (_zero_safety_timeout, "pixhawk_timeout_s"),
         (_negative_landing_speed, "maximum_descent_speed_mps"),
     ],

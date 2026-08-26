@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aerogo2"
-version = "0.3.2"
+version = "0.3.3"
 description = "Safety-first simulation and supervised hardware console for the AeroGo2 dual-mode robot"
 readme = {file = "PACKAGE_README.md", content-type = "text/markdown"}
 requires-python = ">=3.8"

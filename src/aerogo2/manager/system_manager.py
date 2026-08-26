@@ -2094,7 +2094,14 @@ class SystemManager:
             item = next((entry for entry in esc_items if entry["slot"] == slot), None)
             return {"slot": slot, "telemetry": item}
         if name == "esc mapping":
-            return {"mapping": dict(self.config.esc.slots)}
+            display_shift = self.config.esc.mavlink_display_shift
+            return {
+                "mapping": dict(self.config.esc.slots),
+                "mavlink_display_shift": display_shift,
+                "expected_raw_slots": {
+                    slot: slot + display_shift for slot in self.config.esc.slots
+                },
+            }
         if name == "esc health":
             tuple_items = self._snapshot.pixhawk.esc
             tuple_slots = [item.slot for item in tuple_items]

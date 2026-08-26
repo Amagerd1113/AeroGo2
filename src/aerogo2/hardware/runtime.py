@@ -35,6 +35,7 @@ class HardwareWorld:
         self.pixhawk = MavlinkPixhawkBridge(
             config.pixhawk,
             config.esc.slots,
+            esc_mavlink_display_shift=config.esc.mavlink_display_shift,
             clock=self.clock,
             rc_timeout_s=config.safety.rc_timeout_s,
             allow_setpoints=False,

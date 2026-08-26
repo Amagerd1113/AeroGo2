@@ -94,6 +94,9 @@ def test_boolean_strings_are_never_coerced(
         ("rc.low_max", 799, "at least 800"),
         ("rc.high_min", 2201, "at most 2200"),
         ("pixhawk.baud", True, "must be an integer"),
+        ("esc.mavlink_display_shift", True, "must be an integer"),
+        ("esc.mavlink_display_shift", -1, "at least 0"),
+        ("esc.mavlink_display_shift", 2, "at most 1"),
     ],
 )
 def test_integer_and_protocol_bounds_are_strict(

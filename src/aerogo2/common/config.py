@@ -134,6 +134,7 @@ class LandingConfig:
 @dataclass(frozen=True)
 class EscConfig:
     slots: Mapping[int, str]
+    mavlink_display_shift: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "slots", frozen_mapping(self.slots))
@@ -565,6 +566,14 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
         actual_mapping = {index: str(slots[index - 1]) for index in range(1, 5)}
         if actual_mapping != X8_ESC_SLOT_MAPPING:
             errors.append("X8 ESC slots must match NodeID/ThrottleID order 1=RR, 2=LF, 3=LR, 4=RF")
+    if "mavlink_display_shift" in esc:
+        integer(
+            esc,
+            "mavlink_display_shift",
+            "esc.mavlink_display_shift",
+            minimum=0,
+            maximum=1,
+        )
     return errors
 
 
@@ -698,7 +707,10 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
             manual_override_deadband_us=_required(landing, "manual_override_deadband_us"),
             default_abort_mode=_required(landing, "default_abort_mode"),
         ),
-        esc=EscConfig(slots={index: _required(esc, f"slot_{index}") for index in range(1, 5)}),
+        esc=EscConfig(
+            slots={index: _required(esc, f"slot_{index}") for index in range(1, 5)},
+            mavlink_display_shift=int(esc.get("mavlink_display_shift", 0)),
+        ),
         raw=raw,
     )
 

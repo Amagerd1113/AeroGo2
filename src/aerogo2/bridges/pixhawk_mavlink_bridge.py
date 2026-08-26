@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from dataclasses import dataclass, replace
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from aerogo2.common.async_utils import run_blocking
 from aerogo2.common.clock import Clock, RealClock
@@ -52,12 +52,14 @@ class MavlinkPixhawkBridge:
         config: PixhawkConfig,
         esc_mapping: Mapping[int, str],
         *,
+        esc_mavlink_display_shift: int = 0,
         clock: Optional[Clock] = None,
         rc_timeout_s: float = 0.5,
         allow_setpoints: bool = False,
     ) -> None:
         self._config = config
         self._esc_mapping = dict(esc_mapping)
+        self._esc_mavlink_display_shift = esc_mavlink_display_shift
         self._clock = clock or RealClock()
         self._rc_timeout_s = rc_timeout_s
         self._esc_timeout_s = rc_timeout_s * 2.0
@@ -79,7 +81,8 @@ class MavlinkPixhawkBridge:
             esc=tuple(
                 EscTelemetry(slot, position, healthy=False)
                 for slot, position in sorted(self._esc_mapping.items())
-            )
+            ),
+            esc_mavlink_display_shift=self._esc_mavlink_display_shift,
         )
 
     async def connect(self) -> None:
@@ -606,7 +609,7 @@ class MavlinkPixhawkBridge:
     def _build_logical_esc_status(
         self,
         now: float,
-    ) -> Tuple[Tuple[EscTelemetry, ...], Tuple[int, ...], Optional[int]]:
+    ) -> Tuple[Tuple[EscTelemetry, ...], Tuple[int, ...], int]:
         raw_items: Dict[int, _RawEscTelemetry] = {}
         for group in self._esc_groups.values():
             age = now - group.timestamp
@@ -616,15 +619,16 @@ class MavlinkPixhawkBridge:
                 raw_items[item.slot] = item
 
         raw_present_slots = tuple(sorted(slot for slot, item in raw_items.items() if item.present))
-        display_shift = self._infer_mavlink_display_shift(raw_present_slots)
-        if display_shift is None:
+        display_shift = self._esc_mavlink_display_shift
+        expected_raw_slots = {slot + display_shift for slot in self._esc_mapping}
+        if any(slot not in expected_raw_slots for slot in raw_present_slots):
             return (
                 tuple(
                     self._logical_esc_item(slot, position, None)
                     for slot, position in sorted(self._esc_mapping.items())
                 ),
                 raw_present_slots,
-                None,
+                display_shift,
             )
 
         return (
@@ -639,21 +643,6 @@ class MavlinkPixhawkBridge:
             raw_present_slots,
             display_shift,
         )
-
-    def _infer_mavlink_display_shift(
-        self,
-        raw_present_slots: Iterable[int],
-    ) -> Optional[int]:
-        present = {int(slot) for slot in raw_present_slots}
-        expected = set(self._esc_mapping)
-        if not present or not expected:
-            return None
-        candidates = [
-            shift
-            for shift in range(-31, 32)
-            if {raw_slot - shift for raw_slot in present}.issubset(expected)
-        ]
-        return candidates[0] if len(candidates) == 1 else None
 
     @staticmethod
     def _logical_esc_item(

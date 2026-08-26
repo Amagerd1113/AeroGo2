@@ -29,6 +29,8 @@ go2:
 esc:
   # Hobbywing NodeID/ThrottleID/output order validated by pixhawk_x8_cli_diag.py:
   # 1=rear-right, 2=left-front, 3=left-rear, 4=right-front.
+  # New X8-G2 firmware reports slots directly (0). Legacy firmware reports +1 (1).
+  mavlink_display_shift: 0
   slot_1: "RR"
   slot_2: "LF"
   slot_3: "LR"

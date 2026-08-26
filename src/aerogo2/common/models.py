@@ -56,7 +56,7 @@ class PixhawkStatus:
     esc_rpm: Mapping[int, float] = field(default_factory=dict)
     esc_online: Mapping[int, bool] = field(default_factory=dict)
     esc_raw_present_slots: Tuple[int, ...] = ()
-    esc_mavlink_display_shift: Optional[int] = None
+    esc_mavlink_display_shift: int = 0
 
     # Compatibility/detail fields used by the Phase 1 safety implementation.
     failsafe: bool = False

@@ -163,11 +163,16 @@ def test_pixhawk_esc_telemetry_mapping_and_units(
     assert all(item.healthy for item in items)
 
 
-def test_pixhawk_merges_both_groups_and_marks_actual_esc2_offline(
+def test_pixhawk_explicit_legacy_shift_merges_groups_and_marks_esc2_offline(
     app_config: AppConfig,
     clock: ManualClock,
 ) -> None:
-    bridge = MavlinkPixhawkBridge(app_config.pixhawk, app_config.esc.slots, clock=clock)
+    bridge = MavlinkPixhawkBridge(
+        app_config.pixhawk,
+        app_config.esc.slots,
+        esc_mavlink_display_shift=1,
+        clock=clock,
+    )
     bridge._connected = True
     bridge._handle_message(
         SimpleNamespace(
@@ -203,7 +208,7 @@ def test_pixhawk_merges_both_groups_and_marks_actual_esc2_offline(
     assert items[4].voltage_v == 44.68
 
 
-def test_pixhawk_esc_mapping_ambiguity_fails_closed(
+def test_pixhawk_default_zero_shift_maps_partial_new_firmware_telemetry(
     app_config: AppConfig,
     clock: ManualClock,
 ) -> None:
@@ -223,8 +228,42 @@ def test_pixhawk_esc_mapping_ambiguity_fails_closed(
     status = bridge.get_status()
 
     assert status.esc_raw_present_slots == (2, 4)
-    assert status.esc_mavlink_display_shift is None
-    assert status.esc_online == {1: False, 2: False, 3: False, 4: False}
+    assert status.esc_mavlink_display_shift == 0
+    assert status.esc_online == {1: False, 2: True, 3: False, 4: True}
+
+
+def test_pixhawk_wrong_configured_shift_fails_closed_on_unexpected_raw_slot(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    bridge = MavlinkPixhawkBridge(app_config.pixhawk, app_config.esc.slots, clock=clock)
+    bridge._connected = True
+    bridge._handle_message(
+        SimpleNamespace(
+            get_type=lambda: "ESC_TELEMETRY_1_TO_4",
+            rpm=(0, 0, 0, 0),
+            voltage=(0, 4487, 0, 4437),
+            current=(0, 0, 0, 0),
+            temperature=(0, 13, 0, 13),
+            count=(0, 100, 0, 100),
+        )
+    )
+    bridge._handle_message(
+        SimpleNamespace(
+            get_type=lambda: "ESC_TELEMETRY_5_TO_8",
+            rpm=(0, 0, 0, 0),
+            voltage=(4468, 0, 0, 0),
+            current=(0, 0, 0, 0),
+            temperature=(14, 0, 0, 0),
+            count=(100, 0, 0, 0),
+        )
+    )
+
+    status = bridge.get_status()
+
+    assert status.esc_raw_present_slots == (2, 4, 5)
+    assert status.esc_mavlink_display_shift == 0
+    assert not any(status.esc_online.values())
     assert all(math.isnan(item.rpm) for item in status.esc)
 
 
@@ -249,7 +288,7 @@ def test_pixhawk_esc_telemetry_staleness_fails_closed(
     status = bridge.get_status()
 
     assert status.esc_raw_present_slots == ()
-    assert status.esc_mavlink_display_shift is None
+    assert status.esc_mavlink_display_shift == 0
     assert not any(status.esc_online.values())
 
 
