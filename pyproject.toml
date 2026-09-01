@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aerogo2"
-version = "0.3.3"
+version = "0.3.9"
 description = "Safety-first simulation and supervised hardware console for the AeroGo2 dual-mode robot"
 readme = {file = "PACKAGE_README.md", content-type = "text/markdown"}
 requires-python = ">=3.8"
@@ -30,6 +30,7 @@ dev = [
 
 [project.scripts]
 aerogo2 = "aerogo2.main:main"
+aerogo2-configure-f446 = "aerogo2.tools.configure_f446:main"
 aerogo2-configure-landing = "aerogo2.tools.configure_landing_compliance:main"
 
 [tool.setuptools]

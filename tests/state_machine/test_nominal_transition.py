@@ -20,6 +20,7 @@ async def test_nominal_transition_history_contains_every_guarded_stage(
             SystemState.WALK,
             SystemState.WALK_TO_FLIGHT_PRECHECK,
             SystemState.TRANSFORM_TO_FLIGHT,
+            SystemState.GO2_JOINT_LOCK_WAIT,
             SystemState.FLIGHT_READY,
             SystemState.FLIGHT_MANUAL,
             SystemState.AUTO_LANDING_READY,

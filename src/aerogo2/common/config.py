@@ -51,6 +51,10 @@ class F446Config:
     response_timeout_s: float
     transform_timeout_s: float
     status_poll_hz: float
+    firmware_timeout_ms: int
+    automatic_stall_threshold_adc: int
+    stall_blanking_ms: int
+    stall_overcurrent_ms: int
     current_safe_margin_adc: int
     current_clear_hold_s: float
 
@@ -76,6 +80,7 @@ class Go2Config:
     domain_id: int = 0
     sport_state_topic: str = "rt/sportmodestate"
     command_timeout_s: float = 2.0
+    joint_lock_operator_timeout_s: float = 60.0
     landing_compliance_enabled: bool = False
     foot_force_contact_thresholds: Tuple[int, int, int, int] = (0, 0, 0, 0)
     landing_contact_min_feet: int = 3
@@ -411,14 +416,57 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
         and expected_walk != expected_by_direction[normalized_walk]
     ):
         errors.append("expected_walk_state conflicts with walk_direction")
-    for key in ("response_timeout_s", "transform_timeout_s", "status_poll_hz"):
-        finite_number(f446, key, f"f446.{key}", positive=True)
-    integer(
+    finite_number(f446, "response_timeout_s", "f446.response_timeout_s", positive=True)
+    transform_timeout_s = finite_number(
+        f446,
+        "transform_timeout_s",
+        "f446.transform_timeout_s",
+        positive=True,
+    )
+    finite_number(f446, "status_poll_hz", "f446.status_poll_hz", positive=True)
+    current_safe_margin_adc = integer(
         f446,
         "current_safe_margin_adc",
         "f446.current_safe_margin_adc",
         minimum=0,
         maximum=4095,
+    )
+    default_firmware_timeout_ms = (
+        15000
+        if transform_timeout_s is None
+        else max(100, int(round(transform_timeout_s * 1000.0)))
+    )
+    firmware_timeout_ms = (
+        integer(
+            f446,
+            "firmware_timeout_ms",
+            "f446.firmware_timeout_ms",
+            minimum=100,
+            maximum=60000,
+        )
+        if "firmware_timeout_ms" in f446
+        else default_firmware_timeout_ms
+    )
+    automatic_stall_threshold_adc = (
+        integer(
+            f446,
+            "automatic_stall_threshold_adc",
+            "f446.automatic_stall_threshold_adc",
+            minimum=0,
+            maximum=4095,
+        )
+        if "automatic_stall_threshold_adc" in f446
+        else 0
+    )
+    stall_blanking_ms = (
+        integer(f446, "stall_blanking_ms", "f446.stall_blanking_ms", minimum=0, maximum=5000)
+        if "stall_blanking_ms" in f446
+        else 500
+    )
+    stall_overcurrent_ms = (
+        integer(f446, "stall_overcurrent_ms", "f446.stall_overcurrent_ms", minimum=10, maximum=3000)
+        if "stall_overcurrent_ms" in f446
+        else 180
     )
     finite_number(
         f446,
@@ -437,6 +485,13 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
         nonempty_text(go2, "sport_state_topic", "go2.sport_state_topic")
     if "command_timeout_s" in go2:
         finite_number(go2, "command_timeout_s", "go2.command_timeout_s", positive=True)
+    if "joint_lock_operator_timeout_s" in go2:
+        finite_number(
+            go2,
+            "joint_lock_operator_timeout_s",
+            "go2.joint_lock_operator_timeout_s",
+            positive=True,
+        )
 
     compliance_enabled: Optional[bool] = False
     if "landing_compliance_enabled" in go2:
@@ -536,13 +591,40 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
         "controller_timeout_s",
     ):
         finite_number(safety, key, f"safety.{key}", positive=True)
-    integer(
+    maximum_transform_current_adc = integer(
         safety,
         "maximum_transform_current_adc",
         "safety.maximum_transform_current_adc",
         minimum=1,
         maximum=4095,
     )
+    if (
+        transform_timeout_s is not None
+        and firmware_timeout_ms is not None
+        and firmware_timeout_ms > int(round(transform_timeout_s * 1000.0))
+    ):
+        errors.append("f446.firmware_timeout_ms must not exceed transform_timeout_s")
+    if (
+        firmware_timeout_ms is not None
+        and stall_blanking_ms is not None
+        and stall_overcurrent_ms is not None
+        and stall_blanking_ms + stall_overcurrent_ms >= firmware_timeout_ms
+    ):
+        errors.append(
+            "f446.stall_blanking_ms plus stall_overcurrent_ms must be less than firmware_timeout_ms"
+        )
+    if (
+        automatic_stall_threshold_adc is not None
+        and automatic_stall_threshold_adc != 0
+        and current_safe_margin_adc is not None
+        and maximum_transform_current_adc is not None
+    ):
+        safe_ceiling = maximum_transform_current_adc - current_safe_margin_adc
+        if not current_safe_margin_adc < automatic_stall_threshold_adc <= safe_ceiling:
+            errors.append(
+                "f446.automatic_stall_threshold_adc must be 0 or within the host safety envelope "
+                f"{current_safe_margin_adc + 1}..{safe_ceiling}"
+            )
 
     for key in (
         "controller_hz",
@@ -642,6 +724,17 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
             response_timeout_s=float(_required(f446, "response_timeout_s")),
             transform_timeout_s=float(_required(f446, "transform_timeout_s")),
             status_poll_hz=float(_required(f446, "status_poll_hz")),
+            firmware_timeout_ms=int(
+                f446.get(
+                    "firmware_timeout_ms",
+                    round(float(_required(f446, "transform_timeout_s")) * 1000.0),
+                )
+            ),
+            automatic_stall_threshold_adc=int(
+                f446.get("automatic_stall_threshold_adc", 0)
+            ),
+            stall_blanking_ms=int(f446.get("stall_blanking_ms", 500)),
+            stall_overcurrent_ms=int(f446.get("stall_overcurrent_ms", 180)),
             current_safe_margin_adc=_required(f446, "current_safe_margin_adc"),
             current_clear_hold_s=float(_required(f446, "current_clear_hold_s")),
         ),
@@ -652,6 +745,9 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
             domain_id=int(go2.get("domain_id", 0)),
             sport_state_topic=str(go2.get("sport_state_topic", "rt/sportmodestate")),
             command_timeout_s=float(go2.get("command_timeout_s", 2.0)),
+            joint_lock_operator_timeout_s=float(
+                go2.get("joint_lock_operator_timeout_s", 60.0)
+            ),
             landing_compliance_enabled=bool(go2.get("landing_compliance_enabled", False)),
             foot_force_contact_thresholds=foot_force_thresholds,
             landing_contact_min_feet=int(go2.get("landing_contact_min_feet", 3)),

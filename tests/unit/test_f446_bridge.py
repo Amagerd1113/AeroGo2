@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from dataclasses import replace
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from aerogo2.common.config import AppConfig
 from aerogo2.common.enums import Configuration, F446State
 from aerogo2.common.exceptions import BridgeError
 from aerogo2.common.models import F446Status
+from aerogo2.common.results import OperationResult
 
 
 class RecordingWriter:
@@ -99,7 +101,7 @@ async def test_walk_direction_uses_configured_mapping(
     await fake.connect()
     result = await fake.move_to_configuration(Configuration.WALK)
     assert result.ok
-    assert "limr 120" in commands(fake)
+    assert "limr 300" in commands(fake)
 
 
 @pytest.mark.asyncio
@@ -289,6 +291,215 @@ async def test_real_text_bridge_accepts_negative_reverse_duty(
     assert result.ok
     assert result.data["signed_duty"] == -500
     assert b"".join(writer.chunks) == b"mr 500\r"
+
+
+@pytest.mark.asyncio
+async def test_real_text_bridge_ignores_stale_status_before_motion_ack(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge = TextF446Bridge(app_config.f446, allow_motion=True)
+    writer = RecordingWriter()
+    bridge._connected = True
+    bridge._writer = writer
+    initial = F446Status(
+        connected=True,
+        state=F446State.IDLE,
+        raw_state=F446State.IDLE.value,
+        duty=0,
+        manual_limit=500,
+    )
+    responses = iter(
+        (
+            initial,
+            initial,
+            replace(
+                initial,
+                state=F446State.MANUAL_FWD,
+                raw_state=F446State.MANUAL_FWD.value,
+                duty=20,
+            ),
+        )
+    )
+
+    async def request_status() -> F446Status:
+        return next(responses)
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(bridge, "request_status", request_status)
+    monkeypatch.setattr("aerogo2.bridges.f446_text_bridge.asyncio.sleep", no_sleep)
+
+    result = await bridge.start_maintenance_motion("mf", 20)
+
+    assert result.ok
+    assert result.data["signed_duty"] == 20
+    assert b"".join(writer.chunks) == b"mf 20\r"
+
+
+@pytest.mark.asyncio
+async def test_real_text_bridge_ignores_stale_threshold_readback(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge = TextF446Bridge(app_config.f446, allow_motion=True)
+    writer = RecordingWriter()
+    bridge._connected = True
+    bridge._writer = writer
+    initial = F446Status(
+        connected=True,
+        state=F446State.IDLE,
+        raw_state=F446State.IDLE.value,
+        duty=0,
+        manual_limit=350,
+        threshold_adc=1800,
+        threshold_raw=1800,
+        threshold_mv=1450,
+    )
+    responses = iter(
+        (
+            initial,
+            initial,
+            replace(
+                initial,
+                threshold_adc=300,
+                threshold_raw=300,
+                threshold_mv=241,
+            ),
+        )
+    )
+
+    async def request_status() -> F446Status:
+        return next(responses)
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(bridge, "request_status", request_status)
+    monkeypatch.setattr("aerogo2.bridges.f446_text_bridge.asyncio.sleep", no_sleep)
+
+    result = await bridge.set_current_threshold_adc(300)
+
+    assert result.ok
+    assert result.data["threshold_adc"] == 300
+    assert b"".join(writer.chunks) == b"thr 300\r"
+
+
+@pytest.mark.asyncio
+async def test_real_text_bridge_ignores_stale_timeout_readback(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge = TextF446Bridge(app_config.f446, allow_motion=True)
+    writer = RecordingWriter()
+    bridge._connected = True
+    bridge._writer = writer
+    initial = F446Status(
+        connected=True,
+        state=F446State.IDLE,
+        raw_state=F446State.IDLE.value,
+        duty=0,
+        timeout_ms=5000,
+    )
+    responses = iter((initial, initial, replace(initial, timeout_ms=15000)))
+
+    async def request_status() -> F446Status:
+        return next(responses)
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(bridge, "request_status", request_status)
+    monkeypatch.setattr("aerogo2.bridges.f446_text_bridge.asyncio.sleep", no_sleep)
+    result = await bridge.set_motion_timeout_ms(15000)
+    assert result.ok
+    assert result.data["timeout_ms"] == 15000
+    assert b"".join(writer.chunks) == b"timeout 15000\r"
+
+
+@pytest.mark.asyncio
+async def test_connect_synchronizes_configured_f446_parameters(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(app_config.f446, automatic_stall_threshold_adc=900)
+    bridge = TextF446Bridge(config, allow_motion=True)
+    calls: list[tuple[str, int]] = []
+
+    def setter(name: str):
+        async def apply(value: int) -> OperationResult:
+            calls.append((name, value))
+            return OperationResult.success("updated")
+        return apply
+
+    monkeypatch.setattr(bridge, "set_motion_timeout_ms", setter("timeout"))
+    monkeypatch.setattr(bridge, "set_stall_blanking_ms", setter("blank"))
+    monkeypatch.setattr(bridge, "set_overcurrent_duration_ms", setter("overms"))
+    monkeypatch.setattr(bridge, "set_current_threshold_adc", setter("threshold"))
+    status = F446Status(
+        connected=True,
+        state=F446State.IDLE,
+        duty=0,
+        timeout_ms=5000,
+        blanking_ms=100,
+        overcurrent_ms=50,
+        threshold_adc=1800,
+    )
+    await bridge._synchronize_configured_parameters(status)
+    assert calls == [
+        ("timeout", 15000),
+        ("blank", 500),
+        ("overms", 180),
+        ("threshold", 900),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fake_connect_applies_persistent_timing(app_config: AppConfig) -> None:
+    fake = FakeF446(app_config.f446)
+    await fake.connect()
+    status = fake.get_status()
+    assert status.timeout_ms == 15000
+    assert status.blanking_ms == 500
+    assert status.overcurrent_ms == 180
+
+
+@pytest.mark.asyncio
+async def test_poll_holds_transaction_lock_until_status_response(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(app_config.f446, status_poll_hz=1000.0)
+    bridge = TextF446Bridge(config)
+    bridge._connected = True
+    poll_entered = asyncio.Event()
+    release_response = asyncio.Event()
+    contender_acquired = asyncio.Event()
+
+    async def request_status() -> F446Status:
+        poll_entered.set()
+        await release_response.wait()
+        return F446Status(connected=True, state=F446State.IDLE)
+
+    async def contender() -> None:
+        async with bridge._transaction_lock:
+            bridge._connected = False
+            contender_acquired.set()
+
+    monkeypatch.setattr(bridge, "request_status", request_status)
+    poll_task = asyncio.create_task(bridge._poll_loop())
+    await asyncio.wait_for(poll_entered.wait(), timeout=0.2)
+    contender_task = asyncio.create_task(contender())
+    await asyncio.sleep(0)
+
+    assert bridge._transaction_lock.locked()
+    assert not contender_acquired.is_set()
+
+    release_response.set()
+    await asyncio.wait_for(contender_acquired.wait(), timeout=0.2)
+    await contender_task
+    await poll_task
 
 
 @pytest.mark.asyncio

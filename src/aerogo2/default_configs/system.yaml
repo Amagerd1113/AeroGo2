@@ -18,6 +18,9 @@ go2:
   domain_id: 0
   sport_state_topic: "rt/sportmodestate"
   command_timeout_s: 2.0
+  # Time allowed for the operator to select Joint Lock (mode 6) in the Unitree app.
+  # F446 is already stopped at the verified FLIGHT endpoint during this wait.
+  joint_lock_operator_timeout_s: 60.0
   # Keep disabled until all four raw foot-force channels have been calibrated
   # on this exact robot. Threshold order is the SDK foot_force[0..3] order.
   landing_compliance_enabled: false

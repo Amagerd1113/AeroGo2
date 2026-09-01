@@ -84,19 +84,24 @@ log status
 log stop
 log tail
 motor current
+motor endpoint flight
+motor endpoint walk
 motor confirm flight
 motor confirm walk
+motor blank
 motor limf
 motor limr
 motor maintenance enter
 motor maintenance exit
 motor mf
 motor mr
+motor overms
 motor parameters
 motor status
 motor stop
 motor threshold
 motor threshold-mv
+motor timeout
 motor to-flight
 motor to-walk
 pixhawk messages
@@ -165,6 +170,7 @@ def test_complete_canonical_command_tree_is_registered() -> None:
         ("quit", "exit"),
         ("abort", "autoland abort"),
         ("s", "stop"),
+        ("ms", "motor stop"),
     ],
 )
 def test_command_aliases_resolve_to_the_canonical_spec(alias: str, canonical: str) -> None:
@@ -463,7 +469,7 @@ def test_unimplemented_autoland_outputs_remain_dry_run_only(name: str) -> None:
     assert policy.allowed_modes == frozenset({RuntimeMode.DRY_RUN})
 
 
-@pytest.mark.parametrize("name", ["stop", "motor stop", "transform stop", "abort"])
+@pytest.mark.parametrize("name", ["stop", "motor stop", "ms", "transform stop", "abort"])
 def test_safety_stop_commands_never_require_confirmation(name: str) -> None:
     match = build_registry().resolve(name)
 

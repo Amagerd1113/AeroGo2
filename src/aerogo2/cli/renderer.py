@@ -30,6 +30,7 @@ STATE_COLORS: Final[Mapping[SystemState, str]] = MappingProxyType(
         SystemState.WALK: "green",
         SystemState.WALK_TO_FLIGHT_PRECHECK: "yellow",
         SystemState.TRANSFORM_TO_FLIGHT: "yellow",
+        SystemState.GO2_JOINT_LOCK_WAIT: "bold yellow",
         SystemState.FLIGHT_READY: "cyan",
         SystemState.FLIGHT_MANUAL: "cyan",
         SystemState.AUTO_LANDING_READY: "blue",

@@ -29,10 +29,15 @@ class CommandService:
         f446_actions = {
             "manual_enter",
             "manual_exit",
+            "manual_mark_walk",
+            "manual_mark_flight",
             "manual_confirm_walk",
             "manual_confirm_flight",
             "f446_threshold_adc",
             "f446_threshold_mv",
+            "f446_timeout",
+            "f446_blank",
+            "f446_overms",
             "f446_mf",
             "f446_mr",
             "f446_limf",
@@ -111,6 +116,22 @@ class CommandService:
             )
         if action == "manual_exit":
             return cast(OperationResult, await self._manager.exit_manual_positioning())
+        if action == "manual_mark_walk":
+            return cast(
+                OperationResult,
+                await self._manager.mark_manual_configuration(
+                    Configuration.WALK,
+                    operator_confirmed=True,
+                ),
+            )
+        if action == "manual_mark_flight":
+            return cast(
+                OperationResult,
+                await self._manager.mark_manual_configuration(
+                    Configuration.FLIGHT,
+                    operator_confirmed=True,
+                ),
+            )
         if action == "manual_confirm_walk":
             return cast(
                 OperationResult,
@@ -152,6 +173,13 @@ class CommandService:
                     millivolts=True,
                 ),
             )
+        timing_by_action = {
+            "f446_timeout": "timeout",
+            "f446_blank": "blank",
+            "f446_overms": "overms",
+        }
+        if action in timing_by_action:
+            return cast(OperationResult, await self._manager.set_f446_timing_parameter(timing_by_action[action], value))
         operation_by_action = {
             "f446_mf": "mf",
             "f446_mr": "mr",

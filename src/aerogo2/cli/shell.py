@@ -140,6 +140,7 @@ class InteractiveShell:
             SystemState.WALK_TO_FLIGHT_PRECHECK,
             SystemState.MANUAL_POSITIONING,
             SystemState.TRANSFORM_TO_FLIGHT,
+            SystemState.GO2_JOINT_LOCK_WAIT,
             SystemState.FLIGHT_TO_WALK_PRECHECK,
             SystemState.TRANSFORM_TO_WALK,
         ):

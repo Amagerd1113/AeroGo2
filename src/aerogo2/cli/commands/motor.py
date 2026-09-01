@@ -43,6 +43,7 @@ def command_specs() -> Tuple[CommandSpec, ...]:
             "Stop the morphology mechanism",
             "motor",
             "transform_stop",
+            aliases=("ms",),
             capability=CommandPermission.SAFETY_STOP,
             requires_hardware_write=True,
         ),
@@ -86,8 +87,34 @@ def command_specs() -> Tuple[CommandSpec, ...]:
                 requires_hardware_write=True,
             ),
             command(
+                "motor endpoint walk",
+                "Mark the current stopped position as the WALK endpoint",
+                "motor",
+                "manual_mark_walk",
+                aliases=("endpoint walk", "position walk"),
+                allowed_states=manual_state,
+                capability=CommandPermission.F446_MAINTENANCE,
+                requires_maintenance=True,
+                requires_hardware_write=True,
+                confirmation=ConfirmationPolicy.exact("MARK_CURRENT_ENDPOINT_WALK"),
+            ),
+            command(
+                "motor endpoint flight",
+                "Mark the current stopped position as the FLIGHT endpoint",
+                "motor",
+                "manual_mark_flight",
+                aliases=("endpoint flight", "position flight"),
+                allowed_states=manual_state,
+                capability=CommandPermission.F446_MAINTENANCE,
+                requires_maintenance=True,
+                requires_hardware_write=True,
+                confirmation=ConfirmationPolicy.exact(
+                    "MARK_CURRENT_ENDPOINT_FLIGHT"
+                ),
+            ),
+            command(
                 "motor confirm walk",
-                "Accept the stopped manual position as contracted WALK",
+                "Enter WALK after the operator marked the WALK endpoint",
                 "motor",
                 "manual_confirm_walk",
                 aliases=("confirm walk",),
@@ -99,7 +126,7 @@ def command_specs() -> Tuple[CommandSpec, ...]:
             ),
             command(
                 "motor confirm flight",
-                "Accept the stopped manual position as expanded FLIGHT",
+                "Enter FLIGHT_READY after the operator marked the FLIGHT endpoint",
                 "motor",
                 "manual_confirm_flight",
                 aliases=("confirm flight",),
@@ -135,6 +162,45 @@ def command_specs() -> Tuple[CommandSpec, ...]:
                 requires_hardware_write=True,
                 confirmation=ConfirmationPolicy.exact("CHANGE_F446_THRESHOLD"),
             ),
+            command(
+                "motor timeout",
+                "Set and read back the F446 local motion timeout in milliseconds",
+                "motor",
+                "f446_timeout",
+                usage="motor timeout MS",
+                aliases=("timeout",),
+                allowed_states=manual_state,
+                capability=CommandPermission.F446_MAINTENANCE,
+                requires_maintenance=True,
+                requires_hardware_write=True,
+                confirmation=ConfirmationPolicy.exact("CHANGE_F446_TIMEOUT"),
+            ),
+            command(
+                "motor blank",
+                "Set the startup current-sense blanking interval in milliseconds",
+                "motor",
+                "f446_blank",
+                usage="motor blank MS",
+                aliases=("blank",),
+                allowed_states=manual_state,
+                capability=CommandPermission.F446_MAINTENANCE,
+                requires_maintenance=True,
+                requires_hardware_write=True,
+                confirmation=ConfirmationPolicy.exact("CHANGE_F446_BLANKING"),
+            ),
+            command(
+                "motor overms",
+                "Set the continuous over-threshold duration in milliseconds",
+                "motor",
+                "f446_overms",
+                usage="motor overms MS",
+                aliases=("overms",),
+                allowed_states=manual_state,
+                capability=CommandPermission.F446_MAINTENANCE,
+                requires_maintenance=True,
+                requires_hardware_write=True,
+                confirmation=ConfirmationPolicy.exact("CHANGE_F446_OVERMS"),
+            ),
         )
     )
     for operation in ("mf", "mr", "limf", "limr"):
@@ -144,7 +210,7 @@ def command_specs() -> Tuple[CommandSpec, ...]:
             if automatic
             else (
                 "No F446 local limit stop; AeroGo2 applies host timeout and "
-                "absolute current interlocks. Use stop at the observed position."
+                "absolute current interlocks. Use ms at the observed position."
             )
         )
         specs.append(

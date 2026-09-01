@@ -1,0 +1,3246 @@
+diff --git a/README.md b/README.md
+index 288abf0..f642f24 100644
+--- a/README.md
++++ b/README.md
+@@ -152,7 +152,7 @@ await state_machine.transition_to(
+ 转换会依次执行：守卫检查、生成 `TransitionRecord`、JSONL 记录、唯一状态更新、
+ 发布事件、进入动作，以及进入动作失败时转入 `FAULT`。
+ 
+-完整的 15 个状态、所有合法下一状态、每条激活条件和真机/DRY-RUN 边界见
++完整状态、所有合法下一状态、每条激活条件和真机/DRY-RUN 边界见
+ [`docs/STATE_TRANSITIONS_ZH.md`](docs/STATE_TRANSITIONS_ZH.md)。`FLIGHT_READY -> FLIGHT_MANUAL`
+ 采用一次性两把钥匙：AeroGo2 Shell `flight authorize` 成功后，30 秒内再由 RadioMaster CH5 LOW->HIGH 请求正常 Arm。
+ 
+diff --git a/configs/f446.yaml b/configs/f446.yaml
+index 6394f00..c9d6729 100644
+--- a/configs/f446.yaml
++++ b/configs/f446.yaml
+@@ -3,15 +3,23 @@ f446:
+   walk_direction: "reverse"
+ 
+   flight_duty: 120
+-  walk_duty: 120
++  walk_duty: 300
+ 
+   expected_flight_state: "LIMIT_REACHED_FWD"
+   expected_walk_state: "LIMIT_REACHED_REV"
+ 
+   response_timeout_s: 0.5
+-  transform_timeout_s: 6.0
++  transform_timeout_s: 15.0
+   status_poll_hz: 10
+ 
++  # F446 local limit-stop parameters. A threshold of 0 preserves the value
++  # already calibrated on the board; set a nonzero safe value to reapply it
++  # automatically whenever a hardware-write process connects.
++  firmware_timeout_ms: 15000
++  automatic_stall_threshold_adc: 0
++  stall_blanking_ms: 500
++  stall_overcurrent_ms: 180
++
+   current_safe_margin_adc: 200
+   current_clear_hold_s: 1.0
+ 
+diff --git a/configs/system.yaml b/configs/system.yaml
+index e94f25c..9669306 100644
+--- a/configs/system.yaml
++++ b/configs/system.yaml
+@@ -18,6 +18,9 @@ go2:
+   domain_id: 0
+   sport_state_topic: "rt/sportmodestate"
+   command_timeout_s: 2.0
++  # Time allowed for the operator to select Joint Lock (mode 6) in the Unitree app.
++  # F446 is already stopped at the verified FLIGHT endpoint during this wait.
++  joint_lock_operator_timeout_s: 60.0
+   # Keep disabled until all four raw foot-force channels have been calibrated
+   # on this exact robot. Threshold order is the SDK foot_force[0..3] order.
+   landing_compliance_enabled: false
+diff --git a/docs/HARDWARE_AARCH64_ZH.md b/docs/HARDWARE_AARCH64_ZH.md
+index cc30268..fbcc99f 100644
+--- a/docs/HARDWARE_AARCH64_ZH.md
++++ b/docs/HARDWARE_AARCH64_ZH.md
+@@ -4,7 +4,7 @@
+ 
+ 本文用于 Unitree 机载 Ubuntu aarch64。实机链路包括：
+ 
+-- Unitree SDK2：订阅 Go2 SportModeState，只调用高层 StopMove、StandUp、BalanceStand 和 SwitchJoystick；飞行锁定必须确认 mode=6 JOINT_LOCK。
++- Unitree SDK2：订阅 Go2 SportModeState，只调用高层 StopMove、BalanceStand 和 SwitchJoystick；手机端人工选择飞行锁定，且必须确认 mode=6 JOINT_LOCK。
+ - F446：异步串口读取文本协议，只用受过流和超时保护的 limf、limr；到位后再次核对限位状态和 duty=0。
+ - Pixhawk：读取心跳、解锁、落地、RC、姿态和 4 路 ESC 遥测。
+ - SystemManager：在 WALK 与 FLIGHT_READY 之间执行有安全守卫的形态切换。
+@@ -101,7 +101,7 @@ transform flight
+ TRANSFORM_TO_FLIGHT
+ ~~~
+ 
+-只有当前形态是 WALK、Go2 静止保持满足、RC 新鲜、Pixhawk 未解锁、ESC 在线且 RPM=0、F446 无故障且电流裕量满足时，才发送 limf 或 limr。目标限位与 duty=0 再验证通过后才进入 FLIGHT_READY。
++只有当前形态是 WALK、Go2 静止保持满足、RC 新鲜、Pixhawk 未解锁、ESC 在线且 RPM=0、F446 无故障且电流裕量满足时，才发送 limf 或 limr。目标限位与 duty=0 验证通过后进入 `GO2_JOINT_LOCK_WAIT`。此时在 Unitree 手机端选择“锁关节/Joint Lock”；Shell 检测到 mode=6 后自动进入 `FLIGHT_READY`。可用单行命令 `transform status` 查看当前模式和剩余等待时间。
+ 
+ FLIGHT 到 WALK：先确认落地且未解锁，CH9 稳定为 WALK_REQUEST。
+ 
+@@ -117,7 +117,7 @@ TRANSFORM_TO_WALK
+ 
+ 仅在 WALK 且 F446 确认 WALK 限位时允许 walk stop 与 walk stand。它们使用 Unitree SportClient 高层接口，不直接下发关节电机命令。
+ 
+-进入 FLIGHT_READY 前，系统会禁用 Unitree 原装遥控输入并调用 StandUp；只有 SportModeState 实际回报 mode=6 JOINT_LOCK 才允许继续。飞行中锁丢失会触发 GO2_JOINT_LOCK_LOST，但不会自动 Disarm。0.3.2 可在完成四脚压力校准后启用受控落地适应：首次接触仍保持 JOINT_LOCK，只有 landed、Disarm、四 X8 精确 0 RPM 且足够脚压力持续越阈值后才在原装遥控仍禁用的情况下进入 BalanceStand；变形前会重新确认 JOINT_LOCK。回到 WALK 后，执行 walk stand 才重新启用原装遥控。完整单行命令见 `RELEASE_0.3.2_ZH.md`。
++Unitree 高层接口没有可证明进入 mode=6 的公开 JointLock 方法，`StandUp` 也不等于锁关节。0.3.9 因此等待操作者在手机端选择 mode=6；检测成功后才禁用摇杆输入并进入 `FLIGHT_READY`。模式 1→6 的小幅姿态调整不会再误触发变形运动故障；真正进入行走模式、速度越界或超时仍会 fail-closed。飞行中锁丢失会触发 `GO2_JOINT_LOCK_LOST`，但不会自动 Disarm。
+ 
+ 主状态机没有直接 arm/disarm API；`flight authorize` 只在完整互锁通过后开启 30 秒一次性许可，随后必须由 RadioMaster CH5 LOW->HIGH 触发 Pixhawk Lua 的普通受检 Arm。Lua 阻断 MAVLink Arm/force-arm 绕过，但保留正常 Disarm。完整条件见 `STATE_TRANSITIONS_ZH.md`。
+ 
+diff --git a/docs/STATE_TRANSITIONS_ZH.md b/docs/STATE_TRANSITIONS_ZH.md
+index 710aea0..16e8123 100644
+--- a/docs/STATE_TRANSITIONS_ZH.md
++++ b/docs/STATE_TRANSITIONS_ZH.md
+@@ -21,18 +21,19 @@
+ 
+ | 当前状态 | 允许的下一状态 | 激活/离开要求 |
+ |---|---|---|
+-| `BOOT_SAFE` | `MANUAL_POSITIONING`, `HOMING_TO_WALK`, `WALK`, `FLIGHT_READY`, `FAULT` | 每次进程启动固定进入此状态。`connect all` 后，若 F446 权威状态证明 WALK/FLIGHT，可在设备新鲜、Disarm、ESC=0、无故障时采用为 `WALK`/`FLIGHT_READY`；UNKNOWN 只能人工定位或 home。 |
+-| `MANUAL_POSITIONING` | `BOOT_SAFE`, `WALK`, `FLIGHT_READY`, `FAULT`, `EMERGENCY_STOP` | 从 `BOOT_SAFE/WALK/FLIGHT_READY` 执行 `motor maintenance enter`，通过双重确认、共同前提、Go2 停止与静止/电流保持。`mf/mr/limf/limr` 每次发送前重新检查。确认 WALK/FLIGHT 前必须发生过对应方向运动、先 `motor stop`、duty=0、F446 不得报告相反限位，并输入精确确认词；不确认则退出到 `BOOT_SAFE`。 |
++| `BOOT_SAFE` | `MANUAL_POSITIONING`, `HOMING_TO_WALK`, `WALK`, `GO2_JOINT_LOCK_WAIT`, `FLIGHT_READY`, `FAULT` | 每次进程启动固定进入此状态。`connect all` 后，若 F446 权威状态证明 WALK，可采用为 `WALK`；若证明 FLIGHT 且 Go2 已是 mode=6，可进入 `FLIGHT_READY`，否则可写真机进入人工锁关节等待态；UNKNOWN 只能人工定位或 home。 |
++| `MANUAL_POSITIONING` | `BOOT_SAFE`, `WALK`, `GO2_JOINT_LOCK_WAIT`, `FLIGHT_READY`, `FAULT`, `EMERGENCY_STOP` | 从 `BOOT_SAFE/WALK/FLIGHT_READY` 执行 `motor maintenance enter`，通过双重确认、共同前提、Go2 停止与静止/电流保持。`mf/mr/limf/limr` 每次发送前重新检查。可以不先运动，但必须先 `ms` 停止，再用 `motor endpoint walk/flight` 标记当前端点，然后用匹配的 `motor confirm walk/flight` 确认；相反限位、非零 duty 或故障仍拒绝。FLIGHT 端点确认后先进入人工锁关节等待态。 |
+ | `HOMING_TO_WALK` | `WALK`, `FAULT`, `EMERGENCY_STOP` | 仅 `BOOT_SAFE` 且构型 UNKNOWN、F446=IDLE/duty=0 时，执行 `transform home-walk` 并完成双重确认；满足共同前提和保持时间后向 WALK 方向运行自动限位。只有验证 WALK 限位和 duty=0 才进入 `WALK`。 |
+ | `WALK` | `MANUAL_POSITIONING`, `BOOT_SAFE`, `WALK_TO_FLIGHT_PRECHECK`, `FAULT`, `EMERGENCY_STOP` | F446 必须证明 WALK 限位、duty=0，Pixhawk Disarm、ESC=0、设备新鲜、无故障。Go2 运动命令只在该状态且上述 WALK 互锁保持时可用。 |
+ | `WALK_TO_FLIGHT_PRECHECK` | `TRANSFORM_TO_FLIGHT`, `WALK`, `FAULT`, `EMERGENCY_STOP` | `transform flight` 只能从 `WALK` 发起；需输入 `TRANSFORM_TO_FLIGHT`，RC CH9 为去抖后的 FLIGHT_REQUEST、CH5 LOW、当前构型仍为 WALK、Go2 静止、F446 电流安全。静止或电流保持不足会回退 `WALK`，不启动机构。 |
+-| `TRANSFORM_TO_FLIGHT` | `FLIGHT_READY`, `FAULT`, `EMERGENCY_STOP` | 第二次检查全部共同前提，特别是四 ESC 精确 0 RPM；F446 到达 FLIGHT 限位且 duty=0 后，Go2 必须依次接受 `StopMove`、禁用原装遥控输入和 `StandUp`，并实际回报 mode=6 `JOINT_LOCK`。任一步失败都进入 `FAULT`。 |
++| `TRANSFORM_TO_FLIGHT` | `GO2_JOINT_LOCK_WAIT`, `FAULT`, `EMERGENCY_STOP` | 第二次检查全部共同前提，特别是四 ESC 精确 0 RPM；F446 到达 FLIGHT 限位且 duty=0 后再次请求 `StopMove`，随后进入人工锁关节等待态。不会再把 `StandUp()` 当作 mode=6。 |
++| `GO2_JOINT_LOCK_WAIT` | `FLIGHT_READY`, `FAULT`, `EMERGENCY_STOP` | F446 已在已验证 FLIGHT 端点且 duty=0。操作者在 Unitree 手机端选择“锁关节/Joint Lock”，系统等待权威 `SportModeState.mode=6`，然后调用 `SwitchJoystick(false)` 并再次确认 mode=6 后自动进入 `FLIGHT_READY`。默认等待 60 秒，可由 `go2.joint_lock_operator_timeout_s` 调整。模式 1→6 期间允许小于 0.05 m/s 的短暂姿态运动以及 `stable=false/controller_active=true`；进入 `LOCOMOTION`、速度越界、设备/RC/ESC/F446 异常或超时才进入 `FAULT`。 |
+ | `FLIGHT_READY` | `MANUAL_POSITIONING`, `BOOT_SAFE`, `FLIGHT_MANUAL`, `FLIGHT_TO_WALK_PRECHECK`, `FAULT`, `EMERGENCY_STOP` | 构型必须为 FLIGHT、F446 为期望 FLIGHT 限位且 duty=0、Go2 权威回报 `JOINT_LOCK`、Pixhawk Disarm。进入 `FLIGHT_MANUAL` 还必须先执行一次 `flight authorize`，Pixhawk Lua 返回 ACK 后在 30 秒内把 RadioMaster CH5 从 LOW 切到 HIGH，并通过 ArduPilot 全部正常 PreArm 检查。 |
+ | `FLIGHT_MANUAL` | `AUTO_LANDING_READY`, `TOUCHDOWN_VERIFY`, `FLIGHT_TO_WALK_PRECHECK`, `FAULT`, `EMERGENCY_STOP` | 从 `FLIGHT_READY` 进入时必须同时观察到未过期的一次性 Shell 授权、Go2 `JOINT_LOCK` 和 Pixhawk armed。授权进入后立即消费；飞行中丢失关节锁触发 `GO2_JOINT_LOCK_LOST`，但不会自动 Disarm。`AUTO_LANDING_READY` 当前仅 DRY-RUN。 |
+ | `AUTO_LANDING_READY` | `AUTO_LANDING`, `FLIGHT_MANUAL`, `FAULT`, `EMERGENCY_STOP` | 当前只允许 DRY-RUN。要求 Pixhawk armed、CH10 为 AUTO_READY/AUTO_EXECUTE、落地估计有效。任何人工接管/中止返回 `FLIGHT_MANUAL`，且停止外部 setpoint。 |
+ | `AUTO_LANDING` | `TOUCHDOWN_VERIFY`, `FLIGHT_MANUAL`, `FAULT`, `EMERGENCY_STOP` | 当前只允许 DRY-RUN。要求 CH10=AUTO_EXECUTE、Pixhawk armed 且无 failsafe、RC 新鲜无 failsafe/人工接管、落地估计有效且新鲜、检测到地面、所有数值有限、无活动故障。任一条件丢失立即中止到 `FLIGHT_MANUAL`。 |
+ | `TOUCHDOWN_VERIFY` | `FLIGHT_MANUAL`, `LANDING_COMPLIANT`, `FLIGHT_TO_WALK_PRECHECK`, `FAULT`, `EMERGENCY_STOP` | 自动触发要求 Pixhawk `landed=true`，垂直速度绝对值不大于 0.1 m/s，roll/pitch 绝对值不大于 0.2 rad，ESC RPM 不大于 50，参考高度变化不大于 0.02 m，并连续保持 2.0 秒。启用落地适应后禁止直接变形；还必须由 RadioMaster Disarm、四 ESC 精确 0 RPM、至少配置数量的脚压力持续越过各自校准阈值。 |
+-| `LANDING_COMPLIANT` | `FLIGHT_READY`, `FAULT`, `EMERGENCY_STOP` | 只在校准功能已启用且上述接触条件连续保持后自动进入；保持 `SwitchJoystick(false)`，调用高层 `BalanceStand()` 并要求权威回报稳定 `BALANCE_STAND`。Pixhawk重新Arm、任一ESC遥测不完整/非零、脚接触不足或姿态模式丢失都会先尝试恢复 `JOINT_LOCK` 再进入故障。达到配置稳定时间后，`transform walk` 会先调用 `StandUp()` 并确认 mode=6，再回 `FLIGHT_READY` 进入正常预检。 |
++| `LANDING_COMPLIANT` | `GO2_JOINT_LOCK_WAIT`, `FLIGHT_READY`, `FAULT`, `EMERGENCY_STOP` | 只在校准功能已启用且上述接触条件连续保持后自动进入；保持 `SwitchJoystick(false)`，调用高层 `BalanceStand()` 并要求权威回报稳定 `BALANCE_STAND`。达到稳定时间后执行 `transform walk` 会先进入人工锁关节等待态；手机端选 mode=6 并自动回到 `FLIGHT_READY` 后，再次执行 `transform walk` 才启动 F446。 |
+ | `FLIGHT_TO_WALK_PRECHECK` | `TRANSFORM_TO_WALK`, `FLIGHT_READY`, `FAULT`, `EMERGENCY_STOP` | 从 `FLIGHT_READY/FLIGHT_MANUAL/TOUCHDOWN_VERIFY` 请求；若此前进入 `LANDING_COMPLIANT`，必须已事务性重锁并回到 `FLIGHT_READY`。必须 landed、Disarm、四 ESC 精确 0 RPM、Go2 静止、FLIGHT 构型仍受验证、自动落地/setpoint 已停止、共同前提通过。保持不足回退 `FLIGHT_READY`。 |
+ | `TRANSFORM_TO_WALK` | `WALK`, `FAULT`, `EMERGENCY_STOP` | 必须从上一预检查进入且机构仍证明 FLIGHT；再次检查共同前提后按 WALK 方向运行。只有验证 WALK 限位和 duty=0 才进入 `WALK`。 |
+ | `FAULT` | `BOOT_SAFE`, `EMERGENCY_STOP` | 通信、互锁、F446、状态入口或未授权 armed 等故障触发。入口停止 F446 和 AeroGo2 setpoint，但不停止旋翼、不 Disarm。`clear-fault` 仅在根因消失、F446 不再 fault、Pixhawk Disarm、ESC=0 后回 `BOOT_SAFE`。 |
+@@ -40,15 +41,15 @@
+ 
+ ## Go2 飞行关节锁
+ 
+-- 使用 Unitree SDK2 高层 `StandUp()` 进入 `SportModeState.mode=6` 的 `jointLock`，不发布 `LowCmd`，不直接设置十二个关节的扭矩、角度或 PD 参数。
+-- 锁定前先 `StopMove`，再调用 `SwitchJoystick(false)` 禁用 Unitree 原装遥控输入，防止它在飞行时改写运动模式。
+-- RPC 返回 0 仍不算成功；必须在命令超时内收到 `joints_locked=true`。`BOOT_SAFE` 检测到 FLIGHT 构型但未锁定时，HW-RO 保持 `BOOT_SAFE`，可写真机模式才会主动请求锁定。
++- Unitree `SportClient` 没有可证明进入 mode=6 的公开 `JointLock()` 调用；`StandUp()` 只代表站立，不能当作锁关节成功。AeroGo2 不发布 `LowCmd`，也不直接设置十二个关节的扭矩、角度或 PD 参数。
++- 进入等待态前先 `StopMove`，但保留手机端切换能力。操作者在手机端选择“锁关节/Joint Lock”；收到权威 mode=6 后才调用 `SwitchJoystick(false)` 禁用后续摇杆输入。
++- `transform status` 会显示 `GO2_JOINT_LOCK_WAIT`、当前 `go2_mode` 和剩余等待秒数。只有 `joints_locked=true` 且再次确认后才进入 `FLIGHT_READY`。`BOOT_SAFE` 检测到 FLIGHT 构型但未锁定时，HW-RO 仍保持 `BOOT_SAFE`，可写真机进入等待态。
+ - `FLIGHT_READY` 到向 WALK 变形期间持续要求关节锁。锁丢失时停止 AeroGo2 拥有的 F446/setpoint 并进入故障，不自动停 X8、不自动 Disarm。
+ - `request_stop` 在已锁定时保持锁不变；回到 `WALK` 后由 `walk stand` 重新启用 Unitree 原装遥控并进入 `BalanceStand`。`Damp()` 是阻尼模式，不满足飞行互锁。
+ 
+ - 落地适应默认关闭；必须先读取本机 `foot_force[0..3]` 的悬空/站立原始值，为四脚分别设置正阈值后才允许启用。
+ - 启用后，`TOUCHDOWN_VERIFY` 仍保持 `JOINT_LOCK`；只有 Disarm、四 ESC 精确 0 RPM、至少三脚接触持续 0.5 秒时才调用 `BalanceStand()`。原装遥控在此阶段仍保持禁用。
+-- `BalanceStand` 稳定保持默认 1.5 秒后，`transform walk` 先重新调用 `StandUp()` 并确认 mode=6；未重锁绝不启动 F446。`Damp()` 不用于该流程。
++- `BalanceStand` 稳定保持默认 1.5 秒后，`transform walk` 先进入 `GO2_JOINT_LOCK_WAIT`；手机选 mode=6 并回到 `FLIGHT_READY` 后再次执行 `transform walk`。未重锁绝不启动 F446。`Damp()` 不用于该流程。
+ - 使用 `landing compliance` 可只读查看四脚原始值、阈值、每脚接触判定、确认时间与稳定时间。
+ 
+ ## 两把钥匙 Arm 流程
+diff --git a/pyproject.toml b/pyproject.toml
+index fa130f6..3859c20 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "aerogo2"
+-version = "0.3.3"
++version = "0.3.9"
+ description = "Safety-first simulation and supervised hardware console for the AeroGo2 dual-mode robot"
+ readme = {file = "PACKAGE_README.md", content-type = "text/markdown"}
+ requires-python = ">=3.8"
+@@ -30,6 +30,7 @@ dev = [
+ 
+ [project.scripts]
+ aerogo2 = "aerogo2.main:main"
++aerogo2-configure-f446 = "aerogo2.tools.configure_f446:main"
+ aerogo2-configure-landing = "aerogo2.tools.configure_landing_compliance:main"
+ 
+ [tool.setuptools]
+diff --git a/src/aerogo2/__init__.py b/src/aerogo2/__init__.py
+index 0471713..4c606f8 100644
+--- a/src/aerogo2/__init__.py
++++ b/src/aerogo2/__init__.py
+@@ -4,4 +4,4 @@ from aerogo2.common.enums import SystemState
+ 
+ __all__ = ["SystemState", "__version__"]
+ 
+-__version__ = "0.3.3"
++__version__ = "0.3.9"
+diff --git a/src/aerogo2/bridges/f446_interface.py b/src/aerogo2/bridges/f446_interface.py
+index 5ef1eb6..6351231 100644
+--- a/src/aerogo2/bridges/f446_interface.py
++++ b/src/aerogo2/bridges/f446_interface.py
+@@ -54,6 +54,12 @@ class F446Interface(Protocol):
+ 
+     async def set_current_threshold_mv(self, threshold_mv: int) -> OperationResult: ...
+ 
++    async def set_motion_timeout_ms(self, timeout_ms: int) -> OperationResult: ...
++
++    async def set_stall_blanking_ms(self, blanking_ms: int) -> OperationResult: ...
++
++    async def set_overcurrent_duration_ms(self, overcurrent_ms: int) -> OperationResult: ...
++
+     async def stop(self) -> OperationResult: ...
+ 
+ 
+diff --git a/src/aerogo2/bridges/f446_text_bridge.py b/src/aerogo2/bridges/f446_text_bridge.py
+index 41ac10e..dd9c6ab 100644
+--- a/src/aerogo2/bridges/f446_text_bridge.py
++++ b/src/aerogo2/bridges/f446_text_bridge.py
+@@ -7,7 +7,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ from dataclasses import replace
+-from typing import Any, List, Optional, Tuple
++from typing import Any, Callable, List, Optional, Tuple
+ 
+ from aerogo2.bridges.f446_parser import F446TextParser
+ from aerogo2.common.clock import Clock, RealClock
+@@ -23,8 +23,11 @@ from aerogo2.common.results import OperationResult
+ # conservative gap between bytes; this applies to every command, including the
+ # guarded motion commands.
+ _TX_INTER_BYTE_DELAY_S = 0.010
++_TX_POST_COMMAND_DELAY_S = 0.050
+ _INITIAL_STATUS_ATTEMPTS = 3
+ _INITIAL_STATUS_RETRY_DELAY_S = 0.100
++_VERIFICATION_STATUS_ATTEMPTS = 3
++_VERIFICATION_STATUS_RETRY_DELAY_S = 0.050
+ _MAX_MAINTENANCE_DUTY = 900
+ 
+ 
+@@ -86,6 +89,8 @@ class TextF446Bridge:
+             status = await self._request_initial_status()
+             if status.state is F446State.UNKNOWN:
+                 raise BridgeError("F446 returned an unknown initial state")
++            if self._allow_motion:
++                await self._synchronize_configured_parameters(status)
+         except Exception:
+             await self.disconnect()
+             raise
+@@ -167,7 +172,10 @@ class TextF446Bridge:
+             duty = config.duty_for(configuration.value)
+             command = "limf" if direction == "forward" else "limr"
+             await self._write_line(f"{command} {duty}")
+-            deadline = self._clock.monotonic() + config.transform_timeout_s
++            # The F446 local timer may expire at the configured host limit.
++            # Keep one serial-response interval of grace so its authoritative
++            # LIMIT_REACHED/FAULT line can be parsed before host force-stop.
++            deadline = self._clock.monotonic() + config.transform_timeout_s + config.response_timeout_s
+             while self._clock.monotonic() < deadline:
+                 status = self.get_status()
+                 if not status.connected:
+@@ -257,7 +265,9 @@ class TextF446Bridge:
+                 )
+             if initial.manual_limit < duty:
+                 await self._write_line(f"mlimit {duty}")
+-                configured = await self.request_status()
++                configured = await self._request_status_matching(
++                    lambda status: status.manual_limit >= duty
++                )
+                 if configured.manual_limit < duty:
+                     return OperationResult.failure(
+                         "F446_MANUAL_LIMIT_REJECTED",
+@@ -265,10 +275,17 @@ class TextF446Bridge:
+                     )
+ 
+             await self._write_line(f"{normalized} {duty}")
+-            observed = await self.request_status()
+             reached_state = (
+                 F446State.LIMIT_REACHED_FWD if normalized == "limf" else F446State.LIMIT_REACHED_REV
+             )
++            observed = await self._request_status_matching(
++                lambda status: (
++                    normalized.startswith("lim")
++                    and status.state is reached_state
++                    and status.duty == 0
++                )
++                or (status.state is expected and status.duty == expected_duty)
++            )
+             if (
+                 normalized.startswith("lim")
+                 and observed.state is reached_state
+@@ -324,6 +341,33 @@ class TextF446Bridge:
+             tolerance=1,
+         )
+ 
++    async def set_motion_timeout_ms(self, timeout_ms: int) -> OperationResult:
++        return await self._set_timing_parameter(
++            command="timeout",
++            requested=timeout_ms,
++            minimum=100,
++            maximum=60000,
++            observed_field="timeout_ms",
++        )
++
++    async def set_stall_blanking_ms(self, blanking_ms: int) -> OperationResult:
++        return await self._set_timing_parameter(
++            command="blank",
++            requested=blanking_ms,
++            minimum=0,
++            maximum=5000,
++            observed_field="blanking_ms",
++        )
++
++    async def set_overcurrent_duration_ms(self, overcurrent_ms: int) -> OperationResult:
++        return await self._set_timing_parameter(
++            command="overms",
++            requested=overcurrent_ms,
++            minimum=10,
++            maximum=3000,
++            observed_field="overcurrent_ms",
++        )
++
+     async def _set_current_threshold(
+         self,
+         *,
+@@ -356,7 +400,12 @@ class TextF446Bridge:
+                     "Stop F446 before changing the current threshold",
+                 )
+             await self._write_line(f"{command} {requested}")
+-            observed = await self.request_status()
++            observed = await self._request_status_matching(
++                lambda status: (
++                    getattr(status, observed_field) is not None
++                    and abs(int(getattr(status, observed_field)) - requested) <= tolerance
++                )
++            )
+             value = getattr(observed, observed_field)
+             if value is None or abs(int(value) - requested) > tolerance:
+                 return OperationResult.failure(
+@@ -372,6 +421,98 @@ class TextF446Bridge:
+                 },
+             )
+ 
++    async def _set_timing_parameter(
++        self,
++        *,
++        command: str,
++        requested: int,
++        minimum: int,
++        maximum: int,
++        observed_field: str,
++    ) -> OperationResult:
++        if isinstance(requested, bool) or not minimum <= requested <= maximum:
++            return OperationResult.failure(
++                "F446_INVALID_TIMING_PARAMETER",
++                f"{command} must be {minimum}..{maximum}",
++            )
++        if not self._allow_motion:
++            return OperationResult.failure(
++                "F446_HARDWARE_WRITE_DISABLED",
++                "F446 parameter writes are locked in this process",
++            )
++        async with self._transaction_lock:
++            initial = await self.request_status()
++            if initial.faulted:
++                return OperationResult.failure(
++                    "F446_FAULT",
++                    initial.fault_message or "F446 reports FAULT",
++                )
++            if self._is_moving(initial) or initial.duty != 0:
++                return OperationResult.failure(
++                    "F446_PARAMETER_WRITE_WHILE_MOVING",
++                    f"Stop F446 before changing {command}",
++                )
++            await self._write_line(f"{command} {requested}")
++            observed = await self._request_status_matching(
++                lambda status: int(getattr(status, observed_field)) == requested
++            )
++            value = int(getattr(observed, observed_field))
++            if value != requested:
++                return OperationResult.failure(
++                    "F446_TIMING_VERIFY_FAILED",
++                    f"Requested {command}={requested}, read back {value}",
++                )
++            return OperationResult.success(
++                f"F446 {command} verified: {value}ms",
++                code="F446_TIMING_UPDATED",
++                data={observed_field: value},
++            )
++
++    async def _synchronize_configured_parameters(self, status: F446Status) -> None:
++        """Reapply persistent host settings before background polling starts."""
++
++        if self._is_moving(status) or status.duty != 0:
++            raise BridgeError(
++                f"F446 is moving during connect: state={status.state.value}, duty={status.duty}"
++            )
++        # Keep a faulted board connected for diagnostics and explicit recovery;
++        # parameter writes are deliberately forbidden while it reports FAULT.
++        if status.faulted:
++            return
++        config = self._require_config()
++        operations: List[Tuple[str, Callable[[int], Any], int]] = []
++        if status.timeout_ms != config.firmware_timeout_ms:
++            operations.append(
++                ("timeout", self.set_motion_timeout_ms, config.firmware_timeout_ms)
++            )
++        if status.blanking_ms != config.stall_blanking_ms:
++            operations.append(
++                ("blank", self.set_stall_blanking_ms, config.stall_blanking_ms)
++            )
++        if status.overcurrent_ms != config.stall_overcurrent_ms:
++            operations.append(
++                (
++                    "overms",
++                    self.set_overcurrent_duration_ms,
++                    config.stall_overcurrent_ms,
++                )
++            )
++        if (
++            config.automatic_stall_threshold_adc > 0
++            and status.threshold_adc != config.automatic_stall_threshold_adc
++        ):
++            operations.append(
++                (
++                    "threshold",
++                    self.set_current_threshold_adc,
++                    config.automatic_stall_threshold_adc,
++                )
++            )
++        for label, setter, requested in operations:
++            result = await setter(requested)
++            if not result.ok:
++                raise BridgeError(f"Cannot synchronize F446 {label}: {result.message}")
++
+     async def stop(self) -> OperationResult:
+         status = self.get_status()
+         if not self._allow_motion:
+@@ -411,6 +552,22 @@ class TextF446Bridge:
+             f"F446 did not answer '{command}' within {config.response_timeout_s:.2f}s"
+         )
+ 
++    async def _request_status_matching(
++        self,
++        predicate: Callable[[F446Status], bool],
++    ) -> F446Status:
++        """Read bounded statuses until one verifies the preceding command."""
++
++        observed: Optional[F446Status] = None
++        for attempt in range(_VERIFICATION_STATUS_ATTEMPTS):
++            observed = await self.request_status()
++            if predicate(observed):
++                return observed
++            if attempt + 1 < _VERIFICATION_STATUS_ATTEMPTS:
++                await asyncio.sleep(_VERIFICATION_STATUS_RETRY_DELAY_S)
++        assert observed is not None
++        return observed
++
+     async def _force_stop(self) -> OperationResult:
+         try:
+             await self._write_line("stop")
+@@ -438,6 +595,9 @@ class TextF446Bridge:
+                     await drain()
+                 if offset + 1 < len(payload):
+                     await asyncio.sleep(_TX_INTER_BYTE_DELAY_S)
++            # Give the slow firmware main loop time to consume the terminating
++            # CR before the first byte of the next command is transmitted.
++            await asyncio.sleep(_TX_POST_COMMAND_DELAY_S)
+ 
+     async def _request_initial_status(self) -> F446Status:
+         last_error: Optional[BridgeError] = None
+@@ -480,7 +640,10 @@ class TextF446Bridge:
+         try:
+             while self._connected:
+                 await asyncio.sleep(interval)
+-                await self._write_line("status")
++                # Keep the poll response inside the transaction. Otherwise an
++                # old IDLE/threshold status can satisfy a guarded command's readback.
++                async with self._transaction_lock:
++                    await self.request_status()
+         except asyncio.CancelledError:
+             raise
+         except Exception as exc:
+diff --git a/src/aerogo2/bridges/fake_f446.py b/src/aerogo2/bridges/fake_f446.py
+index 639c436..dfdc2b8 100644
+--- a/src/aerogo2/bridges/fake_f446.py
++++ b/src/aerogo2/bridges/fake_f446.py
+@@ -76,10 +76,25 @@ class FakeF446:
+ 
+     async def connect(self) -> None:
+         self._shutdown.clear()
++        threshold_adc = self._status.threshold_adc
++        threshold_mv = self._status.threshold_mv
++        if self._config is not None and self._config.automatic_stall_threshold_adc > 0:
++            threshold_adc = self._config.automatic_stall_threshold_adc
++            threshold_mv = _raw_to_mv(threshold_adc)
+         self._status = replace(
+             self._status,
+             connected=True,
+             timestamp=self._clock.monotonic(),
++            timeout_ms=(
++                self._status.timeout_ms
++                if self._config is None
++                else self._config.firmware_timeout_ms
++            ),
++            blanking_ms=(self._status.blanking_ms if self._config is None else self._config.stall_blanking_ms),
++            overcurrent_ms=(self._status.overcurrent_ms if self._config is None else self._config.stall_overcurrent_ms),
++            threshold_adc=threshold_adc,
++            threshold_raw=0 if threshold_adc is None else threshold_adc,
++            threshold_mv=threshold_mv,
+         )
+ 
+     async def disconnect(self) -> None:
+@@ -427,6 +442,67 @@ class FakeF446:
+                 },
+             )
+ 
++    async def set_motion_timeout_ms(self, timeout_ms: int) -> OperationResult:
++        return await self._set_timing_parameter(
++            command="timeout",
++            requested=timeout_ms,
++            minimum=100,
++            maximum=60000,
++            field="timeout_ms",
++        )
++
++    async def set_stall_blanking_ms(self, blanking_ms: int) -> OperationResult:
++        return await self._set_timing_parameter(
++            command="blank",
++            requested=blanking_ms,
++            minimum=0,
++            maximum=5000,
++            field="blanking_ms",
++        )
++
++    async def set_overcurrent_duration_ms(self, overcurrent_ms: int) -> OperationResult:
++        return await self._set_timing_parameter(
++            command="overms",
++            requested=overcurrent_ms,
++            minimum=10,
++            maximum=3000,
++            field="overcurrent_ms",
++        )
++
++    async def _set_timing_parameter(
++        self,
++        *,
++        command: str,
++        requested: int,
++        minimum: int,
++        maximum: int,
++        field: str,
++    ) -> OperationResult:
++        if isinstance(requested, bool) or not minimum <= requested <= maximum:
++            return OperationResult.failure(
++                "F446_INVALID_TIMING_PARAMETER",
++                f"{command} must be {minimum}..{maximum}",
++            )
++        async with self._operation_lock:
++            if self._status.duty != 0:
++                return OperationResult.failure(
++                    "F446_PARAMETER_WRITE_WHILE_MOVING",
++                    f"Stop FakeF446 before changing {command}",
++                )
++            self._record_command(f"{command} {requested}")
++            if field == "timeout_ms":
++                self._status = replace(self._status, timeout_ms=requested)
++            elif field == "blanking_ms":
++                self._status = replace(self._status, blanking_ms=requested)
++            else:
++                self._status = replace(self._status, overcurrent_ms=requested)
++            self._status = replace(self._status, timestamp=self._clock.monotonic())
++            return OperationResult.success(
++                f"FakeF446 {command} verified: {requested}ms",
++                code="F446_TIMING_UPDATED",
++                data={field: requested},
++            )
++
+     async def stop(self) -> OperationResult:
+         async with self._operation_lock:
+             was_moving = self._status.duty != 0
+diff --git a/src/aerogo2/bridges/go2_sdk_bridge.py b/src/aerogo2/bridges/go2_sdk_bridge.py
+index 554f1ab..f6398af 100644
+--- a/src/aerogo2/bridges/go2_sdk_bridge.py
++++ b/src/aerogo2/bridges/go2_sdk_bridge.py
+@@ -181,17 +181,18 @@ class UnitreeGo2Bridge:
+ 
+     async def request_flight_pose(self) -> bool:
+         already_locked = self.get_status().joints_locked
+-        if not already_locked and not await self._call("StopMove"):
++        if not already_locked:
++            # SportClient has no authoritative JointLock command. StandUp enters
++            # an ordinary standing posture on Go2 and must not be treated as
++            # mode=6. Keep joystick/app control available so the operator can
++            # select Joint Lock in the Unitree phone app.
++            await self._call("StopMove")
+             return False
+         if not self._joystick_disabled:
+             if not await self._call("SwitchJoystick", False):
+                 return False
+             self._joystick_disabled = True
+-        if already_locked:
+-            return True
+-        if not await self._call("StandUp"):
+-            return False
+-        return await self._wait_for_joint_lock()
++        return self.get_status().joints_locked
+ 
+     async def request_landing_pose(self) -> bool:
+         if not self._joystick_disabled:
+diff --git a/src/aerogo2/cli/commands/motor.py b/src/aerogo2/cli/commands/motor.py
+index bdb0e8b..fd8fa4d 100644
+--- a/src/aerogo2/cli/commands/motor.py
++++ b/src/aerogo2/cli/commands/motor.py
+@@ -43,6 +43,7 @@ def command_specs() -> Tuple[CommandSpec, ...]:
+             "Stop the morphology mechanism",
+             "motor",
+             "transform_stop",
++            aliases=("ms",),
+             capability=CommandPermission.SAFETY_STOP,
+             requires_hardware_write=True,
+         ),
+@@ -85,9 +86,35 @@ def command_specs() -> Tuple[CommandSpec, ...]:
+                 requires_maintenance=True,
+                 requires_hardware_write=True,
+             ),
++            command(
++                "motor endpoint walk",
++                "Mark the current stopped position as the WALK endpoint",
++                "motor",
++                "manual_mark_walk",
++                aliases=("endpoint walk", "position walk"),
++                allowed_states=manual_state,
++                capability=CommandPermission.F446_MAINTENANCE,
++                requires_maintenance=True,
++                requires_hardware_write=True,
++                confirmation=ConfirmationPolicy.exact("MARK_CURRENT_ENDPOINT_WALK"),
++            ),
++            command(
++                "motor endpoint flight",
++                "Mark the current stopped position as the FLIGHT endpoint",
++                "motor",
++                "manual_mark_flight",
++                aliases=("endpoint flight", "position flight"),
++                allowed_states=manual_state,
++                capability=CommandPermission.F446_MAINTENANCE,
++                requires_maintenance=True,
++                requires_hardware_write=True,
++                confirmation=ConfirmationPolicy.exact(
++                    "MARK_CURRENT_ENDPOINT_FLIGHT"
++                ),
++            ),
+             command(
+                 "motor confirm walk",
+-                "Accept the stopped manual position as contracted WALK",
++                "Enter WALK after the operator marked the WALK endpoint",
+                 "motor",
+                 "manual_confirm_walk",
+                 aliases=("confirm walk",),
+@@ -99,7 +126,7 @@ def command_specs() -> Tuple[CommandSpec, ...]:
+             ),
+             command(
+                 "motor confirm flight",
+-                "Accept the stopped manual position as expanded FLIGHT",
++                "Enter FLIGHT_READY after the operator marked the FLIGHT endpoint",
+                 "motor",
+                 "manual_confirm_flight",
+                 aliases=("confirm flight",),
+@@ -135,6 +162,45 @@ def command_specs() -> Tuple[CommandSpec, ...]:
+                 requires_hardware_write=True,
+                 confirmation=ConfirmationPolicy.exact("CHANGE_F446_THRESHOLD"),
+             ),
++            command(
++                "motor timeout",
++                "Set and read back the F446 local motion timeout in milliseconds",
++                "motor",
++                "f446_timeout",
++                usage="motor timeout MS",
++                aliases=("timeout",),
++                allowed_states=manual_state,
++                capability=CommandPermission.F446_MAINTENANCE,
++                requires_maintenance=True,
++                requires_hardware_write=True,
++                confirmation=ConfirmationPolicy.exact("CHANGE_F446_TIMEOUT"),
++            ),
++            command(
++                "motor blank",
++                "Set the startup current-sense blanking interval in milliseconds",
++                "motor",
++                "f446_blank",
++                usage="motor blank MS",
++                aliases=("blank",),
++                allowed_states=manual_state,
++                capability=CommandPermission.F446_MAINTENANCE,
++                requires_maintenance=True,
++                requires_hardware_write=True,
++                confirmation=ConfirmationPolicy.exact("CHANGE_F446_BLANKING"),
++            ),
++            command(
++                "motor overms",
++                "Set the continuous over-threshold duration in milliseconds",
++                "motor",
++                "f446_overms",
++                usage="motor overms MS",
++                aliases=("overms",),
++                allowed_states=manual_state,
++                capability=CommandPermission.F446_MAINTENANCE,
++                requires_maintenance=True,
++                requires_hardware_write=True,
++                confirmation=ConfirmationPolicy.exact("CHANGE_F446_OVERMS"),
++            ),
+         )
+     )
+     for operation in ("mf", "mr", "limf", "limr"):
+@@ -144,7 +210,7 @@ def command_specs() -> Tuple[CommandSpec, ...]:
+             if automatic
+             else (
+                 "No F446 local limit stop; AeroGo2 applies host timeout and "
+-                "absolute current interlocks. Use stop at the observed position."
++                "absolute current interlocks. Use ms at the observed position."
+             )
+         )
+         specs.append(
+diff --git a/src/aerogo2/cli/renderer.py b/src/aerogo2/cli/renderer.py
+index b704d9a..e3078f9 100644
+--- a/src/aerogo2/cli/renderer.py
++++ b/src/aerogo2/cli/renderer.py
+@@ -30,6 +30,7 @@ STATE_COLORS: Final[Mapping[SystemState, str]] = MappingProxyType(
+         SystemState.WALK: "green",
+         SystemState.WALK_TO_FLIGHT_PRECHECK: "yellow",
+         SystemState.TRANSFORM_TO_FLIGHT: "yellow",
++        SystemState.GO2_JOINT_LOCK_WAIT: "bold yellow",
+         SystemState.FLIGHT_READY: "cyan",
+         SystemState.FLIGHT_MANUAL: "cyan",
+         SystemState.AUTO_LANDING_READY: "blue",
+diff --git a/src/aerogo2/cli/shell.py b/src/aerogo2/cli/shell.py
+index 44136f2..8ebafbe 100644
+--- a/src/aerogo2/cli/shell.py
++++ b/src/aerogo2/cli/shell.py
+@@ -140,6 +140,7 @@ class InteractiveShell:
+             SystemState.WALK_TO_FLIGHT_PRECHECK,
+             SystemState.MANUAL_POSITIONING,
+             SystemState.TRANSFORM_TO_FLIGHT,
++            SystemState.GO2_JOINT_LOCK_WAIT,
+             SystemState.FLIGHT_TO_WALK_PRECHECK,
+             SystemState.TRANSFORM_TO_WALK,
+         ):
+diff --git a/src/aerogo2/common/config.py b/src/aerogo2/common/config.py
+index fdc4fd8..b7543ea 100644
+--- a/src/aerogo2/common/config.py
++++ b/src/aerogo2/common/config.py
+@@ -51,6 +51,10 @@ class F446Config:
+     response_timeout_s: float
+     transform_timeout_s: float
+     status_poll_hz: float
++    firmware_timeout_ms: int
++    automatic_stall_threshold_adc: int
++    stall_blanking_ms: int
++    stall_overcurrent_ms: int
+     current_safe_margin_adc: int
+     current_clear_hold_s: float
+ 
+@@ -76,6 +80,7 @@ class Go2Config:
+     domain_id: int = 0
+     sport_state_topic: str = "rt/sportmodestate"
+     command_timeout_s: float = 2.0
++    joint_lock_operator_timeout_s: float = 60.0
+     landing_compliance_enabled: bool = False
+     foot_force_contact_thresholds: Tuple[int, int, int, int] = (0, 0, 0, 0)
+     landing_contact_min_feet: int = 3
+@@ -411,15 +416,58 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
+         and expected_walk != expected_by_direction[normalized_walk]
+     ):
+         errors.append("expected_walk_state conflicts with walk_direction")
+-    for key in ("response_timeout_s", "transform_timeout_s", "status_poll_hz"):
+-        finite_number(f446, key, f"f446.{key}", positive=True)
+-    integer(
++    finite_number(f446, "response_timeout_s", "f446.response_timeout_s", positive=True)
++    transform_timeout_s = finite_number(
++        f446,
++        "transform_timeout_s",
++        "f446.transform_timeout_s",
++        positive=True,
++    )
++    finite_number(f446, "status_poll_hz", "f446.status_poll_hz", positive=True)
++    current_safe_margin_adc = integer(
+         f446,
+         "current_safe_margin_adc",
+         "f446.current_safe_margin_adc",
+         minimum=0,
+         maximum=4095,
+     )
++    default_firmware_timeout_ms = (
++        15000
++        if transform_timeout_s is None
++        else max(100, int(round(transform_timeout_s * 1000.0)))
++    )
++    firmware_timeout_ms = (
++        integer(
++            f446,
++            "firmware_timeout_ms",
++            "f446.firmware_timeout_ms",
++            minimum=100,
++            maximum=60000,
++        )
++        if "firmware_timeout_ms" in f446
++        else default_firmware_timeout_ms
++    )
++    automatic_stall_threshold_adc = (
++        integer(
++            f446,
++            "automatic_stall_threshold_adc",
++            "f446.automatic_stall_threshold_adc",
++            minimum=0,
++            maximum=4095,
++        )
++        if "automatic_stall_threshold_adc" in f446
++        else 0
++    )
++    stall_blanking_ms = (
++        integer(f446, "stall_blanking_ms", "f446.stall_blanking_ms", minimum=0, maximum=5000)
++        if "stall_blanking_ms" in f446
++        else 500
++    )
++    stall_overcurrent_ms = (
++        integer(f446, "stall_overcurrent_ms", "f446.stall_overcurrent_ms", minimum=10, maximum=3000)
++        if "stall_overcurrent_ms" in f446
++        else 180
++    )
+     finite_number(
+         f446,
+         "current_clear_hold_s",
+@@ -437,6 +485,13 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
+         nonempty_text(go2, "sport_state_topic", "go2.sport_state_topic")
+     if "command_timeout_s" in go2:
+         finite_number(go2, "command_timeout_s", "go2.command_timeout_s", positive=True)
++    if "joint_lock_operator_timeout_s" in go2:
++        finite_number(
++            go2,
++            "joint_lock_operator_timeout_s",
++            "go2.joint_lock_operator_timeout_s",
++            positive=True,
++        )
+ 
+     compliance_enabled: Optional[bool] = False
+     if "landing_compliance_enabled" in go2:
+@@ -536,13 +591,40 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
+         "controller_timeout_s",
+     ):
+         finite_number(safety, key, f"safety.{key}", positive=True)
+-    integer(
++    maximum_transform_current_adc = integer(
+         safety,
+         "maximum_transform_current_adc",
+         "safety.maximum_transform_current_adc",
+         minimum=1,
+         maximum=4095,
+     )
++    if (
++        transform_timeout_s is not None
++        and firmware_timeout_ms is not None
++        and firmware_timeout_ms > int(round(transform_timeout_s * 1000.0))
++    ):
++        errors.append("f446.firmware_timeout_ms must not exceed transform_timeout_s")
++    if (
++        firmware_timeout_ms is not None
++        and stall_blanking_ms is not None
++        and stall_overcurrent_ms is not None
++        and stall_blanking_ms + stall_overcurrent_ms >= firmware_timeout_ms
++    ):
++        errors.append(
++            "f446.stall_blanking_ms plus stall_overcurrent_ms must be less than firmware_timeout_ms"
++        )
++    if (
++        automatic_stall_threshold_adc is not None
++        and automatic_stall_threshold_adc != 0
++        and current_safe_margin_adc is not None
++        and maximum_transform_current_adc is not None
++    ):
++        safe_ceiling = maximum_transform_current_adc - current_safe_margin_adc
++        if not current_safe_margin_adc < automatic_stall_threshold_adc <= safe_ceiling:
++            errors.append(
++                "f446.automatic_stall_threshold_adc must be 0 or within the host safety envelope "
++                f"{current_safe_margin_adc + 1}..{safe_ceiling}"
++            )
+ 
+     for key in (
+         "controller_hz",
+@@ -642,6 +724,17 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
+             response_timeout_s=float(_required(f446, "response_timeout_s")),
+             transform_timeout_s=float(_required(f446, "transform_timeout_s")),
+             status_poll_hz=float(_required(f446, "status_poll_hz")),
++            firmware_timeout_ms=int(
++                f446.get(
++                    "firmware_timeout_ms",
++                    round(float(_required(f446, "transform_timeout_s")) * 1000.0),
++                )
++            ),
++            automatic_stall_threshold_adc=int(
++                f446.get("automatic_stall_threshold_adc", 0)
++            ),
++            stall_blanking_ms=int(f446.get("stall_blanking_ms", 500)),
++            stall_overcurrent_ms=int(f446.get("stall_overcurrent_ms", 180)),
+             current_safe_margin_adc=_required(f446, "current_safe_margin_adc"),
+             current_clear_hold_s=float(_required(f446, "current_clear_hold_s")),
+         ),
+@@ -652,6 +745,9 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
+             domain_id=int(go2.get("domain_id", 0)),
+             sport_state_topic=str(go2.get("sport_state_topic", "rt/sportmodestate")),
+             command_timeout_s=float(go2.get("command_timeout_s", 2.0)),
++            joint_lock_operator_timeout_s=float(
++                go2.get("joint_lock_operator_timeout_s", 60.0)
++            ),
+             landing_compliance_enabled=bool(go2.get("landing_compliance_enabled", False)),
+             foot_force_contact_thresholds=foot_force_thresholds,
+             landing_contact_min_feet=int(go2.get("landing_contact_min_feet", 3)),
+diff --git a/src/aerogo2/common/enums.py b/src/aerogo2/common/enums.py
+index 0a8acee..c318e92 100644
+--- a/src/aerogo2/common/enums.py
++++ b/src/aerogo2/common/enums.py
+@@ -14,6 +14,7 @@ class SystemState(Enum):
+     WALK = auto()
+     WALK_TO_FLIGHT_PRECHECK = auto()
+     TRANSFORM_TO_FLIGHT = auto()
++    GO2_JOINT_LOCK_WAIT = auto()
+     FLIGHT_READY = auto()
+     FLIGHT_MANUAL = auto()
+     AUTO_LANDING_READY = auto()
+diff --git a/src/aerogo2/default_configs/f446.yaml b/src/aerogo2/default_configs/f446.yaml
+index d992779..38757c2 100644
+--- a/src/aerogo2/default_configs/f446.yaml
++++ b/src/aerogo2/default_configs/f446.yaml
+@@ -3,14 +3,22 @@ f446:
+   walk_direction: "reverse"
+ 
+   flight_duty: 120
+-  walk_duty: 120
++  walk_duty: 300
+ 
+   expected_flight_state: "LIMIT_REACHED_FWD"
+   expected_walk_state: "LIMIT_REACHED_REV"
+ 
+   response_timeout_s: 0.5
+-  transform_timeout_s: 6.0
++  transform_timeout_s: 15.0
+   status_poll_hz: 10
+ 
++  # F446 local limit-stop parameters. A threshold of 0 preserves the value
++  # already calibrated on the board; set a nonzero safe value to reapply it
++  # automatically whenever a hardware-write process connects.
++  firmware_timeout_ms: 15000
++  automatic_stall_threshold_adc: 0
++  stall_blanking_ms: 500
++  stall_overcurrent_ms: 180
++
+   current_safe_margin_adc: 200
+   current_clear_hold_s: 1.0
+diff --git a/src/aerogo2/default_configs/system.yaml b/src/aerogo2/default_configs/system.yaml
+index 3e7acfd..4f0d470 100644
+--- a/src/aerogo2/default_configs/system.yaml
++++ b/src/aerogo2/default_configs/system.yaml
+@@ -18,6 +18,9 @@ go2:
+   domain_id: 0
+   sport_state_topic: "rt/sportmodestate"
+   command_timeout_s: 2.0
++  # Time allowed for the operator to select Joint Lock (mode 6) in the Unitree app.
++  # F446 is already stopped at the verified FLIGHT endpoint during this wait.
++  joint_lock_operator_timeout_s: 60.0
+   # Keep disabled until all four raw foot-force channels have been calibrated
+   # on this exact robot. Threshold order is the SDK foot_force[0..3] order.
+   landing_compliance_enabled: false
+diff --git a/src/aerogo2/manager/command_service.py b/src/aerogo2/manager/command_service.py
+index 49da0da..7b79b65 100644
+--- a/src/aerogo2/manager/command_service.py
++++ b/src/aerogo2/manager/command_service.py
+@@ -29,10 +29,15 @@ class CommandService:
+         f446_actions = {
+             "manual_enter",
+             "manual_exit",
++            "manual_mark_walk",
++            "manual_mark_flight",
+             "manual_confirm_walk",
+             "manual_confirm_flight",
+             "f446_threshold_adc",
+             "f446_threshold_mv",
++            "f446_timeout",
++            "f446_blank",
++            "f446_overms",
+             "f446_mf",
+             "f446_mr",
+             "f446_limf",
+@@ -111,6 +116,22 @@ class CommandService:
+             )
+         if action == "manual_exit":
+             return cast(OperationResult, await self._manager.exit_manual_positioning())
++        if action == "manual_mark_walk":
++            return cast(
++                OperationResult,
++                await self._manager.mark_manual_configuration(
++                    Configuration.WALK,
++                    operator_confirmed=True,
++                ),
++            )
++        if action == "manual_mark_flight":
++            return cast(
++                OperationResult,
++                await self._manager.mark_manual_configuration(
++                    Configuration.FLIGHT,
++                    operator_confirmed=True,
++                ),
++            )
+         if action == "manual_confirm_walk":
+             return cast(
+                 OperationResult,
+@@ -152,6 +173,13 @@ class CommandService:
+                     millivolts=True,
+                 ),
+             )
++        timing_by_action = {
++            "f446_timeout": "timeout",
++            "f446_blank": "blank",
++            "f446_overms": "overms",
++        }
++        if action in timing_by_action:
++            return cast(OperationResult, await self._manager.set_f446_timing_parameter(timing_by_action[action], value))
+         operation_by_action = {
+             "f446_mf": "mf",
+             "f446_mr": "mr",
+diff --git a/src/aerogo2/manager/permissions.py b/src/aerogo2/manager/permissions.py
+index 507e1d3..83c69a4 100644
+--- a/src/aerogo2/manager/permissions.py
++++ b/src/aerogo2/manager/permissions.py
+@@ -52,6 +52,9 @@ STATE_ACTIONS: Final[Mapping[str, FrozenSet[SystemState]]] = MappingProxyType(
+         "manual_confirm_flight": frozenset({SystemState.MANUAL_POSITIONING}),
+         "f446_threshold_adc": frozenset({SystemState.MANUAL_POSITIONING}),
+         "f446_threshold_mv": frozenset({SystemState.MANUAL_POSITIONING}),
++        "f446_timeout": frozenset({SystemState.MANUAL_POSITIONING}),
++        "f446_blank": frozenset({SystemState.MANUAL_POSITIONING}),
++        "f446_overms": frozenset({SystemState.MANUAL_POSITIONING}),
+         "f446_mf": frozenset({SystemState.MANUAL_POSITIONING}),
+         "f446_mr": frozenset({SystemState.MANUAL_POSITIONING}),
+         "f446_limf": frozenset({SystemState.MANUAL_POSITIONING}),
+@@ -120,6 +123,9 @@ class PermissionPolicy:
+                 "manual_confirm_flight",
+                 "f446_threshold_adc",
+                 "f446_threshold_mv",
++                "f446_timeout",
++                "f446_blank",
++                "f446_overms",
+                 "f446_mf",
+                 "f446_mr",
+                 "f446_limf",
+diff --git a/src/aerogo2/manager/system_manager.py b/src/aerogo2/manager/system_manager.py
+index 7a6ea2c..74bb802 100644
+--- a/src/aerogo2/manager/system_manager.py
++++ b/src/aerogo2/manager/system_manager.py
+@@ -90,6 +90,10 @@ class SystemManager:
+             self._enter_manual_positioning,
+         )
+         self._state_machine.set_entry_action(SystemState.WALK, self._leave_manual_positioning)
++        self._state_machine.set_entry_action(
++            SystemState.GO2_JOINT_LOCK_WAIT,
++            self._enter_go2_joint_lock_wait,
++        )
+         self._state_machine.set_entry_action(
+             SystemState.FLIGHT_READY,
+             self._leave_manual_positioning,
+@@ -126,9 +130,11 @@ class SystemManager:
+         self._maintenance_mode = False
+         self._suppress_fault_entry_stop = False
+         self._operator_confirmed_configuration: Optional[Configuration] = None
++        self._manual_marked_configuration: Optional[Configuration] = None
+         self._manual_motion_deadline: Optional[float] = None
+         self._manual_last_direction: Optional[str] = None
+         self._manual_motion_started = False
++        self._go2_joint_lock_deadline: Optional[float] = None
+         self._started = False
+ 
+     @property
+@@ -318,6 +324,7 @@ class SystemManager:
+         configuration: Configuration
+         if not f446.connected:
+             self._operator_confirmed_configuration = None
++            self._manual_marked_configuration = None
+         if firmware_configuration is not Configuration.UNKNOWN:
+             configuration = firmware_configuration
+             configuration_source = "f446_limit"
+@@ -806,6 +813,7 @@ class SystemManager:
+         if not stop_result.ok:
+             return stop_result
+         self._operator_confirmed_configuration = None
++        self._manual_marked_configuration = None
+         self._manual_motion_started = False
+         self._manual_last_direction = None
+         self._manual_motion_deadline = None
+@@ -898,6 +906,7 @@ class SystemManager:
+             return result
+ 
+         self._operator_confirmed_configuration = None
++        self._manual_marked_configuration = None
+         self._manual_motion_started = True
+         self._manual_last_direction = "forward" if normalized.endswith("f") else "reverse"
+         self._manual_motion_deadline = (
+@@ -915,7 +924,7 @@ class SystemManager:
+             {
+                 "host_timeout_s": self.config.f446.transform_timeout_s,
+                 "current_reporting": "R_IS/L_IS/used raw ADC and mV",
+-                "next": "stop, then confirm walk or confirm flight",
++                "next": "ms, then confirm walk or confirm flight",
+             }
+         )
+         return OperationResult.success(result.message, data=data, code=result.code)
+@@ -980,104 +989,186 @@ class SystemManager:
+             )
+         return result
+ 
+-    async def confirm_manual_configuration(
++    async def set_f446_timing_parameter(
++        self,
++        parameter: str,
++        value: int,
++    ) -> OperationResult:
++        """Update one stopped F446 timing parameter and verify its readback."""
++
++        normalized = parameter.strip().lower()
++        if normalized not in {"timeout", "blank", "overms"}:
++            return OperationResult.failure(
++                "F446_INVALID_TIMING_PARAMETER",
++                f"Unsupported F446 timing parameter '{parameter}'",
++            )
++        if not self._control_writes_allowed():
++            return OperationResult.failure(
++                "F446_HARDWARE_WRITE_DISABLED",
++                "F446 parameter writes are locked in this process",
++            )
++        await self.refresh_snapshot()
++        guard = TransitionGuards(self.config).manual_motion_guard(self._snapshot)
++        if not guard.permitted:
++            return OperationResult.failure(
++                guard.codes[0],
++                "; ".join(
++                    f"{code}: {message}" for code, message in zip(guard.codes, guard.messages)
++                ),
++            )
++        if self._snapshot.f446.duty != 0:
++            return OperationResult.failure(
++                "F446_PARAMETER_WRITE_WHILE_MOVING",
++                f"Run ms before changing {normalized}",
++            )
++
++        ranges = {
++            "timeout": (100, min(60000, int(round(self.config.f446.transform_timeout_s * 1000.0)))),
++            "blank": (0, 5000),
++            "overms": (10, 3000),
++        }
++        minimum, maximum = ranges[normalized]
++        if isinstance(value, bool) or not minimum <= value <= maximum:
++            return OperationResult.failure(
++                "F446_TIMING_OUTSIDE_HOST_SAFETY_ENVELOPE",
++                f"{normalized} must be {minimum}..{maximum}ms",
++            )
++
++        current_timeout = self._snapshot.f446.timeout_ms or self.config.f446.firmware_timeout_ms
++        current_blank = self._snapshot.f446.blanking_ms
++        current_overms = self._snapshot.f446.overcurrent_ms
++        candidate_timeout = value if normalized == "timeout" else current_timeout
++        candidate_blank = value if normalized == "blank" else current_blank
++        candidate_overms = value if normalized == "overms" else current_overms
++        if candidate_blank + candidate_overms >= candidate_timeout:
++            return OperationResult.failure(
++                "F446_TIMING_COMBINATION_UNSAFE",
++                "blank + overms must remain less than timeout",
++            )
++
++        setter_by_parameter = {
++            "timeout": self._f446.set_motion_timeout_ms,
++            "blank": self._f446.set_stall_blanking_ms,
++            "overms": self._f446.set_overcurrent_duration_ms,
++        }
++        try:
++            result = await setter_by_parameter[normalized](value)
++        except (BridgeError, asyncio.TimeoutError, OSError, RuntimeError, ValueError) as exc:
++            return OperationResult.failure("F446_TIMING_WRITE_FAILED", str(exc))
++        await self.refresh_snapshot()
++        if result.ok:
++            self._emit(
++                "F446_TIMING_UPDATED",
++                parameter=normalized,
++                value_ms=value,
++                timeout_ms=self._snapshot.f446.timeout_ms,
++                blanking_ms=self._snapshot.f446.blanking_ms,
++                overcurrent_ms=self._snapshot.f446.overcurrent_ms,
++            )
++        return result
++
++    async def mark_manual_configuration(
+         self,
+         target: Configuration,
+         operator_confirmed: bool = False,
+     ) -> OperationResult:
+-        """Accept a stopped manual position only after explicit operator confirmation."""
++        """Record the operator's endpoint choice without leaving manual positioning."""
+ 
+         if target not in {Configuration.WALK, Configuration.FLIGHT}:
+             return OperationResult.failure(
+                 "INVALID_CONFIGURATION",
+-                "Manual confirmation target must be WALK or FLIGHT",
++                "Manual endpoint target must be WALK or FLIGHT",
+             )
+         if not operator_confirmed:
+             return OperationResult.failure(
+                 "CONFIRMATION_REQUIRED",
+-                f"Exact confirmation CONFIRM_MANUAL_{target.value} is required",
++                f"Exact confirmation MARK_CURRENT_ENDPOINT_{target.value} is required",
+             )
+         if self.state is not SystemState.MANUAL_POSITIONING:
+             return OperationResult.failure(
+                 "INVALID_STATE",
+-                "Manual configuration confirmation requires MANUAL_POSITIONING",
++                "Manual endpoint marking requires MANUAL_POSITIONING",
+             )
+ 
++        validation = await self._validate_manual_configuration_target(target)
++        if not validation.ok:
++            return validation
++
++        self._manual_marked_configuration = target
++        self._operator_confirmed_configuration = target
+         await self.refresh_snapshot()
+-        if self._snapshot.f446.duty != 0:
++        self._emit(
++            "F446_MANUAL_ENDPOINT_MARKED",
++            configuration=target.value,
++            source=self._snapshot.configuration_source,
++        )
++        return OperationResult.success(
++            (
++                f"Current stopped position marked as {target.value}; "
++                "system remains MANUAL_POSITIONING"
++            ),
++            code="F446_MANUAL_ENDPOINT_MARKED",
++            data={
++                "marked_endpoint": target.value,
++                "configuration": self._snapshot.configuration.value,
++                "configuration_source": self._snapshot.configuration_source,
++                "state": self.state.name,
++                "next": f"motor confirm {target.value.lower()}",
++            },
++        )
++
++    async def confirm_manual_configuration(
++        self,
++        target: Configuration,
++        operator_confirmed: bool = False,
++    ) -> OperationResult:
++        """Enter the state matching an independently operator-marked endpoint."""
++
++        if target not in {Configuration.WALK, Configuration.FLIGHT}:
+             return OperationResult.failure(
+-                "F446_STILL_MOVING",
+-                "Run stop and verify duty=0 before confirming the physical position",
++                "INVALID_CONFIGURATION",
++                "Manual confirmation target must be WALK or FLIGHT",
+             )
+-        if not self._manual_motion_started:
++        if not operator_confirmed:
+             return OperationResult.failure(
+-                "F446_MANUAL_MOTION_REQUIRED",
+-                "No movement has been started in this manual positioning session",
++                "CONFIRMATION_REQUIRED",
++                f"Exact confirmation CONFIRM_MANUAL_{target.value} is required",
+             )
+-        required_direction = self.config.f446.direction_for(target.value)
+-        if self._manual_last_direction != required_direction:
++        if self.state is not SystemState.MANUAL_POSITIONING:
+             return OperationResult.failure(
+-                "F446_DIRECTION_TARGET_MISMATCH",
+-                (
+-                    f"{target.value} requires last motion direction {required_direction}, "
+-                    f"observed {self._manual_last_direction}"
+-                ),
++                "INVALID_STATE",
++                "Manual configuration confirmation requires MANUAL_POSITIONING",
+             )
+-        expected_state = self.config.f446.expected_state_for(target.value)
+-        opposite = self.config.f446.expected_state_for(
+-            Configuration.FLIGHT.value if target is Configuration.WALK else Configuration.WALK.value
+-        )
+-        if self._snapshot.f446.state is opposite:
+-            return OperationResult.failure(
+-                "F446_LIMIT_TARGET_MISMATCH",
+-                (f"F446 reports {opposite.value}; it cannot be confirmed as {target.value}"),
++        if self._manual_marked_configuration is not target:
++            marked = (
++                "NONE"
++                if self._manual_marked_configuration is None
++                else self._manual_marked_configuration.value
+             )
+-        if self._snapshot.f446.state not in {F446State.IDLE, expected_state}:
+             return OperationResult.failure(
+-                "F446_FINAL_STATE_INVALID",
++                "F446_ENDPOINT_NOT_MARKED",
+                 (
+-                    "Manual confirmation requires IDLE or the matching limit state; "
+-                    f"received {self._snapshot.f446.state.value}"
+-                ),
+-            )
+-
+-        guard = TransitionGuards(self.config).manual_motion_guard(self._snapshot)
+-        if not guard.permitted:
+-            return OperationResult.failure(
+-                guard.codes[0],
+-                "; ".join(
+-                    f"{code}: {message}" for code, message in zip(guard.codes, guard.messages)
++                    f"Run motor endpoint {target.value.lower()} first; "
++                    f"current operator mark is {marked}"
+                 ),
++                data={"marked_endpoint": marked, "requested_endpoint": target.value},
+             )
+-        dwell = self._stationary_dwell_result()
+-        if not dwell.ok:
+-            return dwell
+-        current_clear = self._current_clear_dwell_result()
+-        if not current_clear.ok:
+-            return current_clear
+ 
+-        if target is Configuration.FLIGHT:
+-            try:
+-                if not await self._go2.request_flight_pose():
+-                    raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected the request")
+-            except (BridgeError, OSError, RuntimeError) as exc:
+-                return OperationResult.failure("GO2_JOINT_LOCK_FAILED", str(exc))
+-            await self.refresh_snapshot()
+-            if not self._snapshot.go2.joints_locked:
+-                return OperationResult.failure(
+-                    "GO2_JOINT_LOCK_UNCONFIRMED",
+-                    "Go2 did not authoritatively report mode=6 JOINT_LOCK",
+-                )
++        validation = await self._validate_manual_configuration_target(target)
++        if not validation.ok:
++            return validation
+ 
+         self._operator_confirmed_configuration = target
+         await self.refresh_snapshot()
+         target_state = (
+-            SystemState.WALK if target is Configuration.WALK else SystemState.FLIGHT_READY
++            SystemState.WALK
++            if target is Configuration.WALK
++            else SystemState.GO2_JOINT_LOCK_WAIT
+         )
+         try:
+             await self._state_machine.transition_to(
+                 target_state,
+-                reason=f"operator confirmed stopped manual position as {target.value}",
++                reason=f"operator confirmed marked endpoint as {target.value}",
+                 snapshot=self._snapshot,
+             )
+         except (AeroGo2Error, OSError, RuntimeError, ValueError) as exc:
+@@ -1085,12 +1176,18 @@ class SystemManager:
+             await self.refresh_snapshot()
+             return OperationResult.failure("F446_MANUAL_CONFIRM_REJECTED", str(exc))
+ 
+-        await self.refresh_snapshot()
+         self._emit(
+             "F446_MANUAL_CONFIGURATION_CONFIRMED",
+             configuration=target.value,
+             source=self._snapshot.configuration_source,
+         )
++        if target is Configuration.FLIGHT:
++            if self._runtime_mode is RuntimeMode.DRY_RUN:
++                return await self._advance_go2_joint_lock_wait(simulate_operator=True)
++            await self.refresh_snapshot()
++            return self._joint_lock_operator_required_result()
++
++        await self.refresh_snapshot()
+         return OperationResult.success(
+             f"Operator-confirmed {target.value}; system entered {target_state.name}",
+             code="F446_MANUAL_CONFIGURATION_CONFIRMED",
+@@ -1101,6 +1198,64 @@ class SystemManager:
+             },
+         )
+ 
++    async def _validate_manual_configuration_target(
++        self,
++        target: Configuration,
++    ) -> OperationResult:
++        """Validate a stopped endpoint before marking it or entering its state."""
++
++        await self.refresh_snapshot()
++        if self._snapshot.f446.duty != 0:
++            return OperationResult.failure(
++                "F446_STILL_MOVING",
++                "Run ms and verify duty=0 before marking the physical position",
++            )
++        required_direction = self.config.f446.direction_for(target.value)
++        expected_state = self.config.f446.expected_state_for(target.value)
++        opposite_target = (
++            Configuration.FLIGHT.value
++            if target is Configuration.WALK
++            else Configuration.WALK.value
++        )
++        opposite = self.config.f446.expected_state_for(opposite_target)
++        if self._snapshot.f446.state is opposite:
++            return OperationResult.failure(
++                "F446_LIMIT_TARGET_MISMATCH",
++                f"F446 reports {opposite.value}; it cannot be marked as {target.value}",
++            )
++        if self._manual_motion_started and self._manual_last_direction != required_direction:
++            return OperationResult.failure(
++                "F446_DIRECTION_TARGET_MISMATCH",
++                (
++                    f"{target.value} requires last motion direction {required_direction}, "
++                    f"observed {self._manual_last_direction}"
++                ),
++            )
++        if self._snapshot.f446.state not in {F446State.IDLE, expected_state}:
++            return OperationResult.failure(
++                "F446_FINAL_STATE_INVALID",
++                (
++                    "Manual endpoint marking requires IDLE or the matching limit state; "
++                    f"received {self._snapshot.f446.state.value}"
++                ),
++            )
++
++        guard = TransitionGuards(self.config).manual_motion_guard(self._snapshot)
++        if not guard.permitted:
++            return OperationResult.failure(
++                guard.codes[0],
++                "; ".join(
++                    f"{code}: {message}" for code, message in zip(guard.codes, guard.messages)
++                ),
++            )
++        dwell = self._stationary_dwell_result()
++        if not dwell.ok:
++            return dwell
++        current_clear = self._current_clear_dwell_result()
++        if not current_clear.ok:
++            return current_clear
++        return OperationResult.success(f"Manual endpoint {target.value} is safe to accept")
++
+     async def request_home_walk(self, operator_confirmed: bool = False) -> OperationResult:
+         """Home an unverified F446 mechanism to the configured WALK limit."""
+ 
+@@ -1236,23 +1391,24 @@ class SystemManager:
+             if not move_result.ok:
+                 raise BridgeError(f"{move_result.code}: {move_result.message}")
+             await self.refresh_snapshot()
+-            if not await self._go2.request_flight_pose():
+-                raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected the request")
++            if not await self._go2.request_stop():
++                raise BridgeError("GO2_STOP_FAILED: Go2 rejected the stop request")
+             await self.refresh_snapshot()
+-            if not self._snapshot.go2.joints_locked:
+-                raise BridgeError(
+-                    "GO2_JOINT_LOCK_UNCONFIRMED: Go2 did not report mode=6 JOINT_LOCK"
+-                )
+             self._emit("FLIGHT_LIMIT_REACHED")
+             await self._state_machine.transition_to(
+-                SystemState.FLIGHT_READY,
+-                reason="F446 FLIGHT limit and zero duty verified",
++                SystemState.GO2_JOINT_LOCK_WAIT,
++                reason="F446 FLIGHT endpoint verified; waiting for operator-selected mode=6",
+                 snapshot=self._snapshot,
+             )
+-            self._emit("FLIGHT_CONFIGURATION_VERIFIED")
+-            self._emit("FLIGHT_READY")
+             await self.refresh_snapshot()
+-            return OperationResult.success("FLIGHT verified; only RadioMaster may arm")
++            self._emit(
++                "GO2_JOINT_LOCK_OPERATOR_REQUIRED",
++                timeout_s=self.config.go2.joint_lock_operator_timeout_s,
++                current_mode=self._snapshot.go2.locomotion_mode,
++            )
++            if self._runtime_mode is RuntimeMode.DRY_RUN:
++                return await self._advance_go2_joint_lock_wait(simulate_operator=True)
++            return self._joint_lock_operator_required_result()
+         except (
+             AeroGo2Error,
+             asyncio.TimeoutError,
+@@ -1315,6 +1471,8 @@ class SystemManager:
+                 )
+                 if not relock.ok:
+                     raise BridgeError(f"{relock.code}: {relock.message}")
++                if relock.code == "GO2_JOINT_LOCK_OPERATOR_REQUIRED":
++                    return relock
+ 
+             current_clear = self._current_clear_dwell_result()
+             if not current_clear.ok:
+@@ -1617,6 +1775,10 @@ class SystemManager:
+             await self._fault(blocking[0].code, message, stop_attempted=True)
+             return violations
+ 
++        if self.state is SystemState.GO2_JOINT_LOCK_WAIT:
++            await self._advance_go2_joint_lock_wait()
++            return violations
++
+         non_escalating_codes = {
+             "AUTOLAND_CONTROLLER_TIMEOUT",
+             "AUTOLAND_ESTIMATOR_INVALID",
+@@ -1718,9 +1880,11 @@ class SystemManager:
+         if self._control_writes_allowed() and self._snapshot.go2.connected:
+             try:
+                 if initial_state is SystemState.LANDING_COMPLIANT:
+-                    relock = await self._finish_landing_compliance("supervised stop")
+-                    if not relock.ok:
+-                        raise BridgeError(f"{relock.code}: {relock.message}")
++                    if self._runtime_mode is RuntimeMode.DRY_RUN:
++                        if not await self._go2.request_flight_pose():
++                            raise BridgeError("simulated Go2 JOINT_LOCK restoration failed")
++                    elif not await self._go2.request_stop():
++                        raise BridgeError("Go2 rejected the emergency stop request")
+                 elif not await self._go2.request_stop():
+                     raise BridgeError("Go2 rejected the stop request")
+             except (BridgeError, OSError, RuntimeError) as exc:
+@@ -2141,9 +2305,23 @@ class SystemManager:
+             }
+ 
+         if name == "transform status":
++            joint_lock_deadline = self._go2_joint_lock_deadline
++            joint_lock_remaining_s = (
++                0.0
++                if joint_lock_deadline is None
++                else max(0.0, joint_lock_deadline - self._clock.monotonic())
++            )
+             return {
+                 "system_state": self.state.name,
+                 "configuration": self._snapshot.configuration.value,
++                "go2_mode": self._snapshot.go2.locomotion_mode,
++                "go2_joints_locked": self._snapshot.go2.joints_locked,
++                "joint_lock_operator_remaining_s": joint_lock_remaining_s,
++                "operator_marked_endpoint": (
++                    None
++                    if self._manual_marked_configuration is None
++                    else self._manual_marked_configuration.value
++                ),
+                 "f446_state": self._snapshot.f446.state.value,
+                 "f446_duty": self._snapshot.f446.duty,
+             }
+@@ -2591,7 +2769,12 @@ class SystemManager:
+     async def _adopt_boot_configuration(self) -> None:
+         configuration = self._snapshot.configuration
+         if configuration is Configuration.WALK:
+-            target = SystemState.WALK
++            await self._state_machine.transition_to(
++                SystemState.WALK,
++                reason="devices verified in safe WALK configuration",
++                snapshot=self._snapshot,
++            )
++            return
+         elif configuration is Configuration.FLIGHT:
+             if not self._control_writes_allowed():
+                 self._emit(
+@@ -2602,22 +2785,128 @@ class SystemManager:
+                     ),
+                 )
+                 return
+-            if not await self._go2.request_flight_pose():
+-                raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected the request")
+-            await self.refresh_snapshot()
+-            if not self._snapshot.go2.joints_locked:
+-                raise BridgeError(
+-                    "GO2_JOINT_LOCK_UNCONFIRMED: Go2 did not report mode=6 JOINT_LOCK"
++            if self._snapshot.go2.joints_locked:
++                if not await self._go2.request_flight_pose():
++                    raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected the request")
++                await self.refresh_snapshot()
++                await self._state_machine.transition_to(
++                    SystemState.FLIGHT_READY,
++                    reason="devices verified in safe FLIGHT configuration with mode=6",
++                    snapshot=self._snapshot,
+                 )
+-            target = SystemState.FLIGHT_READY
++                return
++            if not await self._go2.request_stop():
++                raise BridgeError("GO2_STOP_FAILED: Go2 rejected the stop request")
++            await self.refresh_snapshot()
++            await self._state_machine.transition_to(
++                SystemState.GO2_JOINT_LOCK_WAIT,
++                reason="FLIGHT configuration verified; waiting for operator-selected mode=6",
++                snapshot=self._snapshot,
++            )
++            await self.refresh_snapshot()
++            self._emit(
++                "GO2_JOINT_LOCK_OPERATOR_REQUIRED",
++                timeout_s=self.config.go2.joint_lock_operator_timeout_s,
++                current_mode=self._snapshot.go2.locomotion_mode,
++            )
++            if self._runtime_mode is RuntimeMode.DRY_RUN:
++                result = await self._advance_go2_joint_lock_wait(simulate_operator=True)
++                if not result.ok:
++                    raise BridgeError(f"{result.code}: {result.message}")
++            return
+         else:
+             self._emit("F446_CONFIGURATION_UNKNOWN", state=self._snapshot.f446.state.value)
+             return
+-        await self._state_machine.transition_to(
+-            target,
+-            reason=f"devices verified in safe {configuration.value} configuration",
+-            snapshot=self._snapshot,
++
++    def _joint_lock_operator_required_result(self) -> OperationResult:
++        now = self._clock.monotonic()
++        deadline = self._go2_joint_lock_deadline
++        remaining = (
++            self.config.go2.joint_lock_operator_timeout_s
++            if deadline is None
++            else max(0.0, deadline - now)
+         )
++        return OperationResult.success(
++            (
++                "FLIGHT endpoint is verified and F446 is stopped. In the Unitree phone app, "
++                "select Joint Lock (mode 6). AeroGo2 will detect it and enter FLIGHT_READY "
++                f"automatically; {remaining:.1f}s remain. Do not command Go2 locomotion."
++            ),
++            code="GO2_JOINT_LOCK_OPERATOR_REQUIRED",
++            data={
++                "state": self.state.name,
++                "current_mode": self._snapshot.go2.locomotion_mode,
++                "required_mode": "JOINT_LOCK",
++                "required_mode_code": 6,
++                "remaining_s": remaining,
++                "f446_duty": self._snapshot.f446.duty,
++                "automatic_transition": "FLIGHT_READY",
++            },
++        )
++
++    async def _advance_go2_joint_lock_wait(
++        self,
++        *,
++        simulate_operator: bool = False,
++    ) -> OperationResult:
++        if self.state is not SystemState.GO2_JOINT_LOCK_WAIT:
++            return OperationResult.failure(
++                "INVALID_STATE",
++                "Go2 joint-lock completion requires GO2_JOINT_LOCK_WAIT",
++            )
++        if simulate_operator and not self._snapshot.go2.joints_locked:
++            try:
++                if not await self._go2.request_flight_pose():
++                    raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected the request")
++            except (BridgeError, OSError, RuntimeError) as exc:
++                message = str(exc)
++                await self._fault("GO2_JOINT_LOCK_FAILED", message)
++                return OperationResult.failure("GO2_JOINT_LOCK_FAILED", message)
++            await self.refresh_snapshot()
++
++        if not self._snapshot.go2.joints_locked:
++            deadline = self._go2_joint_lock_deadline
++            if deadline is not None and self._clock.monotonic() >= deadline:
++                message = (
++                    "Go2 did not report mode=6 JOINT_LOCK within "
++                    f"{self.config.go2.joint_lock_operator_timeout_s:.1f}s"
++                )
++                await self._fault("GO2_JOINT_LOCK_OPERATOR_TIMEOUT", message)
++                return OperationResult.failure("GO2_JOINT_LOCK_OPERATOR_TIMEOUT", message)
++            return self._joint_lock_operator_required_result()
++
++        try:
++            # The operator/app already selected mode 6. This call only disables
++            # joystick input and re-verifies the authoritative SportModeState.
++            if not await self._go2.request_flight_pose():
++                raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected finalization")
++            await self.refresh_snapshot()
++            if not self._snapshot.go2.joints_locked:
++                raise BridgeError(
++                    "GO2_JOINT_LOCK_UNCONFIRMED: Go2 lost mode=6 during finalization"
++                )
++            await self._state_machine.transition_to(
++                SystemState.FLIGHT_READY,
++                reason="operator-selected Go2 mode=6 verified and joystick input disabled",
++                snapshot=self._snapshot,
++            )
++            self._go2_joint_lock_deadline = None
++            self._emit("FLIGHT_CONFIGURATION_VERIFIED")
++            self._emit("FLIGHT_READY")
++            await self.refresh_snapshot()
++            return OperationResult.success(
++                "FLIGHT verified with Go2 mode=6 JOINT_LOCK; only RadioMaster may arm",
++                code="FLIGHT_READY",
++            )
++        except (AeroGo2Error, OSError, RuntimeError, ValueError) as exc:
++            message = str(exc)
++            code = (
++                "GO2_JOINT_LOCK_UNCONFIRMED"
++                if message.startswith("GO2_JOINT_LOCK_UNCONFIRMED:")
++                else "GO2_JOINT_LOCK_FAILED"
++            )
++            await self._fault(code, message)
++            return OperationResult.failure(code, message)
+ 
+     async def _prepare_disconnect(self) -> OperationResult:
+         if self.state in (
+@@ -2774,21 +3063,36 @@ class SystemManager:
+         self._autoland_active = False
+         self._maintenance_mode = False
+         self._operator_confirmed_configuration = None
++        self._manual_marked_configuration = None
+         self._manual_motion_deadline = None
+         self._manual_last_direction = None
+         self._manual_motion_started = False
++        self._go2_joint_lock_deadline = None
+ 
+     async def _enter_manual_positioning(self, snapshot: SystemSnapshot) -> None:
+         self._maintenance_mode = True
++        self._manual_marked_configuration = None
++        self._manual_motion_deadline = None
++        self._manual_last_direction = None
++        self._manual_motion_started = False
++
++    async def _enter_go2_joint_lock_wait(self, snapshot: SystemSnapshot) -> None:
++        self._maintenance_mode = False
++        self._manual_marked_configuration = None
+         self._manual_motion_deadline = None
+         self._manual_last_direction = None
+         self._manual_motion_started = False
++        self._go2_joint_lock_deadline = (
++            self._clock.monotonic() + self.config.go2.joint_lock_operator_timeout_s
++        )
+ 
+     async def _leave_manual_positioning(self, snapshot: SystemSnapshot) -> None:
+         self._maintenance_mode = False
++        self._manual_marked_configuration = None
+         self._manual_motion_deadline = None
+         self._manual_last_direction = None
+         self._manual_motion_started = False
++        self._go2_joint_lock_deadline = None
+ 
+     async def _enter_landing_compliant(self, snapshot: SystemSnapshot) -> None:
+         if not self._control_writes_allowed():
+@@ -2831,19 +3135,25 @@ class SystemManager:
+                 "Go2 landing compliance can only finish from LANDING_COMPLIANT",
+             )
+         try:
+-            if not await self._go2.request_flight_pose():
+-                raise BridgeError("Go2 rejected the JOINT_LOCK restoration request")
++            if not await self._go2.request_stop():
++                raise BridgeError("Go2 rejected the stop request before manual JOINT_LOCK")
+             await self.refresh_snapshot()
+-            if not self._snapshot.go2.joints_locked:
+-                raise BridgeError("Go2 did not authoritatively report mode=6 JOINT_LOCK")
+             await self._state_machine.transition_to(
+-                SystemState.FLIGHT_READY,
+-                reason=f"landing compliance finished: {reason}",
++                SystemState.GO2_JOINT_LOCK_WAIT,
++                reason=f"landing compliance finished; waiting for operator mode=6: {reason}",
+                 snapshot=self._snapshot,
+             )
+             self._landing_compliant_since = None
+-            self._emit("LANDING_COMPLIANCE_FINISHED", reason=reason)
+             await self.refresh_snapshot()
++            self._emit(
++                "GO2_JOINT_LOCK_OPERATOR_REQUIRED",
++                timeout_s=self.config.go2.joint_lock_operator_timeout_s,
++                current_mode=self._snapshot.go2.locomotion_mode,
++                reason=reason,
++            )
++            if self._runtime_mode is RuntimeMode.DRY_RUN:
++                return await self._advance_go2_joint_lock_wait(simulate_operator=True)
++            return self._joint_lock_operator_required_result()
+         except (
+             AeroGo2Error,
+             asyncio.TimeoutError,
+@@ -2852,20 +3162,16 @@ class SystemManager:
+             ValueError,
+         ) as exc:
+             return OperationResult.failure("GO2_LANDING_RELOCK_FAILED", str(exc))
+-        if self._snapshot.state is not SystemState.FLIGHT_READY:
+-            return OperationResult.failure(
+-                "GO2_LANDING_RELOCK_FAILED",
+-                f"Expected FLIGHT_READY after relock, received {self._snapshot.state.name}",
+-            )
+-        return OperationResult.success("Go2 JOINT_LOCK restored after landing compliance")
+ 
+     async def _enter_fault_state(self, snapshot: SystemSnapshot) -> None:
+         self._autoland_active = False
+         self._maintenance_mode = False
+         self._operator_confirmed_configuration = None
++        self._manual_marked_configuration = None
+         self._manual_motion_deadline = None
+         self._manual_last_direction = None
+         self._manual_motion_started = False
++        self._go2_joint_lock_deadline = None
+         if self._suppress_fault_entry_stop:
+             return
+         await self._stop_setpoints()
+@@ -2874,6 +3180,8 @@ class SystemManager:
+             raise BridgeError(f"{stop_result.code}: {stop_result.message}")
+ 
+     async def _enter_emergency_stop(self, snapshot: SystemSnapshot) -> None:
++        self._manual_marked_configuration = None
++        self._go2_joint_lock_deadline = None
+         result = await self.stop_supervised()
+         if not result.ok:
+             raise BridgeError(f"{result.code}: {result.message}")
+diff --git a/src/aerogo2/manager/transition_guards.py b/src/aerogo2/manager/transition_guards.py
+index 4d4bbdc..bc0d0ec 100644
+--- a/src/aerogo2/manager/transition_guards.py
++++ b/src/aerogo2/manager/transition_guards.py
+@@ -27,12 +27,14 @@ _MUTABLE_ALLOWED_TRANSITIONS: Dict[SystemState, Set[SystemState]] = {
+         SystemState.HOMING_TO_WALK,
+         SystemState.WALK,
+         SystemState.FLIGHT_READY,
++        SystemState.GO2_JOINT_LOCK_WAIT,
+         SystemState.FAULT,
+     },
+     SystemState.MANUAL_POSITIONING: {
+         SystemState.BOOT_SAFE,
+         SystemState.WALK,
+         SystemState.FLIGHT_READY,
++        SystemState.GO2_JOINT_LOCK_WAIT,
+         SystemState.FAULT,
+         SystemState.EMERGENCY_STOP,
+     },
+@@ -55,6 +57,11 @@ _MUTABLE_ALLOWED_TRANSITIONS: Dict[SystemState, Set[SystemState]] = {
+         SystemState.EMERGENCY_STOP,
+     },
+     SystemState.TRANSFORM_TO_FLIGHT: {
++        SystemState.GO2_JOINT_LOCK_WAIT,
++        SystemState.FAULT,
++        SystemState.EMERGENCY_STOP,
++    },
++    SystemState.GO2_JOINT_LOCK_WAIT: {
+         SystemState.FLIGHT_READY,
+         SystemState.FAULT,
+         SystemState.EMERGENCY_STOP,
+@@ -94,6 +101,7 @@ _MUTABLE_ALLOWED_TRANSITIONS: Dict[SystemState, Set[SystemState]] = {
+         SystemState.EMERGENCY_STOP,
+     },
+     SystemState.LANDING_COMPLIANT: {
++        SystemState.GO2_JOINT_LOCK_WAIT,
+         SystemState.FLIGHT_READY,
+         SystemState.FAULT,
+         SystemState.EMERGENCY_STOP,
+@@ -130,7 +138,9 @@ ACTIVE_TRANSFORM_STATES: FrozenSet[SystemState] = frozenset(
+     )
+ )
+ TRANSFORM_STATES: FrozenSet[SystemState] = frozenset(
+-    TRANSFORM_PRECHECK_STATES | ACTIVE_TRANSFORM_STATES
++    TRANSFORM_PRECHECK_STATES
++    | ACTIVE_TRANSFORM_STATES
++    | frozenset((SystemState.GO2_JOINT_LOCK_WAIT,))
+ )
+ 
+ 
+@@ -258,6 +268,24 @@ class TransitionGuards:
+                 )
+             self._require_go2_stationary(snapshot, codes, messages)
+ 
++        if new_state is SystemState.GO2_JOINT_LOCK_WAIT:
++            if snapshot.configuration is not Configuration.FLIGHT:
++                self._reject(
++                    codes,
++                    messages,
++                    "FLIGHT_CONFIGURATION_NOT_CONFIRMED",
++                    "Go2 joint-lock wait requires a verified FLIGHT endpoint",
++                )
++            if snapshot.f446.duty != 0:
++                self._reject(
++                    codes,
++                    messages,
++                    "F446_DUTY_NONZERO",
++                    "F446 must be stopped before waiting for Go2 JOINT_LOCK",
++                )
++            self._require_disarmed(snapshot, codes, messages)
++            self._require_rotors_stopped(snapshot, codes, messages)
++
+         if new_state is SystemState.FLIGHT_READY:
+             if snapshot.configuration is not Configuration.FLIGHT:
+                 self._reject(
+diff --git a/src/aerogo2/safety/safety_monitor.py b/src/aerogo2/safety/safety_monitor.py
+index fd7fb76..19ad330 100644
+--- a/src/aerogo2/safety/safety_monitor.py
++++ b/src/aerogo2/safety/safety_monitor.py
+@@ -32,6 +32,7 @@ _TRANSFORM_INTERLOCK_STATES = frozenset(
+         SystemState.MANUAL_POSITIONING,
+         SystemState.HOMING_TO_WALK,
+         SystemState.TRANSFORM_TO_FLIGHT,
++        SystemState.GO2_JOINT_LOCK_WAIT,
+         SystemState.FLIGHT_TO_WALK_PRECHECK,
+         SystemState.TRANSFORM_TO_WALK,
+     )
+@@ -194,7 +195,17 @@ class SafetyMonitor:
+                     "ESC telemetry is incomplete, inconsistent, unhealthy, non-finite, or nonzero during active transformation.",
+                     "Stop the F446 mechanism; do not command rotor shutdown.",
+                 )
+-            if self._go2_is_moving(snapshot):
++            if (
++                snapshot.state is SystemState.GO2_JOINT_LOCK_WAIT
++                and self._go2_joint_lock_transition_is_unsafe(snapshot)
++            ):
++                add(
++                    "GO2_UNSAFE_DURING_JOINT_LOCK",
++                    SafetySeverity.FAULT,
++                    "Go2 entered a locomotion/unsafe-speed state while waiting for mode=6 JOINT_LOCK.",
++                    "Stop the F446 mechanism and keep the Go2 stationary; select Joint Lock in the Unitree app.",
++                )
++            elif snapshot.state is not SystemState.GO2_JOINT_LOCK_WAIT and self._go2_is_moving(snapshot):
+                 add(
+                     "GO2_MOVING_DURING_TRANSFORM",
+                     SafetySeverity.FAULT,
+@@ -374,6 +385,26 @@ class SafetyMonitor:
+             or snapshot.go2.controller_active
+         )
+ 
++    def _go2_joint_lock_transition_is_unsafe(self, snapshot: SystemSnapshot) -> bool:
++        allowed_modes = {
++            "IDLE_STAND",
++            "BALANCE_STAND",
++            "POSE",
++            "JOINT_LOCK",
++            # Simulation aliases; the hardware bridge emits the names above.
++            "STAND",
++            "STOPPED",
++        }
++        components = snapshot.go2.body_velocity
++        limit = self._config.safety.stationary_velocity_mps
++        return (
++            snapshot.go2.locomotion_mode not in allowed_modes
++            or not math.isfinite(snapshot.go2.velocity_mps)
++            or len(components) != 3
++            or any(not math.isfinite(value) or abs(value) >= limit for value in components)
++            or abs(snapshot.go2.velocity_mps) >= limit
++        )
++
+     def _f446_overcurrent(self, snapshot: SystemSnapshot) -> bool:
+         current = snapshot.f446.used_current_adc
+         if current is None:
+@@ -423,6 +454,7 @@ class SafetyMonitor:
+         if snapshot.state in (SystemState.WALK, SystemState.WALK_TO_FLIGHT_PRECHECK):
+             state_expected = Configuration.WALK
+         elif snapshot.state in (
++            SystemState.GO2_JOINT_LOCK_WAIT,
+             SystemState.FLIGHT_READY,
+             SystemState.FLIGHT_MANUAL,
+             SystemState.AUTO_LANDING_READY,
+diff --git a/tests/integration/test_cli_runtime_semantics.py b/tests/integration/test_cli_runtime_semantics.py
+index b9b72b1..a59fa0f 100644
+--- a/tests/integration/test_cli_runtime_semantics.py
++++ b/tests/integration/test_cli_runtime_semantics.py
+@@ -639,12 +639,14 @@ async def test_top_level_and_transform_stop_have_distinct_semantics(
+     await dispatcher.dispatch("s", render=False)
+     await dispatcher.dispatch("transform stop", render=False)
+     await dispatcher.dispatch("motor stop", render=False)
++    await dispatcher.dispatch("ms", render=False)
+ 
+     assert manager.calls == [
+         ("stop_supervised", None),
+         ("stop_supervised", None),
+         ("stop_transform_motion", None),
+         ("stop_transform_motion", None),
++        ("stop_transform_motion", None),
+     ]
+ 
+ 
+diff --git a/tests/integration/test_dry_run_mission.py b/tests/integration/test_dry_run_mission.py
+index 1532704..27603db 100644
+--- a/tests/integration/test_dry_run_mission.py
++++ b/tests/integration/test_dry_run_mission.py
+@@ -20,6 +20,7 @@ async def test_nominal_dry_run_completes_full_mission(
+             SystemState.WALK,
+             SystemState.WALK_TO_FLIGHT_PRECHECK,
+             SystemState.TRANSFORM_TO_FLIGHT,
++            SystemState.GO2_JOINT_LOCK_WAIT,
+             SystemState.FLIGHT_READY,
+             SystemState.FLIGHT_MANUAL,
+             SystemState.AUTO_LANDING_READY,
+diff --git a/tests/state_machine/test_manual_positioning.py b/tests/state_machine/test_manual_positioning.py
+index 95757d9..aa40f16 100644
+--- a/tests/state_machine/test_manual_positioning.py
++++ b/tests/state_machine/test_manual_positioning.py
+@@ -17,6 +17,125 @@ async def _settle_interlocks(world: SimulationWorld) -> None:
+     )
+ 
+ 
++@pytest.mark.asyncio
++async def test_matching_limit_can_be_confirmed_without_motion(
++    app_config: AppConfig,
++) -> None:
++    world = SimulationWorld(app_config)
++    try:
++        assert (await world.start()).ok
++        await _settle_interlocks(world)
++        assert (await world.manager.enter_manual_positioning(operator_confirmed=True)).ok
++        assert world.manager.snapshot.f446.state is F446State.LIMIT_REACHED_REV
++
++        marked = await world.manager.mark_manual_configuration(
++            Configuration.WALK,
++            operator_confirmed=True,
++        )
++        assert marked.ok
++        assert world.manager.state is SystemState.MANUAL_POSITIONING
++
++        confirmed = await world.manager.confirm_manual_configuration(
++            Configuration.WALK,
++            operator_confirmed=True,
++        )
++
++        assert confirmed.ok
++        assert world.manager.state is SystemState.WALK
++        assert world.manager.snapshot.configuration is Configuration.WALK
++        assert world.manager.snapshot.configuration_source == "f446_limit"
++    finally:
++        await world.shutdown()
++
++
++@pytest.mark.asyncio
++async def test_idle_position_without_motion_can_be_operator_confirmed(
++    app_config: AppConfig,
++) -> None:
++    world = SimulationWorld(app_config)
++    try:
++        assert (await world.start()).ok
++        await _settle_interlocks(world)
++        assert (await world.manager.enter_manual_positioning(operator_confirmed=True)).ok
++        world.f446.inject_status(
++            state=F446State.IDLE,
++            duty=0,
++            used_current_adc=0,
++            used_raw=0,
++            used_mv=0,
++        )
++        await world.manager.refresh_snapshot()
++        await _settle_interlocks(world)
++
++        marked = await world.manager.mark_manual_configuration(
++            Configuration.WALK,
++            operator_confirmed=True,
++        )
++        assert marked.ok
++        assert marked.data["marked_endpoint"] == "WALK"
++        assert world.manager.state is SystemState.MANUAL_POSITIONING
++        assert world.manager.snapshot.configuration is Configuration.WALK
++        await _settle_interlocks(world)
++
++        confirmed = await world.manager.confirm_manual_configuration(
++            Configuration.WALK,
++            operator_confirmed=True,
++        )
++
++        assert confirmed.ok
++        assert world.manager.state is SystemState.WALK
++        assert world.manager.snapshot.configuration is Configuration.WALK
++        assert world.manager.snapshot.configuration_source == "operator"
++    finally:
++        await world.shutdown()
++
++
++@pytest.mark.asyncio
++async def test_opposite_reported_limit_cannot_be_overridden_without_motion(
++    app_config: AppConfig,
++) -> None:
++    world = SimulationWorld(app_config)
++    try:
++        assert (await world.start()).ok
++        await _settle_interlocks(world)
++        assert (await world.manager.enter_manual_positioning(operator_confirmed=True)).ok
++        assert world.manager.snapshot.f446.state is F446State.LIMIT_REACHED_REV
++
++        rejected = await world.manager.mark_manual_configuration(
++            Configuration.FLIGHT,
++            operator_confirmed=True,
++        )
++
++        assert not rejected.ok
++        assert rejected.code == "F446_LIMIT_TARGET_MISMATCH"
++        assert world.manager.state is SystemState.MANUAL_POSITIONING
++    finally:
++        await world.shutdown()
++
++
++@pytest.mark.asyncio
++async def test_state_confirmation_requires_prior_matching_endpoint_mark(
++    app_config: AppConfig,
++) -> None:
++    world = SimulationWorld(app_config)
++    try:
++        assert (await world.start()).ok
++        await _settle_interlocks(world)
++        assert (await world.manager.enter_manual_positioning(operator_confirmed=True)).ok
++
++        rejected = await world.manager.confirm_manual_configuration(
++            Configuration.WALK,
++            operator_confirmed=True,
++        )
++
++        assert not rejected.ok
++        assert rejected.code == "F446_ENDPOINT_NOT_MARKED"
++        assert rejected.data["marked_endpoint"] == "NONE"
++        assert world.manager.state is SystemState.MANUAL_POSITIONING
++    finally:
++        await world.shutdown()
++
++
+ @pytest.mark.asyncio
+ async def test_manual_reverse_stop_and_operator_walk_confirmation(
+     app_config: AppConfig,
+@@ -46,13 +165,19 @@ async def test_manual_reverse_stop_and_operator_walk_confirmation(
+         assert world.manager.snapshot.f446.duty == 0
+ 
+         await _settle_interlocks(world)
+-        wrong_target = await world.manager.confirm_manual_configuration(
++        wrong_target = await world.manager.mark_manual_configuration(
+             Configuration.FLIGHT,
+             operator_confirmed=True,
+         )
+         assert not wrong_target.ok
+         assert wrong_target.code == "F446_DIRECTION_TARGET_MISMATCH"
+ 
++        marked = await world.manager.mark_manual_configuration(
++            Configuration.WALK,
++            operator_confirmed=True,
++        )
++        assert marked.ok
++        await _settle_interlocks(world)
+         confirmed = await world.manager.confirm_manual_configuration(
+             Configuration.WALK,
+             operator_confirmed=True,
+@@ -85,6 +210,12 @@ async def test_manual_forward_stop_and_operator_flight_confirmation(
+         assert world.manager.state is SystemState.MANUAL_POSITIONING
+         await _settle_interlocks(world)
+ 
++        marked = await world.manager.mark_manual_configuration(
++            Configuration.FLIGHT,
++            operator_confirmed=True,
++        )
++        assert marked.ok
++        await _settle_interlocks(world)
+         confirmed = await world.manager.confirm_manual_configuration(
+             Configuration.FLIGHT,
+             operator_confirmed=True,
+@@ -128,6 +259,11 @@ async def test_limit_motion_requires_safe_threshold_and_accepts_limit_stop(
+         )
+         await world.manager.refresh_snapshot()
+         await _settle_interlocks(world)
++        marked = await world.manager.mark_manual_configuration(
++            Configuration.WALK,
++            operator_confirmed=True,
++        )
++        assert marked.ok
+         confirmed = await world.manager.confirm_manual_configuration(
+             Configuration.WALK,
+             operator_confirmed=True,
+@@ -159,3 +295,32 @@ async def test_manual_motion_host_timeout_stops_without_leaving_session(
+         assert world.f446.command_history[-1].command == "stop"
+     finally:
+         await world.shutdown()
++
++
++@pytest.mark.asyncio
++async def test_manual_timing_parameters_are_guarded_and_verified(
++    app_config: AppConfig,
++) -> None:
++    world = SimulationWorld(app_config)
++    try:
++        assert (await world.start()).ok
++        await _settle_interlocks(world)
++        assert (await world.manager.enter_manual_positioning(operator_confirmed=True)).ok
++
++        assert (await world.manager.set_f446_timing_parameter("timeout", 15000)).ok
++        assert (await world.manager.set_f446_timing_parameter("blank", 450)).ok
++        assert (await world.manager.set_f446_timing_parameter("overms", 200)).ok
++        assert world.manager.snapshot.f446.timeout_ms == 15000
++        assert world.manager.snapshot.f446.blanking_ms == 450
++        assert world.manager.snapshot.f446.overcurrent_ms == 200
++
++        unsafe = await world.manager.set_f446_timing_parameter("timeout", 500)
++        assert not unsafe.ok
++        assert unsafe.code == "F446_TIMING_COMBINATION_UNSAFE"
++
++        assert (await world.manager.start_f446_maintenance_motion("mf", 200)).ok
++        moving = await world.manager.set_f446_timing_parameter("blank", 400)
++        assert not moving.ok
++        assert moving.code == "F446_DUTY_NONZERO"
++    finally:
++        await world.shutdown()
+diff --git a/tests/state_machine/test_nominal_transition.py b/tests/state_machine/test_nominal_transition.py
+index 269328c..aacbfd3 100644
+--- a/tests/state_machine/test_nominal_transition.py
++++ b/tests/state_machine/test_nominal_transition.py
+@@ -20,6 +20,7 @@ async def test_nominal_transition_history_contains_every_guarded_stage(
+             SystemState.WALK,
+             SystemState.WALK_TO_FLIGHT_PRECHECK,
+             SystemState.TRANSFORM_TO_FLIGHT,
++            SystemState.GO2_JOINT_LOCK_WAIT,
+             SystemState.FLIGHT_READY,
+             SystemState.FLIGHT_MANUAL,
+             SystemState.AUTO_LANDING_READY,
+diff --git a/tests/unit/test_command_registry.py b/tests/unit/test_command_registry.py
+index 6a184eb..ec2af4d 100644
+--- a/tests/unit/test_command_registry.py
++++ b/tests/unit/test_command_registry.py
+@@ -84,19 +84,24 @@ log status
+ log stop
+ log tail
+ motor current
++motor endpoint flight
++motor endpoint walk
+ motor confirm flight
+ motor confirm walk
++motor blank
+ motor limf
+ motor limr
+ motor maintenance enter
+ motor maintenance exit
+ motor mf
+ motor mr
++motor overms
+ motor parameters
+ motor status
+ motor stop
+ motor threshold
+ motor threshold-mv
++motor timeout
+ motor to-flight
+ motor to-walk
+ pixhawk messages
+@@ -165,6 +170,7 @@ def test_complete_canonical_command_tree_is_registered() -> None:
+         ("quit", "exit"),
+         ("abort", "autoland abort"),
+         ("s", "stop"),
++        ("ms", "motor stop"),
+     ],
+ )
+ def test_command_aliases_resolve_to_the_canonical_spec(alias: str, canonical: str) -> None:
+@@ -463,7 +469,7 @@ def test_unimplemented_autoland_outputs_remain_dry_run_only(name: str) -> None:
+     assert policy.allowed_modes == frozenset({RuntimeMode.DRY_RUN})
+ 
+ 
+-@pytest.mark.parametrize("name", ["stop", "motor stop", "transform stop", "abort"])
++@pytest.mark.parametrize("name", ["stop", "motor stop", "ms", "transform stop", "abort"])
+ def test_safety_stop_commands_never_require_confirmation(name: str) -> None:
+     match = build_registry().resolve(name)
+ 
+diff --git a/tests/unit/test_config.py b/tests/unit/test_config.py
+index 26bfaa6..9626f5d 100644
+--- a/tests/unit/test_config.py
++++ b/tests/unit/test_config.py
+@@ -16,6 +16,12 @@ def test_loads_included_configuration(app_config: AppConfig) -> None:
+     assert app_config.system.hardware_write_enabled is False
+     assert app_config.f446.flight_direction == "forward"
+     assert app_config.rc.morphology_channel == 9
++    assert app_config.f446.walk_duty == 300
++    assert app_config.f446.transform_timeout_s == 15.0
++    assert app_config.f446.firmware_timeout_ms == 15000
++    assert app_config.f446.automatic_stall_threshold_adc == 0
++    assert app_config.f446.stall_blanking_ms == 500
++    assert app_config.f446.stall_overcurrent_ms == 180
+ 
+ 
+ def test_non_dry_configuration_can_describe_hardware_write_capability(
+@@ -86,6 +92,18 @@ def _excess_duty(raw: Dict[str, Any]) -> None:
+ def _zero_timeout(raw: Dict[str, Any]) -> None:
+     raw["f446"]["transform_timeout_s"] = 0
+ 
++def _firmware_timeout_exceeds_host(raw: Dict[str, Any]) -> None:
++    raw["f446"]["firmware_timeout_ms"] = 16000
++
++
++def _unsafe_persistent_threshold(raw: Dict[str, Any]) -> None:
++    raw["f446"]["automatic_stall_threshold_adc"] = 1800
++
++
++def _invalid_timing_combination(raw: Dict[str, Any]) -> None:
++    raw["f446"]["stall_blanking_ms"] = 14900
++
++
+ 
+ def _duplicate_rc(raw: Dict[str, Any]) -> None:
+     raw["rc"]["morphology_channel"] = raw["rc"]["auto_landing_channel"]
+@@ -124,6 +142,9 @@ def _negative_landing_speed(raw: Dict[str, Any]) -> None:
+         (_excess_duty, "walk_duty"),
+         (_zero_timeout, "transform_timeout_s"),
+         (_duplicate_rc, "channel assignments"),
++        (_firmware_timeout_exceeds_host, "must not exceed"),
++        (_unsafe_persistent_threshold, "safety envelope"),
++        (_invalid_timing_combination, "stall_blanking_ms"),
+         (_overlap_rc, "thresholds"),
+         (_rc9_option, "RC9_OPTION"),
+         (_duplicate_esc, "ESC slots"),
+@@ -146,6 +167,26 @@ def test_unsafe_configuration_is_rejected(
+         load_config(path)
+ 
+ 
++
++def test_legacy_f446_timing_keys_are_derived_safely(
++    tmp_path: Path,
++    app_config: AppConfig,
++) -> None:
++    raw = deep_thaw(app_config.raw)
++    raw["f446"]["transform_timeout_s"] = 6.0
++    for key in (
++        "firmware_timeout_ms",
++        "automatic_stall_threshold_adc",
++        "stall_blanking_ms",
++        "stall_overcurrent_ms",
++    ):
++        del raw["f446"][key]
++    path = tmp_path / "legacy.yaml"
++    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
++    loaded = load_config(path)
++    assert loaded.f446.firmware_timeout_ms == 6000
++    assert loaded.f446.automatic_stall_threshold_adc == 0
++
+ def test_include_cycle_is_rejected(tmp_path: Path) -> None:
+     first = tmp_path / "first.yaml"
+     second = tmp_path / "second.yaml"
+diff --git a/tests/unit/test_f446_bridge.py b/tests/unit/test_f446_bridge.py
+index 8ef447c..65b5196 100644
+--- a/tests/unit/test_f446_bridge.py
++++ b/tests/unit/test_f446_bridge.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import asyncio
+ import sys
+ from dataclasses import replace
+ from types import SimpleNamespace
+@@ -13,6 +14,7 @@ from aerogo2.common.config import AppConfig
+ from aerogo2.common.enums import Configuration, F446State
+ from aerogo2.common.exceptions import BridgeError
+ from aerogo2.common.models import F446Status
++from aerogo2.common.results import OperationResult
+ 
+ 
+ class RecordingWriter:
+@@ -99,7 +101,7 @@ async def test_walk_direction_uses_configured_mapping(
+     await fake.connect()
+     result = await fake.move_to_configuration(Configuration.WALK)
+     assert result.ok
+-    assert "limr 120" in commands(fake)
++    assert "limr 300" in commands(fake)
+ 
+ 
+ @pytest.mark.asyncio
+@@ -291,6 +293,215 @@ async def test_real_text_bridge_accepts_negative_reverse_duty(
+     assert b"".join(writer.chunks) == b"mr 500\r"
+ 
+ 
++@pytest.mark.asyncio
++async def test_real_text_bridge_ignores_stale_status_before_motion_ack(
++    app_config: AppConfig,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    bridge = TextF446Bridge(app_config.f446, allow_motion=True)
++    writer = RecordingWriter()
++    bridge._connected = True
++    bridge._writer = writer
++    initial = F446Status(
++        connected=True,
++        state=F446State.IDLE,
++        raw_state=F446State.IDLE.value,
++        duty=0,
++        manual_limit=500,
++    )
++    responses = iter(
++        (
++            initial,
++            initial,
++            replace(
++                initial,
++                state=F446State.MANUAL_FWD,
++                raw_state=F446State.MANUAL_FWD.value,
++                duty=20,
++            ),
++        )
++    )
++
++    async def request_status() -> F446Status:
++        return next(responses)
++
++    async def no_sleep(_: float) -> None:
++        return None
++
++    monkeypatch.setattr(bridge, "request_status", request_status)
++    monkeypatch.setattr("aerogo2.bridges.f446_text_bridge.asyncio.sleep", no_sleep)
++
++    result = await bridge.start_maintenance_motion("mf", 20)
++
++    assert result.ok
++    assert result.data["signed_duty"] == 20
++    assert b"".join(writer.chunks) == b"mf 20\r"
++
++
++@pytest.mark.asyncio
++async def test_real_text_bridge_ignores_stale_threshold_readback(
++    app_config: AppConfig,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    bridge = TextF446Bridge(app_config.f446, allow_motion=True)
++    writer = RecordingWriter()
++    bridge._connected = True
++    bridge._writer = writer
++    initial = F446Status(
++        connected=True,
++        state=F446State.IDLE,
++        raw_state=F446State.IDLE.value,
++        duty=0,
++        manual_limit=350,
++        threshold_adc=1800,
++        threshold_raw=1800,
++        threshold_mv=1450,
++    )
++    responses = iter(
++        (
++            initial,
++            initial,
++            replace(
++                initial,
++                threshold_adc=300,
++                threshold_raw=300,
++                threshold_mv=241,
++            ),
++        )
++    )
++
++    async def request_status() -> F446Status:
++        return next(responses)
++
++    async def no_sleep(_: float) -> None:
++        return None
++
++    monkeypatch.setattr(bridge, "request_status", request_status)
++    monkeypatch.setattr("aerogo2.bridges.f446_text_bridge.asyncio.sleep", no_sleep)
++
++    result = await bridge.set_current_threshold_adc(300)
++
++    assert result.ok
++    assert result.data["threshold_adc"] == 300
++    assert b"".join(writer.chunks) == b"thr 300\r"
++
++
++@pytest.mark.asyncio
++async def test_real_text_bridge_ignores_stale_timeout_readback(
++    app_config: AppConfig,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    bridge = TextF446Bridge(app_config.f446, allow_motion=True)
++    writer = RecordingWriter()
++    bridge._connected = True
++    bridge._writer = writer
++    initial = F446Status(
++        connected=True,
++        state=F446State.IDLE,
++        raw_state=F446State.IDLE.value,
++        duty=0,
++        timeout_ms=5000,
++    )
++    responses = iter((initial, initial, replace(initial, timeout_ms=15000)))
++
++    async def request_status() -> F446Status:
++        return next(responses)
++
++    async def no_sleep(_: float) -> None:
++        return None
++
++    monkeypatch.setattr(bridge, "request_status", request_status)
++    monkeypatch.setattr("aerogo2.bridges.f446_text_bridge.asyncio.sleep", no_sleep)
++    result = await bridge.set_motion_timeout_ms(15000)
++    assert result.ok
++    assert result.data["timeout_ms"] == 15000
++    assert b"".join(writer.chunks) == b"timeout 15000\r"
++
++
++@pytest.mark.asyncio
++async def test_connect_synchronizes_configured_f446_parameters(
++    app_config: AppConfig,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    config = replace(app_config.f446, automatic_stall_threshold_adc=900)
++    bridge = TextF446Bridge(config, allow_motion=True)
++    calls: list[tuple[str, int]] = []
++
++    def setter(name: str):
++        async def apply(value: int) -> OperationResult:
++            calls.append((name, value))
++            return OperationResult.success("updated")
++        return apply
++
++    monkeypatch.setattr(bridge, "set_motion_timeout_ms", setter("timeout"))
++    monkeypatch.setattr(bridge, "set_stall_blanking_ms", setter("blank"))
++    monkeypatch.setattr(bridge, "set_overcurrent_duration_ms", setter("overms"))
++    monkeypatch.setattr(bridge, "set_current_threshold_adc", setter("threshold"))
++    status = F446Status(
++        connected=True,
++        state=F446State.IDLE,
++        duty=0,
++        timeout_ms=5000,
++        blanking_ms=100,
++        overcurrent_ms=50,
++        threshold_adc=1800,
++    )
++    await bridge._synchronize_configured_parameters(status)
++    assert calls == [
++        ("timeout", 15000),
++        ("blank", 500),
++        ("overms", 180),
++        ("threshold", 900),
++    ]
++
++
++@pytest.mark.asyncio
++async def test_fake_connect_applies_persistent_timing(app_config: AppConfig) -> None:
++    fake = FakeF446(app_config.f446)
++    await fake.connect()
++    status = fake.get_status()
++    assert status.timeout_ms == 15000
++    assert status.blanking_ms == 500
++    assert status.overcurrent_ms == 180
++
++
++@pytest.mark.asyncio
++async def test_poll_holds_transaction_lock_until_status_response(
++    app_config: AppConfig,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    config = replace(app_config.f446, status_poll_hz=1000.0)
++    bridge = TextF446Bridge(config)
++    bridge._connected = True
++    poll_entered = asyncio.Event()
++    release_response = asyncio.Event()
++    contender_acquired = asyncio.Event()
++
++    async def request_status() -> F446Status:
++        poll_entered.set()
++        await release_response.wait()
++        return F446Status(connected=True, state=F446State.IDLE)
++
++    async def contender() -> None:
++        async with bridge._transaction_lock:
++            bridge._connected = False
++            contender_acquired.set()
++
++    monkeypatch.setattr(bridge, "request_status", request_status)
++    poll_task = asyncio.create_task(bridge._poll_loop())
++    await asyncio.wait_for(poll_entered.wait(), timeout=0.2)
++    contender_task = asyncio.create_task(contender())
++    await asyncio.sleep(0)
++
++    assert bridge._transaction_lock.locked()
++    assert not contender_acquired.is_set()
++
++    release_response.set()
++    await asyncio.wait_for(contender_acquired.wait(), timeout=0.2)
++    await contender_task
++    await poll_task
++
++
+ @pytest.mark.asyncio
+ async def test_real_text_bridge_retries_only_initial_status(
+     app_config: AppConfig,
+diff --git a/tests/unit/test_go2_joint_lock.py b/tests/unit/test_go2_joint_lock.py
+index 3b22f36..3881632 100644
+--- a/tests/unit/test_go2_joint_lock.py
++++ b/tests/unit/test_go2_joint_lock.py
+@@ -8,8 +8,10 @@ import pytest
+ from aerogo2.bridges.go2_sdk_bridge import UnitreeGo2Bridge
+ from aerogo2.common.clock import ManualClock
+ from aerogo2.common.config import AppConfig
+-from aerogo2.common.enums import Configuration, SafetySeverity, SystemState
++from aerogo2.common.enums import Configuration, RuntimeMode, SafetySeverity, SystemState
+ from aerogo2.common.models import SystemSnapshot
++from aerogo2.landing.safe_descent_controller import SafeDescentController
++from aerogo2.manager.system_manager import SystemManager
+ from aerogo2.safety.safety_monitor import SafetyMonitor
+ from aerogo2.simulation.world import SimulationWorld
+ 
+@@ -50,7 +52,7 @@ def test_go2_mode_six_is_authoritative_joint_lock(
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_flight_pose_disables_unitree_joystick_then_confirms_lock(
++async def test_unlocked_flight_pose_waits_for_operator_then_disables_joystick(
+     app_config: AppConfig,
+     clock: ManualClock,
+ ) -> None:
+@@ -78,12 +80,17 @@ async def test_flight_pose_disables_unitree_joystick_then_confirms_lock(
+     bridge._client = Client()
+     bridge._connected = True
+ 
++    assert not await bridge.request_flight_pose()
++    assert not bridge.get_status().joints_locked
++    assert calls == ["StopMove"]
++
++    bridge._on_state(_joint_lock_message())
+     assert await bridge.request_flight_pose()
+     assert bridge.get_status().joints_locked
+-    assert calls == ["StopMove", ("SwitchJoystick", False), "StandUp"]
++    assert calls == ["StopMove", ("SwitchJoystick", False)]
+ 
+     assert await bridge.request_stop()
+-    assert calls == ["StopMove", ("SwitchJoystick", False), "StandUp"]
++    assert calls == ["StopMove", ("SwitchJoystick", False)]
+ 
+     assert await bridge.request_stand()
+     assert calls[-2:] == [("SwitchJoystick", True), "BalanceStand"]
+@@ -216,11 +223,140 @@ async def test_landing_balance_keeps_original_remote_disabled_then_relocks(
+     assert not status.joints_locked
+ 
+     calls.clear()
++    assert not await bridge.request_flight_pose()
++    assert calls == ["StopMove"]
++    assert not bridge.get_status().joints_locked
++
++    bridge._on_state(_joint_lock_message())
+     assert await bridge.request_flight_pose()
+-    assert calls == ["StopMove", "StandUp"]
++    assert calls == ["StopMove"]
+     assert bridge.get_status().joints_locked
+ 
+ 
++def _hardware_manager(world: SimulationWorld) -> SystemManager:
++    config = replace(
++        world.config,
++        system=replace(
++            world.config.system,
++            dry_run=False,
++            hardware_write_enabled=True,
++        ),
++    )
++    manager = SystemManager(
++        config=config,
++        pixhawk=world.pixhawk,
++        f446=world.f446,
++        go2=world.go2,
++        landing_controller=SafeDescentController(config),
++        clock=world.clock,
++        runtime_mode=RuntimeMode.HARDWARE,
++    )
++    return manager
++
++
++@pytest.mark.asyncio
++async def test_hardware_transform_waits_for_phone_mode_six_without_false_fault(
++    app_config: AppConfig,
++) -> None:
++    world = SimulationWorld(app_config)
++    manager = _hardware_manager(world)
++    try:
++        assert (await manager.start()).ok
++        world._feed_rc(debounce=True)
++        assert (await manager.connect_all()).ok
++        world._set_switches(morphology=1900, autoland=1000, flight_enable=1000)
++        manager.accept_rc_status(
++            world.rc_monitor.update(
++                world._channels,
++                connected=True,
++                failsafe=False,
++                timestamp=world.clock.monotonic(),
++            )
++        )
++        world.clock.advance(
++            max(
++                app_config.safety.stationary_confirm_s,
++                app_config.f446.current_clear_hold_s,
++            )
++            + 0.01
++        )
++        world._heartbeat_all()
++        manager.accept_rc_status(world.rc_monitor.update(world._channels, connected=True, failsafe=False, timestamp=world.clock.monotonic()))
++        await manager.refresh_snapshot()
++
++        result = await manager.request_transform_flight(operator_confirmed=True)
++
++        assert result.ok
++        assert result.code == "GO2_JOINT_LOCK_OPERATOR_REQUIRED"
++        assert manager.state is SystemState.GO2_JOINT_LOCK_WAIT
++        assert manager.snapshot.configuration is Configuration.FLIGHT
++        assert manager.snapshot.f446.duty == 0
++
++        world.go2.inject_status(
++            locomotion_mode="BALANCE_STAND",
++            body_velocity=(-0.005, -0.001, -0.021),
++            stable=False,
++            controller_active=True,
++            joints_locked=False,
++        )
++        await manager.tick()
++        assert manager.state is SystemState.GO2_JOINT_LOCK_WAIT
++        assert all(item.code != "GO2_MOVING_DURING_TRANSFORM" for item in manager.violations)
++
++        world.go2.inject_status(
++            locomotion_mode="JOINT_LOCK",
++            body_velocity=(0.0, 0.0, 0.0),
++            stable=True,
++            standing=True,
++            controller_active=False,
++            joints_locked=True,
++        )
++        await manager.tick()
++
++        assert manager.state is SystemState.FLIGHT_READY
++        assert manager.snapshot.go2.joints_locked
++    finally:
++        await manager.shutdown()
++
++
++def test_joint_lock_wait_rejects_locomotion_but_allows_small_posture_motion(
++    app_config: AppConfig,
++    safe_walk_snapshot: SystemSnapshot,
++) -> None:
++    base = replace(
++        safe_walk_snapshot,
++        state=SystemState.GO2_JOINT_LOCK_WAIT,
++        configuration=Configuration.FLIGHT,
++        f446=replace(
++            safe_walk_snapshot.f446,
++            state=app_config.f446.expected_flight_state,
++            duty=0,
++        ),
++        go2=replace(
++            safe_walk_snapshot.go2,
++            locomotion_mode="BALANCE_STAND",
++            body_velocity=(0.005, 0.001, 0.021),
++            velocity_mps=0.0051,
++            stable=False,
++            moving=True,
++            controller_active=True,
++            joints_locked=False,
++        ),
++    )
++    monitor = SafetyMonitor(app_config)
++
++    safe_codes = {item.code for item in monitor.evaluate(base)}
++    assert "GO2_MOVING_DURING_TRANSFORM" not in safe_codes
++    assert "GO2_UNSAFE_DURING_JOINT_LOCK" not in safe_codes
++
++    locomotion = replace(
++        base,
++        go2=replace(base.go2, locomotion_mode="LOCOMOTION"),
++    )
++    unsafe_codes = {item.code for item in monitor.evaluate(locomotion)}
++    assert "GO2_UNSAFE_DURING_JOINT_LOCK" in unsafe_codes
++
++
+ def test_invalid_foot_force_shape_fails_closed(
+     app_config: AppConfig,
+     clock: ManualClock,
+diff --git a/docs/F446_CALIBRATION_ZH.md b/docs/F446_CALIBRATION_ZH.md
+new file mode 100644
+index 0000000..0a97f9f
+--- /dev/null
++++ b/docs/F446_CALIBRATION_ZH.md
+@@ -0,0 +1,185 @@
++# F446 变形电机与 HW-039 堵转阈值标定
++
++本指南适用于 AeroGo2 0.3.9。所有终端命令均为单行。`ms` 只停止 F446 变形电机；`s`/`stop` 仍是全系统受控停止。
++
++## 1. 安全准备
++
++必须物理拆下四个旋翼、确保 Pixhawk 为 DISARMED，并把机体可靠支撑。若维护预检要求四个 ESC 遥测在线，只能在拆桨后给 X8/ESC 上电，并确认四路 RPM 都为 0；否则保持 X8 动力断电。变形连杆、插销和电机附近不得有人手或工具。准备好随时输入 `ms`，不要一开始就使用 500 占空比。
++
++检查版本：
++
++```bash
++/opt/aerogo2/venv/bin/python -c "import aerogo2; print(aerogo2.__version__)"
++```
++首次进入 shell 前，先把主机与 F446 本地的总超时统一为 15 秒并把正式 WALK 占空比设为 300。此时 threshold 保持 0，表示暂不覆盖板上尚未标定的值：
++
++```bash
++sudo /opt/aerogo2/venv/bin/aerogo2-configure-f446 --config /etc/aerogo2/hardware.yaml --walk-duty 300 --flight-duty 120 --transform-timeout-s 15 --firmware-timeout-ms 15000 --threshold-adc 0 --blanking-ms 500 --overcurrent-ms 180
++```
++
++如果该命令未成功结束，不要进入电机测试；先根据它的 `Configuration not changed` 错误修复配置文件。
++
++
++启动写入模式 shell：
++
++```bash
++set -a; source /etc/aerogo2/aerogo2.env; set +a; MAVLINK20=1 /opt/aerogo2/venv/bin/aerogo2 shell --hardware --config /etc/aerogo2/hardware.yaml --confirm-hardware I_UNDERSTAND_HARDWARE_RISK
++```
++
++连接设备并进入维护模式：
++
++```text
++connect all
++```
++
++```text
++motor maintenance enter
++```
++
++按提示完成两阶段确认。若暂时不接 X8，只有在当前预检明确允许时才继续，不能绕过安全检查。
++
++## 2. 先验证方向与最低可动占空比
++
++查看当前参数：
++
++```text
++motor parameters
++```
++
++从小占空比开始正向点动：
++
++```text
++motor mf 80
++```
++
++立即只停变形电机：
++
++```text
++ms
++```
++
++从小占空比开始反向点动：
++
++```text
++motor mr 80
++```
++
++立即只停变形电机：
++
++```text
++ms
++```
++
++每次只增加 20 到 30，找到能稳定启动但冲击最小的值。确认 `mr` 确实朝 WALK/收缩方向、`mf` 朝 FLIGHT/展开方向。任何方向相反都应停止，不要通过软件名称强行继续。
++
++## 3. 记录 HW-039 电流并选择 threshold
++
++在静止、正常移动和机械端点分别多次执行：
++
++```text
++motor current
++```
++运动命令返回后，可连续输入 `motor current` 取得运动中的近实时样本；每次短测结束立即输入 `ms`。到机械端点只允许短时取样，不能为了读数持续堵转。
++
++
++记录 `R_IS`、`L_IS` 和 `used` 的 ADC 原始值。建议至少取得：静止噪声最大值、正常运动峰值、端点堵转的最低重复值。
++
++阈值必须高于“正常运动峰值 + 噪声余量”，并低于“端点堵转最低重复值”。本项目默认主机安全范围是 201 到 1400 ADC；不能复制别人的数值。若正常峰值与堵转值没有可靠间隔，应先检查 HW-039 接线、采样方向、驱动器和机械阻力，不能靠提高上限掩盖问题。
++
++设置并读回候选阈值（示例 900 仅表示命令格式）：
++
++```text
++motor threshold 900
++```
++
++查看读回值：
++
++```text
++motor parameters
++```
++
++## 4. 调整 blank、overms 和 timeout
++
++`blank` 是启动后忽略浪涌电流的时间，默认 500 ms；`overms` 是电流连续超过 threshold 才判定到位的时间，默认 180 ms；`timeout` 是 F446 本地最长运动时间，默认 15000 ms。
++
++设置并读回本地超时：
++
++```text
++motor timeout 15000
++```
++
++设置并读回启动屏蔽时间：
++
++```text
++motor blank 500
++```
++
++设置并读回持续过流时间：
++
++```text
++motor overms 180
++```
++
++约束为 `blank + overms < timeout`。blank 太短会把启动浪涌误判为端点；blank 太长会延迟真正堵转保护。overms 太短会受尖峰触发，太长会增加端点受力时间。每次只改一个参数并重新测试。
++
++## 5. 验证自动限位
++
++进入手动维护后，先由操作员明确标记当前位置是哪个端点。标记本身不要求本次会话发生过运动，也不会离开 `MANUAL_POSITIONING`：
++
++```text
++motor endpoint walk
++MARK_CURRENT_ENDPOINT_WALK
++```
++
++或者：
++
++```text
++motor endpoint flight
++MARK_CURRENT_ENDPOINT_FLIGHT
++```
++
++标记完成后，再分别执行 `motor confirm walk` 或 `motor confirm flight` 进入 `WALK` 或 `FLIGHT_READY`。如果没有先标记匹配的端点，确认命令会被拒绝。F446 必须已经停止，且状态为 `IDLE` 或匹配的 `LIMIT_REACHED_FWD/REV`；若 F446 明确报告相反端点、仍在运动或处于故障，标记和确认仍会被拒绝。
++
++把机构放在离端点有安全距离的位置，先验证反向自动限位：
++
++```text
++motor limr 300
++```
++
++正常结果必须是 `LIMIT_REACHED_REV` 且 `duty=0`。如果机构不动、方向错误、电流异常或接近端点仍不停，立即输入：
++
++```text
++ms
++```
++
++再以已验证的较低占空比测试正向：
++
++```text
++motor limf 120
++```
++
++正常结果必须是 `LIMIT_REACHED_FWD` 且 `duty=0`。同一组参数至少重复三次，确认没有正常运动误停，也没有端点不停。
++
++## 6. 持久化参数
++
++退出 shell 后，把已验证数值写入 `/etc/aerogo2/hardware.yaml`。下面的 900 必须替换为你的实测阈值：
++
++```bash
++sudo /opt/aerogo2/venv/bin/aerogo2-configure-f446 --config /etc/aerogo2/hardware.yaml --walk-duty 300 --flight-duty 120 --transform-timeout-s 15 --firmware-timeout-ms 15000 --threshold-adc 900 --blanking-ms 500 --overcurrent-ms 180
++```
++
++工具会先验证完整配置、生成 `/etc/aerogo2/hardware.yaml.bak`，然后原子替换。非零 `threshold-adc` 会在每次写入模式连接 F446 时自动重设；设为 0 则保留板上的阈值。
++
++重新启动 shell 后确认：
++
++```text
++motor parameters
++```
++
++最后执行正式 WALK 回零：
++
++```text
++transform home-walk
++```
++
++只有收到 `F446_CONFIGURATION_VERIFIED`、状态为 `LIMIT_REACHED_REV` 且 `duty=0`，才可人工确认后进入下一状态。15 秒内未到位会停止并拒绝状态切换，不能通过 `clear-fault` 把未知机械位置当作已到位。
+diff --git a/docs/RELEASE_0.3.9_ZH.md b/docs/RELEASE_0.3.9_ZH.md
+new file mode 100644
+index 0000000..2df79f0
+--- /dev/null
++++ b/docs/RELEASE_0.3.9_ZH.md
+@@ -0,0 +1,95 @@
++# AeroGo2 0.3.9：手机人工锁关节状态机
++
++## 修改结果
++
++0.3.9 不再把 Unitree `StandUp()` 当作 mode=6 `JOINT_LOCK`。F446 到达并验证 FLIGHT 端点、`duty=0` 后，状态机进入：
++
++```text
++TRANSFORM_TO_FLIGHT -> GO2_JOINT_LOCK_WAIT -> FLIGHT_READY
++```
++
++在 `GO2_JOINT_LOCK_WAIT` 中，由操作者在 Unitree 手机端选择“锁关节/Joint Lock”。AeroGo2 收到权威 `SportModeState.mode=6` 后才调用 `SwitchJoystick(false)`，再次确认 mode=6，然后自动进入 `FLIGHT_READY`。
++
++模式 1 切到模式 6 时，允许小于 `safety.stationary_velocity_mps`（默认 0.05 m/s）的短暂姿态调整，即使此时上报 `stable=false`、`moving=true` 或 `controller_active=true`，也不会再仅因此误触发 `FAULT`。以下情况仍会立即 fail-closed：进入 `LOCOMOTION`、任一速度分量达到阈值、Pixhawk/RC failsafe、Pixhawk Arm、CH5 非 LOW、ESC 遥测不完整或 RPM 非零、F446 异常、Go2 数据过期。
++
++## 安装
++
++把 `aerogo2-0.3.9-py3-none-any.whl` 复制到 Go2 Ubuntu 的 `~/aerogo2/` 后执行：
++
++```bash
++sudo /opt/aerogo2/venv/bin/pip install --no-deps --force-reinstall ~/aerogo2/aerogo2-0.3.9-py3-none-any.whl
++```
++
++确认实际加载的版本：
++
++```bash
++/opt/aerogo2/venv/bin/python -c "import aerogo2; print(aerogo2.__version__, aerogo2.__file__)"
++```
++
++本次改动只更新 Go2 Ubuntu 上的 AeroGo2 Python 包，不需要把新文件烧录到 Pixhawk。原先用于“两把钥匙 Arm”的 `/APM/scripts/aerogo2_arm_gate.lua` 仍必须保留；0.3.9 没有修改该 Lua 文件。
++
++## WALK 到 FLIGHT 的真机步骤
++
++以可写真机模式启动 Shell：
++
++```bash
++set -a; source /etc/aerogo2/aerogo2.env; set +a; MAVLINK20=1 /opt/aerogo2/venv/bin/aerogo2 shell --hardware --enable-hardware-write --config /etc/aerogo2/hardware.yaml --confirm-hardware I_UNDERSTAND_HARDWARE_RISK
++```
++
++每条命令分别输入：
++
++```text
++connect all
++preflight transform-flight
++transform flight
++TRANSFORM_TO_FLIGHT
++```
++
++F446 到位后，Shell 应显示 `GO2_JOINT_LOCK_OPERATOR_REQUIRED`，提示符状态应为 `GO2_JOINT_LOCK_WAIT`。这时：
++
++1. 不要让 Go2 行走，不要 Arm Pixhawk。
++2. 在 Unitree 手机端选择“锁关节/Joint Lock”（mode=6）。
++3. 可随时输入单行命令 `transform status`，检查 `go2_mode`、`go2_joints_locked` 和 `joint_lock_operator_remaining_s`。
++4. 检测到 mode=6 后，后台监控会自动切到 `FLIGHT_READY`，不需要再输入确认命令。
++
++只有提示符已显示 `FLIGHT_READY` 后，才执行：
++
++```text
++preflight flight
++flight authorize
++```
++
++随后必须在授权有效期内由 RadioMaster 把 CH5 从 LOW 切到 HIGH，由 Pixhawk 完成正常 PreArm/Arm；AeroGo2 Shell 不直接 Arm。
++
++## 手动确认 FLIGHT 端点
++
++若使用人工 F446 定位流程，停止并确认端点后也会进入同一个等待态：
++
++```text
++ms
++motor endpoint flight
++MARK_CURRENT_ENDPOINT_FLIGHT
++motor confirm flight
++CONFIRM_MANUAL_FLIGHT
++```
++
++最后一条确认成功后，不会直接跳到 `FLIGHT_READY`；应在手机端选择 mode=6，等待状态机自动完成。
++
++## 等待时间配置
++
++默认人工等待时间为 60 秒。`/etc/aerogo2/hardware.yaml` 没有该字段时仍自动使用 60 秒。需要调整时可在 `go2:` 段增加：
++
++```yaml
++go2:
++  joint_lock_operator_timeout_s: 60.0
++```
++
++修改配置后必须重启 Shell。超时会进入 `FAULT`，但此时 F446 已经停止且 X8 必须保持 0 RPM。
++
++## 落地适应后的重锁
++
++若启用了 `LANDING_COMPLIANT`，第一次执行 `transform walk` 只会退出适应姿态并进入 `GO2_JOINT_LOCK_WAIT`。手机端选择 mode=6，等系统回到 `FLIGHT_READY` 后，再次执行 `transform walk` 才会启动向 WALK 端点的 F446 动作。
++
++## 验证
++
++发布前验证结果：完整 pytest、Ruff 与 mypy 均通过。真机仍须在拆桨、Pixhawk Disarm、机体固定、急停可用的条件下逐步验证状态反馈；自动测试不能代替实际 mode=1→6 的现场确认。
+diff --git a/src/aerogo2/tools/configure_f446.py b/src/aerogo2/tools/configure_f446.py
+new file mode 100644
+index 0000000..45288fc
+--- /dev/null
++++ b/src/aerogo2/tools/configure_f446.py
+@@ -0,0 +1,144 @@
++"""Atomic configuration tool for calibrated F446 motion parameters."""
++
++from __future__ import annotations
++
++import argparse
++import os
++import shutil
++import sys
++from pathlib import Path
++from typing import Any, Dict, Mapping, Optional, Sequence
++
++import yaml
++
++from aerogo2.common.config import AppConfig, load_config
++from aerogo2.common.exceptions import AeroGo2Error
++
++
++def configure_f446(
++    config_path: Path,
++    *,
++    walk_duty: Optional[int] = None,
++    flight_duty: Optional[int] = None,
++    transform_timeout_s: Optional[float] = None,
++    firmware_timeout_ms: Optional[int] = None,
++    threshold_adc: Optional[int] = None,
++    blanking_ms: Optional[int] = None,
++    overcurrent_ms: Optional[int] = None,
++) -> tuple[Path, AppConfig]:
++    """Validate and atomically replace an F446 configuration overlay."""
++
++    changes = {
++        "walk_duty": walk_duty,
++        "flight_duty": flight_duty,
++        "transform_timeout_s": transform_timeout_s,
++        "firmware_timeout_ms": firmware_timeout_ms,
++        "automatic_stall_threshold_adc": threshold_adc,
++        "stall_blanking_ms": blanking_ms,
++        "stall_overcurrent_ms": overcurrent_ms,
++    }
++    if all(item is None for item in changes.values()):
++        raise ValueError("At least one F446 parameter must be supplied")
++    for label, duty in (("walk_duty", walk_duty), ("flight_duty", flight_duty)):
++        if duty is not None and (isinstance(duty, bool) or not 1 <= duty <= 350):
++            raise ValueError(f"{label} must be within 1..350")
++    if transform_timeout_s is not None and not 0.1 <= transform_timeout_s <= 60.0:
++        raise ValueError("transform_timeout_s must be within 0.1..60.0")
++    if firmware_timeout_ms is not None and not 100 <= firmware_timeout_ms <= 60000:
++        raise ValueError("firmware_timeout_ms must be within 100..60000")
++    if threshold_adc is not None and not 0 <= threshold_adc <= 4095:
++        raise ValueError("threshold_adc must be within 0..4095")
++    if blanking_ms is not None and not 0 <= blanking_ms <= 5000:
++        raise ValueError("blanking_ms must be within 0..5000")
++    if overcurrent_ms is not None and not 10 <= overcurrent_ms <= 3000:
++        raise ValueError("overcurrent_ms must be within 10..3000")
++
++    path = config_path.resolve()
++    if not path.is_file():
++        raise ValueError(f"Configuration file does not exist: {path}")
++    loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
++    if loaded is None:
++        document: Dict[str, Any] = {}
++    elif isinstance(loaded, Mapping):
++        document = dict(loaded)
++    else:
++        raise ValueError("Top-level hardware configuration must be a mapping")
++    existing_f446 = document.get("f446", {})
++    if not isinstance(existing_f446, Mapping):
++        raise ValueError("The f446 configuration section must be a mapping")
++    f446 = dict(existing_f446)
++    for key, item in changes.items():
++        if item is not None:
++            f446[key] = item
++    # A host timeout update normally means one total 15 s limit. Keep the
++    # local firmware timeout synchronized unless the operator supplied a
++    # distinct, shorter local value explicitly.
++    if transform_timeout_s is not None and firmware_timeout_ms is None:
++        f446["firmware_timeout_ms"] = int(round(transform_timeout_s * 1000.0))
++    document["f446"] = f446
++
++    candidate = path.parent / f".{path.name}.aerogo2-f446-candidate"
++    backup = path.parent / f"{path.name}.bak"
++    validated: Optional[AppConfig] = None
++    try:
++        candidate.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
++        validated = load_config(candidate)
++        shutil.copy2(path, backup)
++        os.replace(candidate, path)
++    finally:
++        if candidate.exists():
++            candidate.unlink()
++    assert validated is not None
++    return backup, validated
++
++
++def _parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        description="Atomically configure calibrated AeroGo2 F446 parameters",
++    )
++    parser.add_argument("--config", type=Path, required=True)
++    parser.add_argument("--walk-duty", type=int)
++    parser.add_argument("--flight-duty", type=int)
++    parser.add_argument("--transform-timeout-s", type=float)
++    parser.add_argument("--firmware-timeout-ms", type=int)
++    parser.add_argument(
++        "--threshold-adc",
++        type=int,
++        help="0 preserves the board value; nonzero is reapplied on every write-enabled connect",
++    )
++    parser.add_argument("--blanking-ms", type=int)
++    parser.add_argument("--overcurrent-ms", type=int)
++    return parser
++
++
++def main(argv: Optional[Sequence[str]] = None) -> int:
++    args = _parser().parse_args(argv)
++    try:
++        backup, config = configure_f446(
++            args.config,
++            walk_duty=args.walk_duty,
++            flight_duty=args.flight_duty,
++            transform_timeout_s=args.transform_timeout_s,
++            firmware_timeout_ms=args.firmware_timeout_ms,
++            threshold_adc=args.threshold_adc,
++            blanking_ms=args.blanking_ms,
++            overcurrent_ms=args.overcurrent_ms,
++        )
++    except (AeroGo2Error, OSError, TypeError, ValueError, yaml.YAMLError) as exc:
++        print(f"Configuration not changed: {exc}", file=sys.stderr)
++        return 2
++    f446 = config.f446
++    print(
++        "F446 configuration updated; "
++        f"walk_duty={f446.walk_duty}; flight_duty={f446.flight_duty}; "
++        f"host_timeout_s={f446.transform_timeout_s:g}; "
++        f"firmware_timeout_ms={f446.firmware_timeout_ms}; "
++        f"threshold_adc={f446.automatic_stall_threshold_adc}; "
++        f"blanking_ms={f446.stall_blanking_ms}; "
++        f"overcurrent_ms={f446.stall_overcurrent_ms}; backup={backup}"
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/unit/test_f446_config_tool.py b/tests/unit/test_f446_config_tool.py
+new file mode 100644
+index 0000000..3e19290
+--- /dev/null
++++ b/tests/unit/test_f446_config_tool.py
+@@ -0,0 +1,92 @@
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++import yaml
++
++from aerogo2.common.config import AppConfig, load_config
++from aerogo2.common.immutable import deep_thaw
++from aerogo2.tools.configure_f446 import configure_f446, main
++
++
++def _write_config(path: Path, app_config: AppConfig) -> None:
++    path.write_text(yaml.safe_dump(deep_thaw(app_config.raw), sort_keys=False), encoding="utf-8")
++
++
++def test_configure_f446_updates_and_backs_up_atomically(
++    tmp_path: Path,
++    app_config: AppConfig,
++) -> None:
++    path = tmp_path / "hardware.yaml"
++    _write_config(path, app_config)
++
++    backup, configured = configure_f446(
++        path,
++        walk_duty=300,
++        transform_timeout_s=15.0,
++        threshold_adc=900,
++        blanking_ms=450,
++        overcurrent_ms=200,
++    )
++
++    loaded = load_config(path)
++    original = load_config(backup)
++    assert configured.f446.walk_duty == loaded.f446.walk_duty == 300
++    assert loaded.f446.transform_timeout_s == 15.0
++    assert loaded.f446.firmware_timeout_ms == 15000
++    assert loaded.f446.automatic_stall_threshold_adc == 900
++    assert loaded.f446.stall_blanking_ms == 450
++    assert loaded.f446.stall_overcurrent_ms == 200
++    assert original.f446.automatic_stall_threshold_adc == 0
++
++
++def test_configure_f446_rejects_unsafe_threshold_without_touching_file(
++    tmp_path: Path,
++    app_config: AppConfig,
++) -> None:
++    path = tmp_path / "hardware.yaml"
++    _write_config(path, app_config)
++    before = path.read_bytes()
++
++    with pytest.raises(Exception, match="safety envelope"):
++        configure_f446(path, threshold_adc=1800)
++
++    assert path.read_bytes() == before
++    assert not (tmp_path / "hardware.yaml.bak").exists()
++
++
++def test_configure_f446_requires_at_least_one_change(
++    tmp_path: Path,
++    app_config: AppConfig,
++) -> None:
++    path = tmp_path / "hardware.yaml"
++    _write_config(path, app_config)
++
++    with pytest.raises(ValueError, match="At least one"):
++        configure_f446(path)
++
++
++def test_configure_f446_cli_reports_effective_values(
++    tmp_path: Path,
++    app_config: AppConfig,
++    capsys: pytest.CaptureFixture[str],
++) -> None:
++    path = tmp_path / "hardware.yaml"
++    _write_config(path, app_config)
++
++    result = main(
++        [
++            "--config",
++            str(path),
++            "--walk-duty",
++            "300",
++            "--transform-timeout-s",
++            "15",
++        ]
++    )
++
++    assert result == 0
++    output = capsys.readouterr().out
++    assert "walk_duty=300" in output
++    assert "firmware_timeout_ms=15000" in output

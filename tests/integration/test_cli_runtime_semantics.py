@@ -639,10 +639,12 @@ async def test_top_level_and_transform_stop_have_distinct_semantics(
     await dispatcher.dispatch("s", render=False)
     await dispatcher.dispatch("transform stop", render=False)
     await dispatcher.dispatch("motor stop", render=False)
+    await dispatcher.dispatch("ms", render=False)
 
     assert manager.calls == [
         ("stop_supervised", None),
         ("stop_supervised", None),
+        ("stop_transform_motion", None),
         ("stop_transform_motion", None),
         ("stop_transform_motion", None),
     ]

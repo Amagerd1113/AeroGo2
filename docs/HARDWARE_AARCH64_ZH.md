@@ -4,7 +4,7 @@
 
 本文用于 Unitree 机载 Ubuntu aarch64。实机链路包括：
 
-- Unitree SDK2：订阅 Go2 SportModeState，只调用高层 StopMove、StandUp、BalanceStand 和 SwitchJoystick；飞行锁定必须确认 mode=6 JOINT_LOCK。
+- Unitree SDK2：订阅 Go2 SportModeState，只调用高层 StopMove、BalanceStand 和 SwitchJoystick；手机端人工选择飞行锁定，且必须确认 mode=6 JOINT_LOCK。
 - F446：异步串口读取文本协议，只用受过流和超时保护的 limf、limr；到位后再次核对限位状态和 duty=0。
 - Pixhawk：读取心跳、解锁、落地、RC、姿态和 4 路 ESC 遥测。
 - SystemManager：在 WALK 与 FLIGHT_READY 之间执行有安全守卫的形态切换。
@@ -101,7 +101,7 @@ transform flight
 TRANSFORM_TO_FLIGHT
 ~~~
 
-只有当前形态是 WALK、Go2 静止保持满足、RC 新鲜、Pixhawk 未解锁、ESC 在线且 RPM=0、F446 无故障且电流裕量满足时，才发送 limf 或 limr。目标限位与 duty=0 再验证通过后才进入 FLIGHT_READY。
+只有当前形态是 WALK、Go2 静止保持满足、RC 新鲜、Pixhawk 未解锁、ESC 在线且 RPM=0、F446 无故障且电流裕量满足时，才发送 limf 或 limr。目标限位与 duty=0 验证通过后进入 `GO2_JOINT_LOCK_WAIT`。此时在 Unitree 手机端选择“锁关节/Joint Lock”；Shell 检测到 mode=6 后自动进入 `FLIGHT_READY`。可用单行命令 `transform status` 查看当前模式和剩余等待时间。
 
 FLIGHT 到 WALK：先确认落地且未解锁，CH9 稳定为 WALK_REQUEST。
 
@@ -117,7 +117,7 @@ TRANSFORM_TO_WALK
 
 仅在 WALK 且 F446 确认 WALK 限位时允许 walk stop 与 walk stand。它们使用 Unitree SportClient 高层接口，不直接下发关节电机命令。
 
-进入 FLIGHT_READY 前，系统会禁用 Unitree 原装遥控输入并调用 StandUp；只有 SportModeState 实际回报 mode=6 JOINT_LOCK 才允许继续。飞行中锁丢失会触发 GO2_JOINT_LOCK_LOST，但不会自动 Disarm。0.3.2 可在完成四脚压力校准后启用受控落地适应：首次接触仍保持 JOINT_LOCK，只有 landed、Disarm、四 X8 精确 0 RPM 且足够脚压力持续越阈值后才在原装遥控仍禁用的情况下进入 BalanceStand；变形前会重新确认 JOINT_LOCK。回到 WALK 后，执行 walk stand 才重新启用原装遥控。完整单行命令见 `RELEASE_0.3.2_ZH.md`。
+Unitree 高层接口没有可证明进入 mode=6 的公开 JointLock 方法，`StandUp` 也不等于锁关节。0.3.9 因此等待操作者在手机端选择 mode=6；检测成功后才禁用摇杆输入并进入 `FLIGHT_READY`。模式 1→6 的小幅姿态调整不会再误触发变形运动故障；真正进入行走模式、速度越界或超时仍会 fail-closed。飞行中锁丢失会触发 `GO2_JOINT_LOCK_LOST`，但不会自动 Disarm。
 
 主状态机没有直接 arm/disarm API；`flight authorize` 只在完整互锁通过后开启 30 秒一次性许可，随后必须由 RadioMaster CH5 LOW->HIGH 触发 Pixhawk Lua 的普通受检 Arm。Lua 阻断 MAVLink Arm/force-arm 绕过，但保留正常 Disarm。完整条件见 `STATE_TRANSITIONS_ZH.md`。
 

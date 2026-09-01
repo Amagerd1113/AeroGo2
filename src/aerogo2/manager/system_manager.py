@@ -91,6 +91,10 @@ class SystemManager:
         )
         self._state_machine.set_entry_action(SystemState.WALK, self._leave_manual_positioning)
         self._state_machine.set_entry_action(
+            SystemState.GO2_JOINT_LOCK_WAIT,
+            self._enter_go2_joint_lock_wait,
+        )
+        self._state_machine.set_entry_action(
             SystemState.FLIGHT_READY,
             self._leave_manual_positioning,
         )
@@ -126,9 +130,11 @@ class SystemManager:
         self._maintenance_mode = False
         self._suppress_fault_entry_stop = False
         self._operator_confirmed_configuration: Optional[Configuration] = None
+        self._manual_marked_configuration: Optional[Configuration] = None
         self._manual_motion_deadline: Optional[float] = None
         self._manual_last_direction: Optional[str] = None
         self._manual_motion_started = False
+        self._go2_joint_lock_deadline: Optional[float] = None
         self._started = False
 
     @property
@@ -318,6 +324,7 @@ class SystemManager:
         configuration: Configuration
         if not f446.connected:
             self._operator_confirmed_configuration = None
+            self._manual_marked_configuration = None
         if firmware_configuration is not Configuration.UNKNOWN:
             configuration = firmware_configuration
             configuration_source = "f446_limit"
@@ -806,6 +813,7 @@ class SystemManager:
         if not stop_result.ok:
             return stop_result
         self._operator_confirmed_configuration = None
+        self._manual_marked_configuration = None
         self._manual_motion_started = False
         self._manual_last_direction = None
         self._manual_motion_deadline = None
@@ -898,6 +906,7 @@ class SystemManager:
             return result
 
         self._operator_confirmed_configuration = None
+        self._manual_marked_configuration = None
         self._manual_motion_started = True
         self._manual_last_direction = "forward" if normalized.endswith("f") else "reverse"
         self._manual_motion_deadline = (
@@ -915,7 +924,7 @@ class SystemManager:
             {
                 "host_timeout_s": self.config.f446.transform_timeout_s,
                 "current_reporting": "R_IS/L_IS/used raw ADC and mV",
-                "next": "stop, then confirm walk or confirm flight",
+                "next": "ms, then confirm walk or confirm flight",
             }
         )
         return OperationResult.success(result.message, data=data, code=result.code)
@@ -980,12 +989,140 @@ class SystemManager:
             )
         return result
 
+    async def set_f446_timing_parameter(
+        self,
+        parameter: str,
+        value: int,
+    ) -> OperationResult:
+        """Update one stopped F446 timing parameter and verify its readback."""
+
+        normalized = parameter.strip().lower()
+        if normalized not in {"timeout", "blank", "overms"}:
+            return OperationResult.failure(
+                "F446_INVALID_TIMING_PARAMETER",
+                f"Unsupported F446 timing parameter '{parameter}'",
+            )
+        if not self._control_writes_allowed():
+            return OperationResult.failure(
+                "F446_HARDWARE_WRITE_DISABLED",
+                "F446 parameter writes are locked in this process",
+            )
+        await self.refresh_snapshot()
+        guard = TransitionGuards(self.config).manual_motion_guard(self._snapshot)
+        if not guard.permitted:
+            return OperationResult.failure(
+                guard.codes[0],
+                "; ".join(
+                    f"{code}: {message}" for code, message in zip(guard.codes, guard.messages)
+                ),
+            )
+        if self._snapshot.f446.duty != 0:
+            return OperationResult.failure(
+                "F446_PARAMETER_WRITE_WHILE_MOVING",
+                f"Run ms before changing {normalized}",
+            )
+
+        ranges = {
+            "timeout": (100, min(60000, int(round(self.config.f446.transform_timeout_s * 1000.0)))),
+            "blank": (0, 5000),
+            "overms": (10, 3000),
+        }
+        minimum, maximum = ranges[normalized]
+        if isinstance(value, bool) or not minimum <= value <= maximum:
+            return OperationResult.failure(
+                "F446_TIMING_OUTSIDE_HOST_SAFETY_ENVELOPE",
+                f"{normalized} must be {minimum}..{maximum}ms",
+            )
+
+        current_timeout = self._snapshot.f446.timeout_ms or self.config.f446.firmware_timeout_ms
+        current_blank = self._snapshot.f446.blanking_ms
+        current_overms = self._snapshot.f446.overcurrent_ms
+        candidate_timeout = value if normalized == "timeout" else current_timeout
+        candidate_blank = value if normalized == "blank" else current_blank
+        candidate_overms = value if normalized == "overms" else current_overms
+        if candidate_blank + candidate_overms >= candidate_timeout:
+            return OperationResult.failure(
+                "F446_TIMING_COMBINATION_UNSAFE",
+                "blank + overms must remain less than timeout",
+            )
+
+        setter_by_parameter = {
+            "timeout": self._f446.set_motion_timeout_ms,
+            "blank": self._f446.set_stall_blanking_ms,
+            "overms": self._f446.set_overcurrent_duration_ms,
+        }
+        try:
+            result = await setter_by_parameter[normalized](value)
+        except (BridgeError, asyncio.TimeoutError, OSError, RuntimeError, ValueError) as exc:
+            return OperationResult.failure("F446_TIMING_WRITE_FAILED", str(exc))
+        await self.refresh_snapshot()
+        if result.ok:
+            self._emit(
+                "F446_TIMING_UPDATED",
+                parameter=normalized,
+                value_ms=value,
+                timeout_ms=self._snapshot.f446.timeout_ms,
+                blanking_ms=self._snapshot.f446.blanking_ms,
+                overcurrent_ms=self._snapshot.f446.overcurrent_ms,
+            )
+        return result
+
+    async def mark_manual_configuration(
+        self,
+        target: Configuration,
+        operator_confirmed: bool = False,
+    ) -> OperationResult:
+        """Record the operator's endpoint choice without leaving manual positioning."""
+
+        if target not in {Configuration.WALK, Configuration.FLIGHT}:
+            return OperationResult.failure(
+                "INVALID_CONFIGURATION",
+                "Manual endpoint target must be WALK or FLIGHT",
+            )
+        if not operator_confirmed:
+            return OperationResult.failure(
+                "CONFIRMATION_REQUIRED",
+                f"Exact confirmation MARK_CURRENT_ENDPOINT_{target.value} is required",
+            )
+        if self.state is not SystemState.MANUAL_POSITIONING:
+            return OperationResult.failure(
+                "INVALID_STATE",
+                "Manual endpoint marking requires MANUAL_POSITIONING",
+            )
+
+        validation = await self._validate_manual_configuration_target(target)
+        if not validation.ok:
+            return validation
+
+        self._manual_marked_configuration = target
+        self._operator_confirmed_configuration = target
+        await self.refresh_snapshot()
+        self._emit(
+            "F446_MANUAL_ENDPOINT_MARKED",
+            configuration=target.value,
+            source=self._snapshot.configuration_source,
+        )
+        return OperationResult.success(
+            (
+                f"Current stopped position marked as {target.value}; "
+                "system remains MANUAL_POSITIONING"
+            ),
+            code="F446_MANUAL_ENDPOINT_MARKED",
+            data={
+                "marked_endpoint": target.value,
+                "configuration": self._snapshot.configuration.value,
+                "configuration_source": self._snapshot.configuration_source,
+                "state": self.state.name,
+                "next": f"motor confirm {target.value.lower()}",
+            },
+        )
+
     async def confirm_manual_configuration(
         self,
         target: Configuration,
         operator_confirmed: bool = False,
     ) -> OperationResult:
-        """Accept a stopped manual position only after explicit operator confirmation."""
+        """Enter the state matching an independently operator-marked endpoint."""
 
         if target not in {Configuration.WALK, Configuration.FLIGHT}:
             return OperationResult.failure(
@@ -1002,20 +1139,91 @@ class SystemManager:
                 "INVALID_STATE",
                 "Manual configuration confirmation requires MANUAL_POSITIONING",
             )
+        if self._manual_marked_configuration is not target:
+            marked = (
+                "NONE"
+                if self._manual_marked_configuration is None
+                else self._manual_marked_configuration.value
+            )
+            return OperationResult.failure(
+                "F446_ENDPOINT_NOT_MARKED",
+                (
+                    f"Run motor endpoint {target.value.lower()} first; "
+                    f"current operator mark is {marked}"
+                ),
+                data={"marked_endpoint": marked, "requested_endpoint": target.value},
+            )
+
+        validation = await self._validate_manual_configuration_target(target)
+        if not validation.ok:
+            return validation
+
+        self._operator_confirmed_configuration = target
+        await self.refresh_snapshot()
+        target_state = (
+            SystemState.WALK
+            if target is Configuration.WALK
+            else SystemState.GO2_JOINT_LOCK_WAIT
+        )
+        try:
+            await self._state_machine.transition_to(
+                target_state,
+                reason=f"operator confirmed marked endpoint as {target.value}",
+                snapshot=self._snapshot,
+            )
+        except (AeroGo2Error, OSError, RuntimeError, ValueError) as exc:
+            self._operator_confirmed_configuration = None
+            await self.refresh_snapshot()
+            return OperationResult.failure("F446_MANUAL_CONFIRM_REJECTED", str(exc))
+
+        self._emit(
+            "F446_MANUAL_CONFIGURATION_CONFIRMED",
+            configuration=target.value,
+            source=self._snapshot.configuration_source,
+        )
+        if target is Configuration.FLIGHT:
+            if self._runtime_mode is RuntimeMode.DRY_RUN:
+                return await self._advance_go2_joint_lock_wait(simulate_operator=True)
+            await self.refresh_snapshot()
+            return self._joint_lock_operator_required_result()
+
+        await self.refresh_snapshot()
+        return OperationResult.success(
+            f"Operator-confirmed {target.value}; system entered {target_state.name}",
+            code="F446_MANUAL_CONFIGURATION_CONFIRMED",
+            data={
+                "configuration": target.value,
+                "configuration_source": self._snapshot.configuration_source,
+                "state": target_state.name,
+            },
+        )
+
+    async def _validate_manual_configuration_target(
+        self,
+        target: Configuration,
+    ) -> OperationResult:
+        """Validate a stopped endpoint before marking it or entering its state."""
 
         await self.refresh_snapshot()
         if self._snapshot.f446.duty != 0:
             return OperationResult.failure(
                 "F446_STILL_MOVING",
-                "Run stop and verify duty=0 before confirming the physical position",
-            )
-        if not self._manual_motion_started:
-            return OperationResult.failure(
-                "F446_MANUAL_MOTION_REQUIRED",
-                "No movement has been started in this manual positioning session",
+                "Run ms and verify duty=0 before marking the physical position",
             )
         required_direction = self.config.f446.direction_for(target.value)
-        if self._manual_last_direction != required_direction:
+        expected_state = self.config.f446.expected_state_for(target.value)
+        opposite_target = (
+            Configuration.FLIGHT.value
+            if target is Configuration.WALK
+            else Configuration.WALK.value
+        )
+        opposite = self.config.f446.expected_state_for(opposite_target)
+        if self._snapshot.f446.state is opposite:
+            return OperationResult.failure(
+                "F446_LIMIT_TARGET_MISMATCH",
+                f"F446 reports {opposite.value}; it cannot be marked as {target.value}",
+            )
+        if self._manual_motion_started and self._manual_last_direction != required_direction:
             return OperationResult.failure(
                 "F446_DIRECTION_TARGET_MISMATCH",
                 (
@@ -1023,20 +1231,11 @@ class SystemManager:
                     f"observed {self._manual_last_direction}"
                 ),
             )
-        expected_state = self.config.f446.expected_state_for(target.value)
-        opposite = self.config.f446.expected_state_for(
-            Configuration.FLIGHT.value if target is Configuration.WALK else Configuration.WALK.value
-        )
-        if self._snapshot.f446.state is opposite:
-            return OperationResult.failure(
-                "F446_LIMIT_TARGET_MISMATCH",
-                (f"F446 reports {opposite.value}; it cannot be confirmed as {target.value}"),
-            )
         if self._snapshot.f446.state not in {F446State.IDLE, expected_state}:
             return OperationResult.failure(
                 "F446_FINAL_STATE_INVALID",
                 (
-                    "Manual confirmation requires IDLE or the matching limit state; "
+                    "Manual endpoint marking requires IDLE or the matching limit state; "
                     f"received {self._snapshot.f446.state.value}"
                 ),
             )
@@ -1055,51 +1254,7 @@ class SystemManager:
         current_clear = self._current_clear_dwell_result()
         if not current_clear.ok:
             return current_clear
-
-        if target is Configuration.FLIGHT:
-            try:
-                if not await self._go2.request_flight_pose():
-                    raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected the request")
-            except (BridgeError, OSError, RuntimeError) as exc:
-                return OperationResult.failure("GO2_JOINT_LOCK_FAILED", str(exc))
-            await self.refresh_snapshot()
-            if not self._snapshot.go2.joints_locked:
-                return OperationResult.failure(
-                    "GO2_JOINT_LOCK_UNCONFIRMED",
-                    "Go2 did not authoritatively report mode=6 JOINT_LOCK",
-                )
-
-        self._operator_confirmed_configuration = target
-        await self.refresh_snapshot()
-        target_state = (
-            SystemState.WALK if target is Configuration.WALK else SystemState.FLIGHT_READY
-        )
-        try:
-            await self._state_machine.transition_to(
-                target_state,
-                reason=f"operator confirmed stopped manual position as {target.value}",
-                snapshot=self._snapshot,
-            )
-        except (AeroGo2Error, OSError, RuntimeError, ValueError) as exc:
-            self._operator_confirmed_configuration = None
-            await self.refresh_snapshot()
-            return OperationResult.failure("F446_MANUAL_CONFIRM_REJECTED", str(exc))
-
-        await self.refresh_snapshot()
-        self._emit(
-            "F446_MANUAL_CONFIGURATION_CONFIRMED",
-            configuration=target.value,
-            source=self._snapshot.configuration_source,
-        )
-        return OperationResult.success(
-            f"Operator-confirmed {target.value}; system entered {target_state.name}",
-            code="F446_MANUAL_CONFIGURATION_CONFIRMED",
-            data={
-                "configuration": target.value,
-                "configuration_source": self._snapshot.configuration_source,
-                "state": target_state.name,
-            },
-        )
+        return OperationResult.success(f"Manual endpoint {target.value} is safe to accept")
 
     async def request_home_walk(self, operator_confirmed: bool = False) -> OperationResult:
         """Home an unverified F446 mechanism to the configured WALK limit."""
@@ -1236,23 +1391,24 @@ class SystemManager:
             if not move_result.ok:
                 raise BridgeError(f"{move_result.code}: {move_result.message}")
             await self.refresh_snapshot()
-            if not await self._go2.request_flight_pose():
-                raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected the request")
+            if not await self._go2.request_stop():
+                raise BridgeError("GO2_STOP_FAILED: Go2 rejected the stop request")
             await self.refresh_snapshot()
-            if not self._snapshot.go2.joints_locked:
-                raise BridgeError(
-                    "GO2_JOINT_LOCK_UNCONFIRMED: Go2 did not report mode=6 JOINT_LOCK"
-                )
             self._emit("FLIGHT_LIMIT_REACHED")
             await self._state_machine.transition_to(
-                SystemState.FLIGHT_READY,
-                reason="F446 FLIGHT limit and zero duty verified",
+                SystemState.GO2_JOINT_LOCK_WAIT,
+                reason="F446 FLIGHT endpoint verified; waiting for operator-selected mode=6",
                 snapshot=self._snapshot,
             )
-            self._emit("FLIGHT_CONFIGURATION_VERIFIED")
-            self._emit("FLIGHT_READY")
             await self.refresh_snapshot()
-            return OperationResult.success("FLIGHT verified; only RadioMaster may arm")
+            self._emit(
+                "GO2_JOINT_LOCK_OPERATOR_REQUIRED",
+                timeout_s=self.config.go2.joint_lock_operator_timeout_s,
+                current_mode=self._snapshot.go2.locomotion_mode,
+            )
+            if self._runtime_mode is RuntimeMode.DRY_RUN:
+                return await self._advance_go2_joint_lock_wait(simulate_operator=True)
+            return self._joint_lock_operator_required_result()
         except (
             AeroGo2Error,
             asyncio.TimeoutError,
@@ -1315,6 +1471,8 @@ class SystemManager:
                 )
                 if not relock.ok:
                     raise BridgeError(f"{relock.code}: {relock.message}")
+                if relock.code == "GO2_JOINT_LOCK_OPERATOR_REQUIRED":
+                    return relock
 
             current_clear = self._current_clear_dwell_result()
             if not current_clear.ok:
@@ -1617,6 +1775,10 @@ class SystemManager:
             await self._fault(blocking[0].code, message, stop_attempted=True)
             return violations
 
+        if self.state is SystemState.GO2_JOINT_LOCK_WAIT:
+            await self._advance_go2_joint_lock_wait()
+            return violations
+
         non_escalating_codes = {
             "AUTOLAND_CONTROLLER_TIMEOUT",
             "AUTOLAND_ESTIMATOR_INVALID",
@@ -1718,9 +1880,11 @@ class SystemManager:
         if self._control_writes_allowed() and self._snapshot.go2.connected:
             try:
                 if initial_state is SystemState.LANDING_COMPLIANT:
-                    relock = await self._finish_landing_compliance("supervised stop")
-                    if not relock.ok:
-                        raise BridgeError(f"{relock.code}: {relock.message}")
+                    if self._runtime_mode is RuntimeMode.DRY_RUN:
+                        if not await self._go2.request_flight_pose():
+                            raise BridgeError("simulated Go2 JOINT_LOCK restoration failed")
+                    elif not await self._go2.request_stop():
+                        raise BridgeError("Go2 rejected the emergency stop request")
                 elif not await self._go2.request_stop():
                     raise BridgeError("Go2 rejected the stop request")
             except (BridgeError, OSError, RuntimeError) as exc:
@@ -2141,9 +2305,23 @@ class SystemManager:
             }
 
         if name == "transform status":
+            joint_lock_deadline = self._go2_joint_lock_deadline
+            joint_lock_remaining_s = (
+                0.0
+                if joint_lock_deadline is None
+                else max(0.0, joint_lock_deadline - self._clock.monotonic())
+            )
             return {
                 "system_state": self.state.name,
                 "configuration": self._snapshot.configuration.value,
+                "go2_mode": self._snapshot.go2.locomotion_mode,
+                "go2_joints_locked": self._snapshot.go2.joints_locked,
+                "joint_lock_operator_remaining_s": joint_lock_remaining_s,
+                "operator_marked_endpoint": (
+                    None
+                    if self._manual_marked_configuration is None
+                    else self._manual_marked_configuration.value
+                ),
                 "f446_state": self._snapshot.f446.state.value,
                 "f446_duty": self._snapshot.f446.duty,
             }
@@ -2591,7 +2769,12 @@ class SystemManager:
     async def _adopt_boot_configuration(self) -> None:
         configuration = self._snapshot.configuration
         if configuration is Configuration.WALK:
-            target = SystemState.WALK
+            await self._state_machine.transition_to(
+                SystemState.WALK,
+                reason="devices verified in safe WALK configuration",
+                snapshot=self._snapshot,
+            )
+            return
         elif configuration is Configuration.FLIGHT:
             if not self._control_writes_allowed():
                 self._emit(
@@ -2602,22 +2785,128 @@ class SystemManager:
                     ),
                 )
                 return
-            if not await self._go2.request_flight_pose():
-                raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected the request")
-            await self.refresh_snapshot()
-            if not self._snapshot.go2.joints_locked:
-                raise BridgeError(
-                    "GO2_JOINT_LOCK_UNCONFIRMED: Go2 did not report mode=6 JOINT_LOCK"
+            if self._snapshot.go2.joints_locked:
+                if not await self._go2.request_flight_pose():
+                    raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected the request")
+                await self.refresh_snapshot()
+                await self._state_machine.transition_to(
+                    SystemState.FLIGHT_READY,
+                    reason="devices verified in safe FLIGHT configuration with mode=6",
+                    snapshot=self._snapshot,
                 )
-            target = SystemState.FLIGHT_READY
+                return
+            if not await self._go2.request_stop():
+                raise BridgeError("GO2_STOP_FAILED: Go2 rejected the stop request")
+            await self.refresh_snapshot()
+            await self._state_machine.transition_to(
+                SystemState.GO2_JOINT_LOCK_WAIT,
+                reason="FLIGHT configuration verified; waiting for operator-selected mode=6",
+                snapshot=self._snapshot,
+            )
+            await self.refresh_snapshot()
+            self._emit(
+                "GO2_JOINT_LOCK_OPERATOR_REQUIRED",
+                timeout_s=self.config.go2.joint_lock_operator_timeout_s,
+                current_mode=self._snapshot.go2.locomotion_mode,
+            )
+            if self._runtime_mode is RuntimeMode.DRY_RUN:
+                result = await self._advance_go2_joint_lock_wait(simulate_operator=True)
+                if not result.ok:
+                    raise BridgeError(f"{result.code}: {result.message}")
+            return
         else:
             self._emit("F446_CONFIGURATION_UNKNOWN", state=self._snapshot.f446.state.value)
             return
-        await self._state_machine.transition_to(
-            target,
-            reason=f"devices verified in safe {configuration.value} configuration",
-            snapshot=self._snapshot,
+
+    def _joint_lock_operator_required_result(self) -> OperationResult:
+        now = self._clock.monotonic()
+        deadline = self._go2_joint_lock_deadline
+        remaining = (
+            self.config.go2.joint_lock_operator_timeout_s
+            if deadline is None
+            else max(0.0, deadline - now)
         )
+        return OperationResult.success(
+            (
+                "FLIGHT endpoint is verified and F446 is stopped. In the Unitree phone app, "
+                "select Joint Lock (mode 6). AeroGo2 will detect it and enter FLIGHT_READY "
+                f"automatically; {remaining:.1f}s remain. Do not command Go2 locomotion."
+            ),
+            code="GO2_JOINT_LOCK_OPERATOR_REQUIRED",
+            data={
+                "state": self.state.name,
+                "current_mode": self._snapshot.go2.locomotion_mode,
+                "required_mode": "JOINT_LOCK",
+                "required_mode_code": 6,
+                "remaining_s": remaining,
+                "f446_duty": self._snapshot.f446.duty,
+                "automatic_transition": "FLIGHT_READY",
+            },
+        )
+
+    async def _advance_go2_joint_lock_wait(
+        self,
+        *,
+        simulate_operator: bool = False,
+    ) -> OperationResult:
+        if self.state is not SystemState.GO2_JOINT_LOCK_WAIT:
+            return OperationResult.failure(
+                "INVALID_STATE",
+                "Go2 joint-lock completion requires GO2_JOINT_LOCK_WAIT",
+            )
+        if simulate_operator and not self._snapshot.go2.joints_locked:
+            try:
+                if not await self._go2.request_flight_pose():
+                    raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected the request")
+            except (BridgeError, OSError, RuntimeError) as exc:
+                message = str(exc)
+                await self._fault("GO2_JOINT_LOCK_FAILED", message)
+                return OperationResult.failure("GO2_JOINT_LOCK_FAILED", message)
+            await self.refresh_snapshot()
+
+        if not self._snapshot.go2.joints_locked:
+            deadline = self._go2_joint_lock_deadline
+            if deadline is not None and self._clock.monotonic() >= deadline:
+                message = (
+                    "Go2 did not report mode=6 JOINT_LOCK within "
+                    f"{self.config.go2.joint_lock_operator_timeout_s:.1f}s"
+                )
+                await self._fault("GO2_JOINT_LOCK_OPERATOR_TIMEOUT", message)
+                return OperationResult.failure("GO2_JOINT_LOCK_OPERATOR_TIMEOUT", message)
+            return self._joint_lock_operator_required_result()
+
+        try:
+            # The operator/app already selected mode 6. This call only disables
+            # joystick input and re-verifies the authoritative SportModeState.
+            if not await self._go2.request_flight_pose():
+                raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected finalization")
+            await self.refresh_snapshot()
+            if not self._snapshot.go2.joints_locked:
+                raise BridgeError(
+                    "GO2_JOINT_LOCK_UNCONFIRMED: Go2 lost mode=6 during finalization"
+                )
+            await self._state_machine.transition_to(
+                SystemState.FLIGHT_READY,
+                reason="operator-selected Go2 mode=6 verified and joystick input disabled",
+                snapshot=self._snapshot,
+            )
+            self._go2_joint_lock_deadline = None
+            self._emit("FLIGHT_CONFIGURATION_VERIFIED")
+            self._emit("FLIGHT_READY")
+            await self.refresh_snapshot()
+            return OperationResult.success(
+                "FLIGHT verified with Go2 mode=6 JOINT_LOCK; only RadioMaster may arm",
+                code="FLIGHT_READY",
+            )
+        except (AeroGo2Error, OSError, RuntimeError, ValueError) as exc:
+            message = str(exc)
+            code = (
+                "GO2_JOINT_LOCK_UNCONFIRMED"
+                if message.startswith("GO2_JOINT_LOCK_UNCONFIRMED:")
+                else "GO2_JOINT_LOCK_FAILED"
+            )
+            await self._fault(code, message)
+            return OperationResult.failure(code, message)
 
     async def _prepare_disconnect(self) -> OperationResult:
         if self.state in (
@@ -2774,21 +3063,36 @@ class SystemManager:
         self._autoland_active = False
         self._maintenance_mode = False
         self._operator_confirmed_configuration = None
+        self._manual_marked_configuration = None
         self._manual_motion_deadline = None
         self._manual_last_direction = None
         self._manual_motion_started = False
+        self._go2_joint_lock_deadline = None
 
     async def _enter_manual_positioning(self, snapshot: SystemSnapshot) -> None:
         self._maintenance_mode = True
+        self._manual_marked_configuration = None
         self._manual_motion_deadline = None
         self._manual_last_direction = None
         self._manual_motion_started = False
 
-    async def _leave_manual_positioning(self, snapshot: SystemSnapshot) -> None:
+    async def _enter_go2_joint_lock_wait(self, snapshot: SystemSnapshot) -> None:
         self._maintenance_mode = False
+        self._manual_marked_configuration = None
         self._manual_motion_deadline = None
         self._manual_last_direction = None
         self._manual_motion_started = False
+        self._go2_joint_lock_deadline = (
+            self._clock.monotonic() + self.config.go2.joint_lock_operator_timeout_s
+        )
+
+    async def _leave_manual_positioning(self, snapshot: SystemSnapshot) -> None:
+        self._maintenance_mode = False
+        self._manual_marked_configuration = None
+        self._manual_motion_deadline = None
+        self._manual_last_direction = None
+        self._manual_motion_started = False
+        self._go2_joint_lock_deadline = None
 
     async def _enter_landing_compliant(self, snapshot: SystemSnapshot) -> None:
         if not self._control_writes_allowed():
@@ -2831,19 +3135,25 @@ class SystemManager:
                 "Go2 landing compliance can only finish from LANDING_COMPLIANT",
             )
         try:
-            if not await self._go2.request_flight_pose():
-                raise BridgeError("Go2 rejected the JOINT_LOCK restoration request")
+            if not await self._go2.request_stop():
+                raise BridgeError("Go2 rejected the stop request before manual JOINT_LOCK")
             await self.refresh_snapshot()
-            if not self._snapshot.go2.joints_locked:
-                raise BridgeError("Go2 did not authoritatively report mode=6 JOINT_LOCK")
             await self._state_machine.transition_to(
-                SystemState.FLIGHT_READY,
-                reason=f"landing compliance finished: {reason}",
+                SystemState.GO2_JOINT_LOCK_WAIT,
+                reason=f"landing compliance finished; waiting for operator mode=6: {reason}",
                 snapshot=self._snapshot,
             )
             self._landing_compliant_since = None
-            self._emit("LANDING_COMPLIANCE_FINISHED", reason=reason)
             await self.refresh_snapshot()
+            self._emit(
+                "GO2_JOINT_LOCK_OPERATOR_REQUIRED",
+                timeout_s=self.config.go2.joint_lock_operator_timeout_s,
+                current_mode=self._snapshot.go2.locomotion_mode,
+                reason=reason,
+            )
+            if self._runtime_mode is RuntimeMode.DRY_RUN:
+                return await self._advance_go2_joint_lock_wait(simulate_operator=True)
+            return self._joint_lock_operator_required_result()
         except (
             AeroGo2Error,
             asyncio.TimeoutError,
@@ -2852,20 +3162,16 @@ class SystemManager:
             ValueError,
         ) as exc:
             return OperationResult.failure("GO2_LANDING_RELOCK_FAILED", str(exc))
-        if self._snapshot.state is not SystemState.FLIGHT_READY:
-            return OperationResult.failure(
-                "GO2_LANDING_RELOCK_FAILED",
-                f"Expected FLIGHT_READY after relock, received {self._snapshot.state.name}",
-            )
-        return OperationResult.success("Go2 JOINT_LOCK restored after landing compliance")
 
     async def _enter_fault_state(self, snapshot: SystemSnapshot) -> None:
         self._autoland_active = False
         self._maintenance_mode = False
         self._operator_confirmed_configuration = None
+        self._manual_marked_configuration = None
         self._manual_motion_deadline = None
         self._manual_last_direction = None
         self._manual_motion_started = False
+        self._go2_joint_lock_deadline = None
         if self._suppress_fault_entry_stop:
             return
         await self._stop_setpoints()
@@ -2874,6 +3180,8 @@ class SystemManager:
             raise BridgeError(f"{stop_result.code}: {stop_result.message}")
 
     async def _enter_emergency_stop(self, snapshot: SystemSnapshot) -> None:
+        self._manual_marked_configuration = None
+        self._go2_joint_lock_deadline = None
         result = await self.stop_supervised()
         if not result.ok:
             raise BridgeError(f"{result.code}: {result.message}")

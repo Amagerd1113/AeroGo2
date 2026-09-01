@@ -152,7 +152,7 @@ await state_machine.transition_to(
 转换会依次执行：守卫检查、生成 `TransitionRecord`、JSONL 记录、唯一状态更新、
 发布事件、进入动作，以及进入动作失败时转入 `FAULT`。
 
-完整的 15 个状态、所有合法下一状态、每条激活条件和真机/DRY-RUN 边界见
+完整状态、所有合法下一状态、每条激活条件和真机/DRY-RUN 边界见
 [`docs/STATE_TRANSITIONS_ZH.md`](docs/STATE_TRANSITIONS_ZH.md)。`FLIGHT_READY -> FLIGHT_MANUAL`
 采用一次性两把钥匙：AeroGo2 Shell `flight authorize` 成功后，30 秒内再由 RadioMaster CH5 LOW->HIGH 请求正常 Arm。
 

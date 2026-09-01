@@ -16,6 +16,12 @@ def test_loads_included_configuration(app_config: AppConfig) -> None:
     assert app_config.system.hardware_write_enabled is False
     assert app_config.f446.flight_direction == "forward"
     assert app_config.rc.morphology_channel == 9
+    assert app_config.f446.walk_duty == 300
+    assert app_config.f446.transform_timeout_s == 15.0
+    assert app_config.f446.firmware_timeout_ms == 15000
+    assert app_config.f446.automatic_stall_threshold_adc == 0
+    assert app_config.f446.stall_blanking_ms == 500
+    assert app_config.f446.stall_overcurrent_ms == 180
 
 
 def test_non_dry_configuration_can_describe_hardware_write_capability(
@@ -86,6 +92,18 @@ def _excess_duty(raw: Dict[str, Any]) -> None:
 def _zero_timeout(raw: Dict[str, Any]) -> None:
     raw["f446"]["transform_timeout_s"] = 0
 
+def _firmware_timeout_exceeds_host(raw: Dict[str, Any]) -> None:
+    raw["f446"]["firmware_timeout_ms"] = 16000
+
+
+def _unsafe_persistent_threshold(raw: Dict[str, Any]) -> None:
+    raw["f446"]["automatic_stall_threshold_adc"] = 1800
+
+
+def _invalid_timing_combination(raw: Dict[str, Any]) -> None:
+    raw["f446"]["stall_blanking_ms"] = 14900
+
+
 
 def _duplicate_rc(raw: Dict[str, Any]) -> None:
     raw["rc"]["morphology_channel"] = raw["rc"]["auto_landing_channel"]
@@ -124,6 +142,9 @@ def _negative_landing_speed(raw: Dict[str, Any]) -> None:
         (_excess_duty, "walk_duty"),
         (_zero_timeout, "transform_timeout_s"),
         (_duplicate_rc, "channel assignments"),
+        (_firmware_timeout_exceeds_host, "must not exceed"),
+        (_unsafe_persistent_threshold, "safety envelope"),
+        (_invalid_timing_combination, "stall_blanking_ms"),
         (_overlap_rc, "thresholds"),
         (_rc9_option, "RC9_OPTION"),
         (_duplicate_esc, "ESC slots"),
@@ -145,6 +166,26 @@ def test_unsafe_configuration_is_rejected(
     with pytest.raises(ConfigurationError, match=expected):
         load_config(path)
 
+
+
+def test_legacy_f446_timing_keys_are_derived_safely(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    raw = deep_thaw(app_config.raw)
+    raw["f446"]["transform_timeout_s"] = 6.0
+    for key in (
+        "firmware_timeout_ms",
+        "automatic_stall_threshold_adc",
+        "stall_blanking_ms",
+        "stall_overcurrent_ms",
+    ):
+        del raw["f446"][key]
+    path = tmp_path / "legacy.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    loaded = load_config(path)
+    assert loaded.f446.firmware_timeout_ms == 6000
+    assert loaded.f446.automatic_stall_threshold_adc == 0
 
 def test_include_cycle_is_rejected(tmp_path: Path) -> None:
     first = tmp_path / "first.yaml"

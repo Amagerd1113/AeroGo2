@@ -27,12 +27,14 @@ _MUTABLE_ALLOWED_TRANSITIONS: Dict[SystemState, Set[SystemState]] = {
         SystemState.HOMING_TO_WALK,
         SystemState.WALK,
         SystemState.FLIGHT_READY,
+        SystemState.GO2_JOINT_LOCK_WAIT,
         SystemState.FAULT,
     },
     SystemState.MANUAL_POSITIONING: {
         SystemState.BOOT_SAFE,
         SystemState.WALK,
         SystemState.FLIGHT_READY,
+        SystemState.GO2_JOINT_LOCK_WAIT,
         SystemState.FAULT,
         SystemState.EMERGENCY_STOP,
     },
@@ -55,6 +57,11 @@ _MUTABLE_ALLOWED_TRANSITIONS: Dict[SystemState, Set[SystemState]] = {
         SystemState.EMERGENCY_STOP,
     },
     SystemState.TRANSFORM_TO_FLIGHT: {
+        SystemState.GO2_JOINT_LOCK_WAIT,
+        SystemState.FAULT,
+        SystemState.EMERGENCY_STOP,
+    },
+    SystemState.GO2_JOINT_LOCK_WAIT: {
         SystemState.FLIGHT_READY,
         SystemState.FAULT,
         SystemState.EMERGENCY_STOP,
@@ -94,6 +101,7 @@ _MUTABLE_ALLOWED_TRANSITIONS: Dict[SystemState, Set[SystemState]] = {
         SystemState.EMERGENCY_STOP,
     },
     SystemState.LANDING_COMPLIANT: {
+        SystemState.GO2_JOINT_LOCK_WAIT,
         SystemState.FLIGHT_READY,
         SystemState.FAULT,
         SystemState.EMERGENCY_STOP,
@@ -130,7 +138,9 @@ ACTIVE_TRANSFORM_STATES: FrozenSet[SystemState] = frozenset(
     )
 )
 TRANSFORM_STATES: FrozenSet[SystemState] = frozenset(
-    TRANSFORM_PRECHECK_STATES | ACTIVE_TRANSFORM_STATES
+    TRANSFORM_PRECHECK_STATES
+    | ACTIVE_TRANSFORM_STATES
+    | frozenset((SystemState.GO2_JOINT_LOCK_WAIT,))
 )
 
 
@@ -257,6 +267,24 @@ class TransitionGuards:
                     "The second-stage check requires the mechanism to remain in WALK",
                 )
             self._require_go2_stationary(snapshot, codes, messages)
+
+        if new_state is SystemState.GO2_JOINT_LOCK_WAIT:
+            if snapshot.configuration is not Configuration.FLIGHT:
+                self._reject(
+                    codes,
+                    messages,
+                    "FLIGHT_CONFIGURATION_NOT_CONFIRMED",
+                    "Go2 joint-lock wait requires a verified FLIGHT endpoint",
+                )
+            if snapshot.f446.duty != 0:
+                self._reject(
+                    codes,
+                    messages,
+                    "F446_DUTY_NONZERO",
+                    "F446 must be stopped before waiting for Go2 JOINT_LOCK",
+                )
+            self._require_disarmed(snapshot, codes, messages)
+            self._require_rotors_stopped(snapshot, codes, messages)
 
         if new_state is SystemState.FLIGHT_READY:
             if snapshot.configuration is not Configuration.FLIGHT:

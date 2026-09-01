@@ -32,6 +32,7 @@ _TRANSFORM_INTERLOCK_STATES = frozenset(
         SystemState.MANUAL_POSITIONING,
         SystemState.HOMING_TO_WALK,
         SystemState.TRANSFORM_TO_FLIGHT,
+        SystemState.GO2_JOINT_LOCK_WAIT,
         SystemState.FLIGHT_TO_WALK_PRECHECK,
         SystemState.TRANSFORM_TO_WALK,
     )
@@ -194,7 +195,17 @@ class SafetyMonitor:
                     "ESC telemetry is incomplete, inconsistent, unhealthy, non-finite, or nonzero during active transformation.",
                     "Stop the F446 mechanism; do not command rotor shutdown.",
                 )
-            if self._go2_is_moving(snapshot):
+            if (
+                snapshot.state is SystemState.GO2_JOINT_LOCK_WAIT
+                and self._go2_joint_lock_transition_is_unsafe(snapshot)
+            ):
+                add(
+                    "GO2_UNSAFE_DURING_JOINT_LOCK",
+                    SafetySeverity.FAULT,
+                    "Go2 entered a locomotion/unsafe-speed state while waiting for mode=6 JOINT_LOCK.",
+                    "Stop the F446 mechanism and keep the Go2 stationary; select Joint Lock in the Unitree app.",
+                )
+            elif snapshot.state is not SystemState.GO2_JOINT_LOCK_WAIT and self._go2_is_moving(snapshot):
                 add(
                     "GO2_MOVING_DURING_TRANSFORM",
                     SafetySeverity.FAULT,
@@ -374,6 +385,26 @@ class SafetyMonitor:
             or snapshot.go2.controller_active
         )
 
+    def _go2_joint_lock_transition_is_unsafe(self, snapshot: SystemSnapshot) -> bool:
+        allowed_modes = {
+            "IDLE_STAND",
+            "BALANCE_STAND",
+            "POSE",
+            "JOINT_LOCK",
+            # Simulation aliases; the hardware bridge emits the names above.
+            "STAND",
+            "STOPPED",
+        }
+        components = snapshot.go2.body_velocity
+        limit = self._config.safety.stationary_velocity_mps
+        return (
+            snapshot.go2.locomotion_mode not in allowed_modes
+            or not math.isfinite(snapshot.go2.velocity_mps)
+            or len(components) != 3
+            or any(not math.isfinite(value) or abs(value) >= limit for value in components)
+            or abs(snapshot.go2.velocity_mps) >= limit
+        )
+
     def _f446_overcurrent(self, snapshot: SystemSnapshot) -> bool:
         current = snapshot.f446.used_current_adc
         if current is None:
@@ -423,6 +454,7 @@ class SafetyMonitor:
         if snapshot.state in (SystemState.WALK, SystemState.WALK_TO_FLIGHT_PRECHECK):
             state_expected = Configuration.WALK
         elif snapshot.state in (
+            SystemState.GO2_JOINT_LOCK_WAIT,
             SystemState.FLIGHT_READY,
             SystemState.FLIGHT_MANUAL,
             SystemState.AUTO_LANDING_READY,

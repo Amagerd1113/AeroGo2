@@ -14,6 +14,7 @@ class SystemState(Enum):
     WALK = auto()
     WALK_TO_FLIGHT_PRECHECK = auto()
     TRANSFORM_TO_FLIGHT = auto()
+    GO2_JOINT_LOCK_WAIT = auto()
     FLIGHT_READY = auto()
     FLIGHT_MANUAL = auto()
     AUTO_LANDING_READY = auto()

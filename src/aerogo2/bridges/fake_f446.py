@@ -76,10 +76,25 @@ class FakeF446:
 
     async def connect(self) -> None:
         self._shutdown.clear()
+        threshold_adc = self._status.threshold_adc
+        threshold_mv = self._status.threshold_mv
+        if self._config is not None and self._config.automatic_stall_threshold_adc > 0:
+            threshold_adc = self._config.automatic_stall_threshold_adc
+            threshold_mv = _raw_to_mv(threshold_adc)
         self._status = replace(
             self._status,
             connected=True,
             timestamp=self._clock.monotonic(),
+            timeout_ms=(
+                self._status.timeout_ms
+                if self._config is None
+                else self._config.firmware_timeout_ms
+            ),
+            blanking_ms=(self._status.blanking_ms if self._config is None else self._config.stall_blanking_ms),
+            overcurrent_ms=(self._status.overcurrent_ms if self._config is None else self._config.stall_overcurrent_ms),
+            threshold_adc=threshold_adc,
+            threshold_raw=0 if threshold_adc is None else threshold_adc,
+            threshold_mv=threshold_mv,
         )
 
     async def disconnect(self) -> None:
@@ -425,6 +440,67 @@ class FakeF446:
                     "threshold_adc": threshold_adc,
                     "threshold_mv": _raw_to_mv(threshold_adc),
                 },
+            )
+
+    async def set_motion_timeout_ms(self, timeout_ms: int) -> OperationResult:
+        return await self._set_timing_parameter(
+            command="timeout",
+            requested=timeout_ms,
+            minimum=100,
+            maximum=60000,
+            field="timeout_ms",
+        )
+
+    async def set_stall_blanking_ms(self, blanking_ms: int) -> OperationResult:
+        return await self._set_timing_parameter(
+            command="blank",
+            requested=blanking_ms,
+            minimum=0,
+            maximum=5000,
+            field="blanking_ms",
+        )
+
+    async def set_overcurrent_duration_ms(self, overcurrent_ms: int) -> OperationResult:
+        return await self._set_timing_parameter(
+            command="overms",
+            requested=overcurrent_ms,
+            minimum=10,
+            maximum=3000,
+            field="overcurrent_ms",
+        )
+
+    async def _set_timing_parameter(
+        self,
+        *,
+        command: str,
+        requested: int,
+        minimum: int,
+        maximum: int,
+        field: str,
+    ) -> OperationResult:
+        if isinstance(requested, bool) or not minimum <= requested <= maximum:
+            return OperationResult.failure(
+                "F446_INVALID_TIMING_PARAMETER",
+                f"{command} must be {minimum}..{maximum}",
+            )
+        async with self._operation_lock:
+            if self._status.duty != 0:
+                return OperationResult.failure(
+                    "F446_PARAMETER_WRITE_WHILE_MOVING",
+                    f"Stop FakeF446 before changing {command}",
+                )
+            self._record_command(f"{command} {requested}")
+            if field == "timeout_ms":
+                self._status = replace(self._status, timeout_ms=requested)
+            elif field == "blanking_ms":
+                self._status = replace(self._status, blanking_ms=requested)
+            else:
+                self._status = replace(self._status, overcurrent_ms=requested)
+            self._status = replace(self._status, timestamp=self._clock.monotonic())
+            return OperationResult.success(
+                f"FakeF446 {command} verified: {requested}ms",
+                code="F446_TIMING_UPDATED",
+                data={field: requested},
             )
 
     async def stop(self) -> OperationResult:

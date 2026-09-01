@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from aerogo2.bridges.f446_parser import F446TextParser
 from aerogo2.common.clock import Clock, RealClock
@@ -23,8 +23,11 @@ from aerogo2.common.results import OperationResult
 # conservative gap between bytes; this applies to every command, including the
 # guarded motion commands.
 _TX_INTER_BYTE_DELAY_S = 0.010
+_TX_POST_COMMAND_DELAY_S = 0.050
 _INITIAL_STATUS_ATTEMPTS = 3
 _INITIAL_STATUS_RETRY_DELAY_S = 0.100
+_VERIFICATION_STATUS_ATTEMPTS = 3
+_VERIFICATION_STATUS_RETRY_DELAY_S = 0.050
 _MAX_MAINTENANCE_DUTY = 900
 
 
@@ -86,6 +89,8 @@ class TextF446Bridge:
             status = await self._request_initial_status()
             if status.state is F446State.UNKNOWN:
                 raise BridgeError("F446 returned an unknown initial state")
+            if self._allow_motion:
+                await self._synchronize_configured_parameters(status)
         except Exception:
             await self.disconnect()
             raise
@@ -167,7 +172,10 @@ class TextF446Bridge:
             duty = config.duty_for(configuration.value)
             command = "limf" if direction == "forward" else "limr"
             await self._write_line(f"{command} {duty}")
-            deadline = self._clock.monotonic() + config.transform_timeout_s
+            # The F446 local timer may expire at the configured host limit.
+            # Keep one serial-response interval of grace so its authoritative
+            # LIMIT_REACHED/FAULT line can be parsed before host force-stop.
+            deadline = self._clock.monotonic() + config.transform_timeout_s + config.response_timeout_s
             while self._clock.monotonic() < deadline:
                 status = self.get_status()
                 if not status.connected:
@@ -257,7 +265,9 @@ class TextF446Bridge:
                 )
             if initial.manual_limit < duty:
                 await self._write_line(f"mlimit {duty}")
-                configured = await self.request_status()
+                configured = await self._request_status_matching(
+                    lambda status: status.manual_limit >= duty
+                )
                 if configured.manual_limit < duty:
                     return OperationResult.failure(
                         "F446_MANUAL_LIMIT_REJECTED",
@@ -265,9 +275,16 @@ class TextF446Bridge:
                     )
 
             await self._write_line(f"{normalized} {duty}")
-            observed = await self.request_status()
             reached_state = (
                 F446State.LIMIT_REACHED_FWD if normalized == "limf" else F446State.LIMIT_REACHED_REV
+            )
+            observed = await self._request_status_matching(
+                lambda status: (
+                    normalized.startswith("lim")
+                    and status.state is reached_state
+                    and status.duty == 0
+                )
+                or (status.state is expected and status.duty == expected_duty)
             )
             if (
                 normalized.startswith("lim")
@@ -324,6 +341,33 @@ class TextF446Bridge:
             tolerance=1,
         )
 
+    async def set_motion_timeout_ms(self, timeout_ms: int) -> OperationResult:
+        return await self._set_timing_parameter(
+            command="timeout",
+            requested=timeout_ms,
+            minimum=100,
+            maximum=60000,
+            observed_field="timeout_ms",
+        )
+
+    async def set_stall_blanking_ms(self, blanking_ms: int) -> OperationResult:
+        return await self._set_timing_parameter(
+            command="blank",
+            requested=blanking_ms,
+            minimum=0,
+            maximum=5000,
+            observed_field="blanking_ms",
+        )
+
+    async def set_overcurrent_duration_ms(self, overcurrent_ms: int) -> OperationResult:
+        return await self._set_timing_parameter(
+            command="overms",
+            requested=overcurrent_ms,
+            minimum=10,
+            maximum=3000,
+            observed_field="overcurrent_ms",
+        )
+
     async def _set_current_threshold(
         self,
         *,
@@ -356,7 +400,12 @@ class TextF446Bridge:
                     "Stop F446 before changing the current threshold",
                 )
             await self._write_line(f"{command} {requested}")
-            observed = await self.request_status()
+            observed = await self._request_status_matching(
+                lambda status: (
+                    getattr(status, observed_field) is not None
+                    and abs(int(getattr(status, observed_field)) - requested) <= tolerance
+                )
+            )
             value = getattr(observed, observed_field)
             if value is None or abs(int(value) - requested) > tolerance:
                 return OperationResult.failure(
@@ -371,6 +420,98 @@ class TextF446Bridge:
                     "threshold_mv": observed.threshold_mv,
                 },
             )
+
+    async def _set_timing_parameter(
+        self,
+        *,
+        command: str,
+        requested: int,
+        minimum: int,
+        maximum: int,
+        observed_field: str,
+    ) -> OperationResult:
+        if isinstance(requested, bool) or not minimum <= requested <= maximum:
+            return OperationResult.failure(
+                "F446_INVALID_TIMING_PARAMETER",
+                f"{command} must be {minimum}..{maximum}",
+            )
+        if not self._allow_motion:
+            return OperationResult.failure(
+                "F446_HARDWARE_WRITE_DISABLED",
+                "F446 parameter writes are locked in this process",
+            )
+        async with self._transaction_lock:
+            initial = await self.request_status()
+            if initial.faulted:
+                return OperationResult.failure(
+                    "F446_FAULT",
+                    initial.fault_message or "F446 reports FAULT",
+                )
+            if self._is_moving(initial) or initial.duty != 0:
+                return OperationResult.failure(
+                    "F446_PARAMETER_WRITE_WHILE_MOVING",
+                    f"Stop F446 before changing {command}",
+                )
+            await self._write_line(f"{command} {requested}")
+            observed = await self._request_status_matching(
+                lambda status: int(getattr(status, observed_field)) == requested
+            )
+            value = int(getattr(observed, observed_field))
+            if value != requested:
+                return OperationResult.failure(
+                    "F446_TIMING_VERIFY_FAILED",
+                    f"Requested {command}={requested}, read back {value}",
+                )
+            return OperationResult.success(
+                f"F446 {command} verified: {value}ms",
+                code="F446_TIMING_UPDATED",
+                data={observed_field: value},
+            )
+
+    async def _synchronize_configured_parameters(self, status: F446Status) -> None:
+        """Reapply persistent host settings before background polling starts."""
+
+        if self._is_moving(status) or status.duty != 0:
+            raise BridgeError(
+                f"F446 is moving during connect: state={status.state.value}, duty={status.duty}"
+            )
+        # Keep a faulted board connected for diagnostics and explicit recovery;
+        # parameter writes are deliberately forbidden while it reports FAULT.
+        if status.faulted:
+            return
+        config = self._require_config()
+        operations: List[Tuple[str, Callable[[int], Any], int]] = []
+        if status.timeout_ms != config.firmware_timeout_ms:
+            operations.append(
+                ("timeout", self.set_motion_timeout_ms, config.firmware_timeout_ms)
+            )
+        if status.blanking_ms != config.stall_blanking_ms:
+            operations.append(
+                ("blank", self.set_stall_blanking_ms, config.stall_blanking_ms)
+            )
+        if status.overcurrent_ms != config.stall_overcurrent_ms:
+            operations.append(
+                (
+                    "overms",
+                    self.set_overcurrent_duration_ms,
+                    config.stall_overcurrent_ms,
+                )
+            )
+        if (
+            config.automatic_stall_threshold_adc > 0
+            and status.threshold_adc != config.automatic_stall_threshold_adc
+        ):
+            operations.append(
+                (
+                    "threshold",
+                    self.set_current_threshold_adc,
+                    config.automatic_stall_threshold_adc,
+                )
+            )
+        for label, setter, requested in operations:
+            result = await setter(requested)
+            if not result.ok:
+                raise BridgeError(f"Cannot synchronize F446 {label}: {result.message}")
 
     async def stop(self) -> OperationResult:
         status = self.get_status()
@@ -411,6 +552,22 @@ class TextF446Bridge:
             f"F446 did not answer '{command}' within {config.response_timeout_s:.2f}s"
         )
 
+    async def _request_status_matching(
+        self,
+        predicate: Callable[[F446Status], bool],
+    ) -> F446Status:
+        """Read bounded statuses until one verifies the preceding command."""
+
+        observed: Optional[F446Status] = None
+        for attempt in range(_VERIFICATION_STATUS_ATTEMPTS):
+            observed = await self.request_status()
+            if predicate(observed):
+                return observed
+            if attempt + 1 < _VERIFICATION_STATUS_ATTEMPTS:
+                await asyncio.sleep(_VERIFICATION_STATUS_RETRY_DELAY_S)
+        assert observed is not None
+        return observed
+
     async def _force_stop(self) -> OperationResult:
         try:
             await self._write_line("stop")
@@ -438,6 +595,9 @@ class TextF446Bridge:
                     await drain()
                 if offset + 1 < len(payload):
                     await asyncio.sleep(_TX_INTER_BYTE_DELAY_S)
+            # Give the slow firmware main loop time to consume the terminating
+            # CR before the first byte of the next command is transmitted.
+            await asyncio.sleep(_TX_POST_COMMAND_DELAY_S)
 
     async def _request_initial_status(self) -> F446Status:
         last_error: Optional[BridgeError] = None
@@ -480,7 +640,10 @@ class TextF446Bridge:
         try:
             while self._connected:
                 await asyncio.sleep(interval)
-                await self._write_line("status")
+                # Keep the poll response inside the transaction. Otherwise an
+                # old IDLE/threshold status can satisfy a guarded command's readback.
+                async with self._transaction_lock:
+                    await self.request_status()
         except asyncio.CancelledError:
             raise
         except Exception as exc:

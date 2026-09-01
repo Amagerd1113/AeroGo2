@@ -181,17 +181,18 @@ class UnitreeGo2Bridge:
 
     async def request_flight_pose(self) -> bool:
         already_locked = self.get_status().joints_locked
-        if not already_locked and not await self._call("StopMove"):
+        if not already_locked:
+            # SportClient has no authoritative JointLock command. StandUp enters
+            # an ordinary standing posture on Go2 and must not be treated as
+            # mode=6. Keep joystick/app control available so the operator can
+            # select Joint Lock in the Unitree phone app.
+            await self._call("StopMove")
             return False
         if not self._joystick_disabled:
             if not await self._call("SwitchJoystick", False):
                 return False
             self._joystick_disabled = True
-        if already_locked:
-            return True
-        if not await self._call("StandUp"):
-            return False
-        return await self._wait_for_joint_lock()
+        return self.get_status().joints_locked
 
     async def request_landing_pose(self) -> bool:
         if not self._joystick_disabled:
