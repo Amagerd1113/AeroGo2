@@ -2,6 +2,7 @@ safety:
   stationary_velocity_mps: 0.05
   stationary_confirm_s: 1.0
   maximum_safe_esc_rpm_for_transform: 50
+  airborne_confirm_s: 1.0
   touchdown_confirm_s: 2.0
   touchdown_max_vertical_speed_mps: 0.1
   touchdown_max_tilt_rad: 0.2

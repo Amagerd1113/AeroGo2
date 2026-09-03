@@ -128,6 +128,26 @@ async def test_three_calibrated_feet_enter_balance_then_relock_before_transform(
 
 
 @pytest.mark.asyncio
+async def test_landing_compliant_relocks_before_manual_positioning(
+    app_config: AppConfig,
+) -> None:
+    world = SimulationWorld(_enabled_config(app_config))
+    try:
+        await _enter_landing_compliant(world)
+        await world.step(world.config.go2.landing_compliance_settle_s + 0.05)
+
+        entered = await world.manager.enter_manual_positioning(operator_confirmed=True)
+
+        assert entered.ok
+        assert entered.data["entry_state"] == "LANDING_COMPLIANT"
+        assert entered.data["post_touchdown_recovery"] is True
+        assert world.manager.state is SystemState.MANUAL_POSITIONING
+        assert world.manager.snapshot.go2.joints_locked
+    finally:
+        await world.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_contact_loss_in_compliant_mode_relocks_then_faults(
     app_config: AppConfig,
 ) -> None:

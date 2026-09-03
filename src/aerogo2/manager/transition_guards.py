@@ -94,6 +94,7 @@ _MUTABLE_ALLOWED_TRANSITIONS: Dict[SystemState, Set[SystemState]] = {
         SystemState.EMERGENCY_STOP,
     },
     SystemState.TOUCHDOWN_VERIFY: {
+        SystemState.MANUAL_POSITIONING,
         SystemState.FLIGHT_MANUAL,
         SystemState.FLIGHT_TO_WALK_PRECHECK,
         SystemState.LANDING_COMPLIANT,
@@ -101,6 +102,7 @@ _MUTABLE_ALLOWED_TRANSITIONS: Dict[SystemState, Set[SystemState]] = {
         SystemState.EMERGENCY_STOP,
     },
     SystemState.LANDING_COMPLIANT: {
+        SystemState.MANUAL_POSITIONING,
         SystemState.GO2_JOINT_LOCK_WAIT,
         SystemState.FLIGHT_READY,
         SystemState.FAULT,
@@ -180,6 +182,18 @@ class TransitionGuards:
                 codes,
                 messages,
                 exact_rotor_stop=not initial_flight_precheck,
+            )
+
+        if (
+            current in {SystemState.TOUCHDOWN_VERIFY, SystemState.LANDING_COMPLIANT}
+            and new_state is SystemState.MANUAL_POSITIONING
+            and not snapshot.pixhawk.landed
+        ):
+            self._reject(
+                codes,
+                messages,
+                "TOUCHDOWN_NOT_CONFIRMED",
+                "Post-touchdown manual positioning requires Pixhawk landed=true",
             )
 
         if current is SystemState.BOOT_SAFE and new_state is SystemState.WALK:
@@ -717,12 +731,12 @@ class TransitionGuards:
         codes: List[str],
         messages: List[str],
     ) -> None:
-        if not snapshot.go2.joints_locked:
+        if not snapshot.joint_lock_confirmed:
             TransitionGuards._reject(
                 codes,
                 messages,
                 "GO2_JOINT_LOCK_REQUIRED",
-                "Go2 must report JOINT_LOCK before entering FLIGHT_READY",
+                "Go2 joint lock must be confirmed before entering FLIGHT_READY",
             )
 
     def _require_go2_foot_contact(

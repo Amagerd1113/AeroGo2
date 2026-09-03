@@ -496,7 +496,17 @@ class SimulationWorld:
             self.pixhawk.inject_esc_rpm(slot, 1000.0)
         await self.manager.tick()
         states.append(self.manager.state)
-        return OperationResult.success("Reached FLIGHT_MANUAL")
+        steps = int(self.config.safety.airborne_confirm_s / 0.05) + 2
+        for _ in range(steps):
+            await self.step(0.05)
+            if self.manager.query("touchdown status")["airborne_confirmed"]:
+                break
+        if not self.manager.query("touchdown status")["airborne_confirmed"]:
+            return OperationResult.failure(
+                "AIRBORNE_CONFIRM_TIMEOUT",
+                "Simulation did not hold armed and landed=false long enough",
+            )
+        return OperationResult.success("Reached FLIGHT_MANUAL with airborne phase confirmed")
 
     async def _reach_autoland(self, states: List[SystemState]) -> OperationResult:
         self._set_landing_estimate(

@@ -49,10 +49,9 @@ def _vector4_int(raw: Any) -> Tuple[Tuple[int, int, int, int], bool]:
 class UnitreeGo2Bridge:
     """Subscribe to SportModeState and issue only conservative SportClient calls."""
 
-    # Go2 firmware uses SportModeState.error_code as a posture/state-machine code.
-    # Hardware verified: 100 is upright IDLE_STAND; 1001 is lying down.
-    # Unknown codes remain fail-closed.
-    _STABLE_STATE_CODES = frozenset((0, 100))
+    # SportModeState.error_code remains visible as raw telemetry. Firmware-specific
+    # codes considered compatible with normal posture are explicitly configured;
+    # they never imply JOINT_LOCK by themselves.
 
     _MODE_NAMES = {
         0: "IDLE_STAND",
@@ -194,6 +193,22 @@ class UnitreeGo2Bridge:
             self._joystick_disabled = True
         return self.get_status().joints_locked
 
+    async def finalize_operator_joint_lock(self) -> bool:
+        """Disable joystick input after a guarded, explicit operator confirmation.
+
+        This does not claim that SportModeState.mode is 6. The manager records the
+        operator confirmation separately from authoritative telemetry.
+        """
+
+        status = self.get_status()
+        if not status.connected or status.moving:
+            return False
+        if not self._joystick_disabled:
+            if not await self._call("SwitchJoystick", False):
+                return False
+            self._joystick_disabled = True
+        return True
+
     async def request_landing_pose(self) -> bool:
         if not self._joystick_disabled:
             if not await self._call("SwitchJoystick", False):
@@ -265,8 +280,14 @@ class UnitreeGo2Bridge:
         mode = int(_value(message, "mode", -1))
         state_code = int(_value(message, "error_code", 0))
         speed = math.hypot(velocity[0], velocity[1])
-        posture_code_ok = state_code in self._STABLE_STATE_CODES
-        joints_locked = mode == 6 and posture_code_ok
+        posture_code_ok = state_code in self._config.accepted_state_codes
+        # Go2 EDU firmware variants may keep mode=0 (IDLE_STAND) after the
+        # phone app enters Lock On and expose the locked state through
+        # error_code=1002 instead. The compatibility codes are explicit and
+        # configurable; downstream FLIGHT_READY interlocks remain mandatory.
+        joints_locked = posture_code_ok and (
+            mode == 6 or state_code in self._config.joint_lock_state_codes
+        )
         standing = mode in {0, 1, 2, 6} and posture_code_ok
         moving = mode == 3 or speed >= 0.02 or abs(velocity[2]) >= 0.02
         stable = standing and abs(rpy[0]) < 0.35 and abs(rpy[1]) < 0.35 and not moving

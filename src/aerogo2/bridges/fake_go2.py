@@ -82,6 +82,11 @@ class FakeGo2:
         )
         return True
 
+    async def finalize_operator_joint_lock(self) -> bool:
+        if not self._status.connected or self._status.moving or self._flight_lock_failure:
+            return False
+        return True
+
     async def request_landing_pose(self) -> bool:
         if not self._status.connected or self._status.moving:
             return False

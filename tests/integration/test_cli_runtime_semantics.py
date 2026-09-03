@@ -139,6 +139,13 @@ class _ManagerStub:
         self.calls.append(("request_transform_walk", str(operator_confirmed)))
         return OperationResult.success("transformed to walk")
 
+    async def confirm_operator_joint_lock(
+        self,
+        operator_confirmed: bool,
+    ) -> OperationResult:
+        self.calls.append(("confirm_operator_joint_lock", str(operator_confirmed)))
+        return OperationResult.success("operator lock confirmed")
+
     async def connect_device(self, name: str) -> OperationResult:
         self.calls.append(("connect_device", name))
         return OperationResult.success(f"{name} connected")
@@ -229,6 +236,19 @@ def _dispatcher(
         history=CommandHistory(),
         event_sink=event_sink,
     )
+
+
+@pytest.mark.asyncio
+async def test_go2_confirm_lock_requires_exact_phrase_and_forwards_confirmation(
+    app_config: AppConfig,
+) -> None:
+    manager = _ManagerStub(app_config, state=SystemState.GO2_JOINT_LOCK_WAIT)
+    dispatcher = _dispatcher(manager, responses=("CONFIRM_GO2_JOINT_LOCK",))
+
+    outcome = await dispatcher.dispatch("go2 confirm-lock", render=False)
+
+    assert outcome.result.status is CommandStatus.SUCCESS
+    assert manager.calls == [("confirm_operator_joint_lock", "True")]
 
 
 @pytest.mark.asyncio

@@ -46,6 +46,9 @@ class Go2BridgeStub:
     async def request_flight_pose(self) -> bool:
         raise UnsupportedPhaseOperation(_PHASE_MESSAGE)
 
+    async def finalize_operator_joint_lock(self) -> bool:
+        raise UnsupportedPhaseOperation(_PHASE_MESSAGE)
+
     async def request_landing_pose(self) -> bool:
         raise UnsupportedPhaseOperation(_PHASE_MESSAGE)
 

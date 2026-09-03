@@ -115,6 +115,8 @@ class SystemManager:
         self._last_landing_command = LandingCommand(timestamp=now)
         self._last_landing_update: Optional[float] = None
         self._next_landing_update_at: Optional[float] = None
+        self._airborne_since: Optional[float] = None
+        self._airborne_confirmed = False
         self._touchdown_since: Optional[float] = None
         self._touchdown_height_reference: Optional[float] = None
         self._landing_contact_since: Optional[float] = None
@@ -135,6 +137,9 @@ class SystemManager:
         self._manual_last_direction: Optional[str] = None
         self._manual_motion_started = False
         self._go2_joint_lock_deadline: Optional[float] = None
+        self._go2_joint_lock_entered_at: Optional[float] = None
+        self._go2_joint_lock_unsafe_since: Optional[float] = None
+        self._operator_joint_lock_confirmed = False
         self._started = False
 
     @property
@@ -171,11 +176,36 @@ class SystemManager:
         )
 
     async def _on_state_transition(self, record: TransitionRecord) -> None:
+        if record.new_state in (
+            SystemState.BOOT_SAFE,
+            SystemState.MANUAL_POSITIONING,
+            SystemState.WALK,
+            SystemState.GO2_JOINT_LOCK_WAIT,
+            SystemState.LANDING_COMPLIANT,
+            SystemState.FAULT,
+            SystemState.EMERGENCY_STOP,
+        ):
+            self._operator_joint_lock_confirmed = False
+
         if (
             record.previous_state is SystemState.FLIGHT_READY
             and record.new_state is not SystemState.FLIGHT_READY
         ):
             await self._revoke_ground_arm_authorization(f"state changed to {record.new_state.name}")
+
+        if (
+            record.previous_state is SystemState.FLIGHT_READY
+            and record.new_state is SystemState.FLIGHT_MANUAL
+        ):
+            self._reset_touchdown_cycle()
+        elif record.new_state in (
+            SystemState.BOOT_SAFE,
+            SystemState.WALK,
+            SystemState.FLIGHT_READY,
+            SystemState.FAULT,
+            SystemState.EMERGENCY_STOP,
+        ):
+            self._reset_touchdown_cycle()
 
     async def start(self) -> OperationResult:
         """Start services but leave every device disconnected in BOOT_SAFE."""
@@ -406,6 +436,18 @@ class SystemManager:
         ground_arm_authorization_expires_at = (
             self._ground_arm_authorization_expires_at if ground_arm_authorized else None
         )
+        if not go2.connected:
+            self._operator_joint_lock_confirmed = False
+        joint_lock_confirmed = go2.connected and (
+            go2.joints_locked or self._operator_joint_lock_confirmed
+        )
+        joint_lock_source = (
+            "telemetry"
+            if go2.connected and go2.joints_locked
+            else "operator"
+            if go2.connected and self._operator_joint_lock_confirmed
+            else "none"
+        )
         self._snapshot = SystemSnapshot(
             timestamp=now,
             state=self.state,
@@ -420,6 +462,8 @@ class SystemManager:
             autoland_active=self._autoland_active,
             external_setpoint_active=self._setpoint_active,
             maintenance_mode=self._maintenance_mode,
+            joint_lock_confirmed=joint_lock_confirmed,
+            joint_lock_source=joint_lock_source,
             ground_arm_authorized=ground_arm_authorized,
             ground_arm_authorization_expires_at=ground_arm_authorization_expires_at,
             active_fault_codes=tuple(sorted(self._active_violations)),
@@ -764,6 +808,8 @@ class SystemManager:
             SystemState.BOOT_SAFE,
             SystemState.WALK,
             SystemState.FLIGHT_READY,
+            SystemState.TOUCHDOWN_VERIFY,
+            SystemState.LANDING_COMPLIANT,
         }:
             return OperationResult.failure(
                 "INVALID_STATE",
@@ -771,6 +817,20 @@ class SystemManager:
             )
         try:
             await self.refresh_snapshot()
+            entry_state = self.state
+            if entry_state is SystemState.LANDING_COMPLIANT:
+                settled = self._landing_compliance_settle_result()
+                if not settled.ok:
+                    return settled
+                hold = self._landing_compliance_hold_result()
+                if not hold.ok:
+                    return hold
+                relock = await self._finish_landing_compliance(
+                    "operator requested post-touchdown manual WALK positioning"
+                )
+                if not relock.ok or self.state is not SystemState.FLIGHT_READY:
+                    return relock
+                await self.refresh_snapshot()
             if self._snapshot.go2.connected and not await self._go2.request_stop():
                 return OperationResult.failure(
                     "GO2_STOP_REJECTED",
@@ -791,9 +851,18 @@ class SystemManager:
             await self.refresh_snapshot()
             self._emit("F446_MANUAL_POSITIONING_ENTERED")
             return OperationResult.success(
-                "Manual positioning active; use mf/mr or limf/limr, stop, then confirm walk/flight",
+                (
+                    "Manual positioning active; use mf/mr or limf/limr, ms, then "
+                    "mark and confirm the observed walk/flight endpoint"
+                ),
                 code="F446_MANUAL_POSITIONING_ACTIVE",
                 data={
+                    "entry_state": entry_state.name,
+                    "post_touchdown_recovery": entry_state
+                    in {
+                        SystemState.TOUCHDOWN_VERIFY,
+                        SystemState.LANDING_COMPLIANT,
+                    },
                     "manual_timeout_s": self.config.f446.transform_timeout_s,
                     "current_reporting": "automatic while duty is nonzero",
                 },
@@ -1161,9 +1230,7 @@ class SystemManager:
         self._operator_confirmed_configuration = target
         await self.refresh_snapshot()
         target_state = (
-            SystemState.WALK
-            if target is Configuration.WALK
-            else SystemState.GO2_JOINT_LOCK_WAIT
+            SystemState.WALK if target is Configuration.WALK else SystemState.GO2_JOINT_LOCK_WAIT
         )
         try:
             await self._state_machine.transition_to(
@@ -1213,9 +1280,7 @@ class SystemManager:
         required_direction = self.config.f446.direction_for(target.value)
         expected_state = self.config.f446.expected_state_for(target.value)
         opposite_target = (
-            Configuration.FLIGHT.value
-            if target is Configuration.WALK
-            else Configuration.WALK.value
+            Configuration.FLIGHT.value if target is Configuration.WALK else Configuration.WALK.value
         )
         opposite = self.config.f446.expected_state_for(opposite_target)
         if self._snapshot.f446.state is opposite:
@@ -1741,7 +1806,9 @@ class SystemManager:
             )
             await self.refresh_snapshot()
 
-        violations = tuple(self._safety_monitor.evaluate(self._snapshot))
+        violations = self._filter_go2_joint_lock_wait_violations(
+            tuple(self._safety_monitor.evaluate(self._snapshot))
+        )
         self._update_violations(violations)
         blocking = [
             item
@@ -2228,7 +2295,16 @@ class SystemManager:
             return {"f446": f446}
 
         if name == "go2 status":
-            return {"go2": go2}
+            return {
+                "go2": go2,
+                "joint_lock_telemetry": self._snapshot.go2.joints_locked,
+                "joint_lock_confirmed": self._snapshot.joint_lock_confirmed,
+                "joint_lock_source": self._snapshot.joint_lock_source,
+                "joint_lock_state_codes": list(self.config.go2.joint_lock_state_codes),
+                "accepted_state_codes": list(self.config.go2.accepted_state_codes),
+            }
+        if name == "touchdown status":
+            return self._touchdown_report()
         if name == "landing compliance":
             return self._landing_compliance_report()
         if name == "go2 motion":
@@ -2306,17 +2382,37 @@ class SystemManager:
 
         if name == "transform status":
             joint_lock_deadline = self._go2_joint_lock_deadline
+            now = self._clock.monotonic()
             joint_lock_remaining_s = (
                 0.0
                 if joint_lock_deadline is None
-                else max(0.0, joint_lock_deadline - self._clock.monotonic())
+                else max(0.0, joint_lock_deadline - now)
+            )
+            joint_lock_grace_remaining_s = (
+                0.0
+                if self._go2_joint_lock_entered_at is None
+                else max(
+                    0.0,
+                    self.config.go2.joint_lock_transition_grace_s
+                    - (now - self._go2_joint_lock_entered_at),
+                )
+            )
+            joint_lock_unsafe_observed_s = (
+                0.0
+                if self._go2_joint_lock_unsafe_since is None
+                else max(0.0, now - self._go2_joint_lock_unsafe_since)
             )
             return {
                 "system_state": self.state.name,
                 "configuration": self._snapshot.configuration.value,
                 "go2_mode": self._snapshot.go2.locomotion_mode,
                 "go2_joints_locked": self._snapshot.go2.joints_locked,
+                "joint_lock_confirmed": self._snapshot.joint_lock_confirmed,
+                "joint_lock_source": self._snapshot.joint_lock_source,
+                "joint_lock_state_codes": list(self.config.go2.joint_lock_state_codes),
                 "joint_lock_operator_remaining_s": joint_lock_remaining_s,
+                "joint_lock_transition_grace_remaining_s": joint_lock_grace_remaining_s,
+                "joint_lock_unsafe_observed_s": joint_lock_unsafe_observed_s,
                 "operator_marked_endpoint": (
                     None
                     if self._manual_marked_configuration is None
@@ -2421,6 +2517,16 @@ class SystemManager:
             "checks": checks,
         }
 
+    def _reset_touchdown_candidate(self) -> None:
+        self._touchdown_since = None
+        self._touchdown_height_reference = None
+
+    def _reset_touchdown_cycle(self) -> None:
+        self._airborne_since = None
+        self._airborne_confirmed = False
+        self._touchdown_confirmed = False
+        self._reset_touchdown_candidate()
+
     def _esc_telemetry_confirms_touchdown(self) -> bool:
         return assess_esc_telemetry(
             self._snapshot,
@@ -2428,30 +2534,110 @@ class SystemManager:
             maximum_abs_rpm=self.config.safety.touchdown_max_esc_rpm,
         ).safe
 
-    async def _check_touchdown(self) -> None:
+    def _airborne_sample_is_valid(self) -> bool:
         status = self._snapshot.pixhawk
-        height = status.relative_altitude_m
+        return (
+            status.connected
+            and timestamp_is_fresh(
+                self._clock.monotonic(),
+                status.heartbeat_timestamp,
+                self.config.safety.pixhawk_timeout_s,
+            )
+            and status.armed
+            and not status.landed
+        )
+
+    def _update_airborne_confirmation(self, now: float) -> None:
+        if self._airborne_confirmed:
+            return
+        if not self._airborne_sample_is_valid():
+            self._airborne_since = None
+            self._reset_touchdown_candidate()
+            return
+        if self._airborne_since is None:
+            self._airborne_since = now
+            return
+        if now - self._airborne_since < self.config.safety.airborne_confirm_s:
+            return
+        self._airborne_confirmed = True
+        self._reset_touchdown_candidate()
+        self._emit("AIRBORNE_CONFIRMED")
+
+    def _touchdown_height(self) -> float:
+        height = self._snapshot.pixhawk.relative_altitude_m
         if (
             self.state is SystemState.AUTO_LANDING
             and self._snapshot.landing_estimate.height_m is not None
         ):
             height = self._snapshot.landing_estimate.height_m
-        touchdown = (
-            status.landed
-            and math.isfinite(height)
-            and math.isfinite(status.vertical_velocity_mps)
-            and math.isfinite(status.roll_rad)
-            and math.isfinite(status.pitch_rad)
-            and abs(status.vertical_velocity_mps)
-            <= self.config.safety.touchdown_max_vertical_speed_mps
-            and abs(status.roll_rad) <= self.config.safety.touchdown_max_tilt_rad
-            and abs(status.pitch_rad) <= self.config.safety.touchdown_max_tilt_rad
-            and self._esc_telemetry_confirms_touchdown()
-        )
+        return height
+
+    def _touchdown_conditions(self, height: float) -> Mapping[str, bool]:
+        status = self._snapshot.pixhawk
+        return {
+            "pixhawk_landed": status.landed,
+            "height_finite": math.isfinite(height),
+            "vertical_velocity_finite": math.isfinite(status.vertical_velocity_mps),
+            "roll_finite": math.isfinite(status.roll_rad),
+            "pitch_finite": math.isfinite(status.pitch_rad),
+            "vertical_speed_safe": (
+                math.isfinite(status.vertical_velocity_mps)
+                and abs(status.vertical_velocity_mps)
+                <= self.config.safety.touchdown_max_vertical_speed_mps
+            ),
+            "roll_safe": (
+                math.isfinite(status.roll_rad)
+                and abs(status.roll_rad) <= self.config.safety.touchdown_max_tilt_rad
+            ),
+            "pitch_safe": (
+                math.isfinite(status.pitch_rad)
+                and abs(status.pitch_rad) <= self.config.safety.touchdown_max_tilt_rad
+            ),
+            "esc_rpm_safe": self._esc_telemetry_confirms_touchdown(),
+        }
+
+    def _touchdown_report(self) -> Mapping[str, Any]:
         now = self._clock.monotonic()
+        height = self._touchdown_height()
+        airborne_elapsed = (
+            0.0 if self._airborne_since is None else max(0.0, now - self._airborne_since)
+        )
+        touchdown_elapsed = (
+            0.0 if self._touchdown_since is None else max(0.0, now - self._touchdown_since)
+        )
+        height_delta = (
+            None
+            if self._touchdown_height_reference is None or not math.isfinite(height)
+            else abs(height - self._touchdown_height_reference)
+        )
+        return {
+            "state": self.state.name,
+            "airborne_confirmed": self._airborne_confirmed,
+            "airborne_candidate_elapsed_s": airborne_elapsed,
+            "airborne_confirm_s": self.config.safety.airborne_confirm_s,
+            "touchdown_detection_enabled": self._airborne_confirmed,
+            "touchdown_candidate_elapsed_s": touchdown_elapsed,
+            "touchdown_confirm_s": self.config.safety.touchdown_confirm_s,
+            "touchdown_confirmed": self._touchdown_confirmed,
+            "height_m": height,
+            "height_reference_m": self._touchdown_height_reference,
+            "height_delta_m": height_delta,
+            "maximum_height_delta_m": self.config.safety.touchdown_max_height_delta_m,
+            "pixhawk_armed": self._snapshot.pixhawk.armed,
+            "pixhawk_landed": self._snapshot.pixhawk.landed,
+            "conditions": dict(self._touchdown_conditions(height)),
+        }
+
+    async def _check_touchdown(self) -> None:
+        now = self._clock.monotonic()
+        self._update_airborne_confirmation(now)
+        if not self._airborne_confirmed:
+            return
+
+        height = self._touchdown_height()
+        touchdown = all(self._touchdown_conditions(height).values())
         if not touchdown:
-            self._touchdown_since = None
-            self._touchdown_height_reference = None
+            self._reset_touchdown_candidate()
             return
         if self._touchdown_height_reference is None:
             self._touchdown_height_reference = height
@@ -2476,7 +2662,7 @@ class SystemManager:
         await self.refresh_snapshot()
         await self._state_machine.transition_to(
             SystemState.TOUCHDOWN_VERIFY,
-            reason="touchdown conditions held for configured duration",
+            reason="touchdown conditions held after confirmed airborne phase",
             snapshot=self._snapshot,
         )
         self._emit("TOUCHDOWN_CONFIRMED")
@@ -2515,10 +2701,10 @@ class SystemManager:
             )
         if snapshot.f446.duty != 0 or snapshot.f446.faulted:
             return OperationResult.failure("F446_NOT_SAFE", "F446 must be stopped and fault-free")
-        if not snapshot.go2.joints_locked:
+        if not snapshot.joint_lock_confirmed:
             return OperationResult.failure(
                 "GO2_JOINT_LOCK_REQUIRED",
-                "Go2 must remain JOINT_LOCKED until compliance entry",
+                "Go2 joint lock must remain confirmed until compliance entry",
             )
         if not snapshot.go2.stable or snapshot.go2.moving or snapshot.go2.controller_active:
             return OperationResult.failure(
@@ -2677,6 +2863,8 @@ class SystemManager:
             "maximum_esc_rpm": self._snapshot.pixhawk.maximum_esc_rpm,
             "go2_mode": self._snapshot.go2.locomotion_mode,
             "joints_locked": self._snapshot.go2.joints_locked,
+            "joint_lock_confirmed": self._snapshot.joint_lock_confirmed,
+            "joint_lock_source": self._snapshot.joint_lock_source,
         }
 
     async def _fault(
@@ -2829,8 +3017,10 @@ class SystemManager:
         return OperationResult.success(
             (
                 "FLIGHT endpoint is verified and F446 is stopped. In the Unitree phone app, "
-                "select Joint Lock (mode 6). AeroGo2 will detect it and enter FLIGHT_READY "
-                f"automatically; {remaining:.1f}s remain. Do not command Go2 locomotion."
+                "select Joint Lock. AeroGo2 accepts mode 6 or the configured Lock On "
+                "state code (1002 by default), then waits for the filtered motion to settle. "
+                "If neither is reported, visually verify Lock On, then run "
+                f"go2 confirm-lock; {remaining:.1f}s remain. Do not command Go2 locomotion."
             ),
             code="GO2_JOINT_LOCK_OPERATOR_REQUIRED",
             data={
@@ -2838,11 +3028,127 @@ class SystemManager:
                 "current_mode": self._snapshot.go2.locomotion_mode,
                 "required_mode": "JOINT_LOCK",
                 "required_mode_code": 6,
+                "accepted_lock_state_codes": list(self.config.go2.joint_lock_state_codes),
+                "manual_fallback_command": "go2 confirm-lock",
+                "manual_fallback_phrase": "CONFIRM_GO2_JOINT_LOCK",
                 "remaining_s": remaining,
                 "f446_duty": self._snapshot.f446.duty,
                 "automatic_transition": "FLIGHT_READY",
             },
         )
+
+    async def confirm_operator_joint_lock(
+        self,
+        operator_confirmed: bool = False,
+    ) -> OperationResult:
+        """Accept a guarded operator assertion without falsifying Go2 telemetry."""
+
+        if not self._control_writes_allowed():
+            return OperationResult.failure(
+                "HARDWARE_WRITE_DISABLED",
+                "Operator joint-lock confirmation requires an unlocked hardware process",
+            )
+        if not operator_confirmed:
+            return OperationResult.failure(
+                "CONFIRMATION_REQUIRED",
+                "Exact confirmation CONFIRM_GO2_JOINT_LOCK is required",
+            )
+        if self.state is SystemState.FLIGHT_READY:
+            await self.refresh_snapshot()
+            if self._snapshot.joint_lock_confirmed:
+                return OperationResult.success(
+                    "Joint Lock was already confirmed and FLIGHT_READY is active.",
+                    code="GO2_JOINT_LOCK_ALREADY_CONFIRMED",
+                    data={
+                        "state": self.state.name,
+                        "joint_lock_telemetry": self._snapshot.go2.joints_locked,
+                        "joint_lock_confirmed": self._snapshot.joint_lock_confirmed,
+                        "joint_lock_source": self._snapshot.joint_lock_source,
+                    },
+                )
+            return OperationResult.failure(
+                "GO2_JOINT_LOCK_REQUIRED",
+                "FLIGHT_READY lost its joint-lock confirmation; supervised recovery is required",
+            )
+        if self.state is not SystemState.GO2_JOINT_LOCK_WAIT:
+            return OperationResult.failure(
+                "INVALID_STATE",
+                "Operator joint-lock confirmation requires GO2_JOINT_LOCK_WAIT",
+            )
+
+        await self.refresh_snapshot()
+        if self._snapshot.go2.joints_locked:
+            return await self._advance_go2_joint_lock_wait()
+        if self._snapshot.go2.fault_code not in self.config.go2.accepted_state_codes:
+            return OperationResult.failure(
+                "GO2_STATE_CODE_NOT_ACCEPTED",
+                (
+                    f"Go2 error_code={self._snapshot.go2.fault_code} is not in "
+                    f"go2.accepted_state_codes={list(self.config.go2.accepted_state_codes)}"
+                ),
+            )
+
+        candidate = replace(
+            self._snapshot,
+            joint_lock_confirmed=True,
+            joint_lock_source="operator",
+        )
+        interlock = self._landing_interlocks.can_enter_flight_ready(
+            candidate,
+            require_flight_enable_low=True,
+        )
+        if not interlock.permitted:
+            return OperationResult.failure(
+                interlock.codes[0] if interlock.codes else "GO2_OPERATOR_LOCK_REJECTED",
+                "; ".join(interlock.messages) or "Operator lock confirmation checks failed",
+                data={
+                    "checks": [
+                        {"code": code, "message": message, "passed": False}
+                        for code, message in zip(interlock.codes, interlock.messages)
+                    ]
+                },
+            )
+
+        try:
+            if not await self._go2.finalize_operator_joint_lock():
+                raise BridgeError("Go2 rejected joystick disable after operator lock confirmation")
+            self._operator_joint_lock_confirmed = True
+            await self.refresh_snapshot()
+            await self._state_machine.transition_to(
+                SystemState.FLIGHT_READY,
+                reason=(
+                    "operator confirmed phone-app joint lock; joystick input disabled; "
+                    "raw SportModeState retained"
+                ),
+                snapshot=self._snapshot,
+            )
+            self._go2_joint_lock_deadline = None
+            self._emit(
+                "GO2_JOINT_LOCK_OPERATOR_CONFIRMED",
+                raw_mode=self._snapshot.go2.locomotion_mode,
+                raw_joints_locked=self._snapshot.go2.joints_locked,
+            )
+            self._emit("FLIGHT_READY")
+            await self.refresh_snapshot()
+            return OperationResult.success(
+                (
+                    "FLIGHT_READY entered using explicit operator joint-lock confirmation. "
+                    "Raw joints_locked remains unchanged and source=operator."
+                ),
+                code="FLIGHT_READY_OPERATOR_LOCK",
+                data={
+                    "state": self.state.name,
+                    "joint_lock_telemetry": self._snapshot.go2.joints_locked,
+                    "joint_lock_confirmed": self._snapshot.joint_lock_confirmed,
+                    "joint_lock_source": self._snapshot.joint_lock_source,
+                },
+            )
+        except (AeroGo2Error, OSError, RuntimeError, ValueError) as exc:
+            self._operator_joint_lock_confirmed = False
+            await self.refresh_snapshot()
+            message = str(exc)
+            await self._fault("GO2_OPERATOR_LOCK_FINALIZE_FAILED", message)
+            return OperationResult.failure("GO2_OPERATOR_LOCK_FINALIZE_FAILED", message)
 
     async def _advance_go2_joint_lock_wait(
         self,
@@ -2864,16 +3170,32 @@ class SystemManager:
                 return OperationResult.failure("GO2_JOINT_LOCK_FAILED", message)
             await self.refresh_snapshot()
 
+        deadline = self._go2_joint_lock_deadline
+        if deadline is not None and self._clock.monotonic() >= deadline:
+            message = (
+                "Go2 did not report and settle a valid joint-lock signal within "
+                f"{self.config.go2.joint_lock_operator_timeout_s:.1f}s"
+            )
+            await self._fault("GO2_JOINT_LOCK_OPERATOR_TIMEOUT", message)
+            return OperationResult.failure("GO2_JOINT_LOCK_OPERATOR_TIMEOUT", message)
+
         if not self._snapshot.go2.joints_locked:
-            deadline = self._go2_joint_lock_deadline
-            if deadline is not None and self._clock.monotonic() >= deadline:
-                message = (
-                    "Go2 did not report mode=6 JOINT_LOCK within "
-                    f"{self.config.go2.joint_lock_operator_timeout_s:.1f}s"
-                )
-                await self._fault("GO2_JOINT_LOCK_OPERATOR_TIMEOUT", message)
-                return OperationResult.failure("GO2_JOINT_LOCK_OPERATOR_TIMEOUT", message)
             return self._joint_lock_operator_required_result()
+
+        if not self._go2_joint_lock_is_settled():
+            return OperationResult.success(
+                (
+                    "Joint Lock signal detected; waiting for Go2 motion telemetry to settle "
+                    "before FLIGHT_READY."
+                ),
+                code="GO2_JOINT_LOCK_SETTLING",
+                data={
+                    "fault_code": self._snapshot.go2.fault_code,
+                    "mode": self._snapshot.go2.locomotion_mode,
+                    "velocity_mps": self._snapshot.go2.velocity_mps,
+                    "body_velocity": list(self._snapshot.go2.body_velocity),
+                },
+            )
 
         try:
             # The operator/app already selected mode 6. This call only disables
@@ -2882,12 +3204,10 @@ class SystemManager:
                 raise BridgeError("GO2_JOINT_LOCK_FAILED: Go2 rejected finalization")
             await self.refresh_snapshot()
             if not self._snapshot.go2.joints_locked:
-                raise BridgeError(
-                    "GO2_JOINT_LOCK_UNCONFIRMED: Go2 lost mode=6 during finalization"
-                )
+                raise BridgeError("GO2_JOINT_LOCK_UNCONFIRMED: Go2 lost mode=6 during finalization")
             await self._state_machine.transition_to(
                 SystemState.FLIGHT_READY,
-                reason="operator-selected Go2 mode=6 verified and joystick input disabled",
+                reason="Go2 joint-lock telemetry verified and joystick input disabled",
                 snapshot=self._snapshot,
             )
             self._go2_joint_lock_deadline = None
@@ -2895,7 +3215,7 @@ class SystemManager:
             self._emit("FLIGHT_READY")
             await self.refresh_snapshot()
             return OperationResult.success(
-                "FLIGHT verified with Go2 mode=6 JOINT_LOCK; only RadioMaster may arm",
+                "FLIGHT verified with Go2 joint-lock telemetry; only RadioMaster may arm",
                 code="FLIGHT_READY",
             )
         except (AeroGo2Error, OSError, RuntimeError, ValueError) as exc:
@@ -2954,6 +3274,63 @@ class SystemManager:
                 f"({max(0.0, elapsed):.3f}s observed)",
             )
         return OperationResult.success("Go2 stationary dwell confirmed")
+
+    def _go2_joint_lock_is_settled(self) -> bool:
+        status = self._snapshot.go2
+        components = status.body_velocity
+        limit = self.config.safety.stationary_velocity_mps
+        return (
+            status.connected
+            and status.joints_locked
+            and math.isfinite(status.velocity_mps)
+            and abs(status.velocity_mps) < limit
+            and len(components) == 3
+            and all(math.isfinite(value) and abs(value) < limit for value in components)
+            and status.stable
+            and not status.moving
+            and not status.controller_active
+        )
+
+    def _filter_go2_joint_lock_wait_violations(
+        self,
+        violations: Tuple[SafetyViolation, ...],
+    ) -> Tuple[SafetyViolation, ...]:
+        """Debounce only the phone Lock On posture transient.
+
+        Device freshness, RC, ESC, Pixhawk and F446 violations are never filtered.
+        A locomotion/unsafe-speed violation becomes blocking after the configured
+        initial grace and continuous confirmation windows.
+        """
+
+        if self.state is not SystemState.GO2_JOINT_LOCK_WAIT:
+            self._go2_joint_lock_unsafe_since = None
+            return violations
+
+        unsafe_code = "GO2_UNSAFE_DURING_JOINT_LOCK"
+        if not any(item.code == unsafe_code for item in violations):
+            self._go2_joint_lock_unsafe_since = None
+            return violations
+
+        now = self._clock.monotonic()
+        entered_at = self._go2_joint_lock_entered_at
+        if entered_at is None:
+            entered_at = now
+            self._go2_joint_lock_entered_at = now
+
+        if now - entered_at < self.config.go2.joint_lock_transition_grace_s:
+            self._go2_joint_lock_unsafe_since = None
+            return tuple(item for item in violations if item.code != unsafe_code)
+
+        if self._go2_joint_lock_unsafe_since is None:
+            self._go2_joint_lock_unsafe_since = now
+            return tuple(item for item in violations if item.code != unsafe_code)
+
+        if (
+            now - self._go2_joint_lock_unsafe_since
+            < self.config.go2.joint_lock_unsafe_confirm_s
+        ):
+            return tuple(item for item in violations if item.code != unsafe_code)
+        return violations
 
     def _f446_current_margin_is_clear(
         self,
@@ -3068,6 +3445,8 @@ class SystemManager:
         self._manual_last_direction = None
         self._manual_motion_started = False
         self._go2_joint_lock_deadline = None
+        self._go2_joint_lock_entered_at = None
+        self._go2_joint_lock_unsafe_since = None
 
     async def _enter_manual_positioning(self, snapshot: SystemSnapshot) -> None:
         self._maintenance_mode = True
@@ -3082,9 +3461,10 @@ class SystemManager:
         self._manual_motion_deadline = None
         self._manual_last_direction = None
         self._manual_motion_started = False
-        self._go2_joint_lock_deadline = (
-            self._clock.monotonic() + self.config.go2.joint_lock_operator_timeout_s
-        )
+        now = self._clock.monotonic()
+        self._go2_joint_lock_deadline = now + self.config.go2.joint_lock_operator_timeout_s
+        self._go2_joint_lock_entered_at = now
+        self._go2_joint_lock_unsafe_since = None
 
     async def _leave_manual_positioning(self, snapshot: SystemSnapshot) -> None:
         self._maintenance_mode = False
@@ -3093,6 +3473,8 @@ class SystemManager:
         self._manual_last_direction = None
         self._manual_motion_started = False
         self._go2_joint_lock_deadline = None
+        self._go2_joint_lock_entered_at = None
+        self._go2_joint_lock_unsafe_since = None
 
     async def _enter_landing_compliant(self, snapshot: SystemSnapshot) -> None:
         if not self._control_writes_allowed():
@@ -3172,6 +3554,8 @@ class SystemManager:
         self._manual_last_direction = None
         self._manual_motion_started = False
         self._go2_joint_lock_deadline = None
+        self._go2_joint_lock_entered_at = None
+        self._go2_joint_lock_unsafe_since = None
         if self._suppress_fault_entry_stop:
             return
         await self._stop_setpoints()
@@ -3182,6 +3566,8 @@ class SystemManager:
     async def _enter_emergency_stop(self, snapshot: SystemSnapshot) -> None:
         self._manual_marked_configuration = None
         self._go2_joint_lock_deadline = None
+        self._go2_joint_lock_entered_at = None
+        self._go2_joint_lock_unsafe_since = None
         result = await self.stop_supervised()
         if not result.ok:
             raise BridgeError(f"{result.code}: {result.message}")

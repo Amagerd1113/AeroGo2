@@ -1,6 +1,6 @@
 # F446 变形电机与 HW-039 堵转阈值标定
 
-本指南适用于 AeroGo2 0.3.9。所有终端命令均为单行。`ms` 只停止 F446 变形电机；`s`/`stop` 仍是全系统受控停止。
+本指南适用于 AeroGo2 0.3.12。所有终端命令均为单行。`ms` 只停止 F446 变形电机；`s`/`stop` 仍是全系统受控停止。
 
 ## 1. 安全准备
 
@@ -183,3 +183,31 @@ transform home-walk
 ```
 
 只有收到 `F446_CONFIGURATION_VERIFIED`、状态为 `LIMIT_REACHED_REV` 且 `duty=0`，才可人工确认后进入下一状态。15 秒内未到位会停止并拒绝状态切换，不能通过 `clear-fault` 把未知机械位置当作已到位。
+
+## 7. 落地后人工回 WALK 后门
+
+系统已经进入 `TOUCHDOWN_VERIFY` 后，先用 RadioMaster 正常 Disarm，并确认四个 X8 都在线、健康且 RPM 精确为 0。然后执行：
+
+```text
+motor maintenance enter
+```
+
+完成 `y` 和 `ENTER_F446_MANUAL` 两阶段确认后，可以使用 `motor mr DUTY` 或 `motor limr DUTY` 朝已验证的 WALK 方向移动，随时用 `ms` 只停止变形电机。到达操作者确认的 WALK 端点后，依次执行：
+
+```text
+motor endpoint walk
+```
+
+```text
+MARK_CURRENT_ENDPOINT_WALK
+```
+
+```text
+motor confirm walk
+```
+
+```text
+CONFIRM_MANUAL_WALK
+```
+
+只有最终端点复核、Go2 静止、电流保持、F446 duty=0 以及全部形态互锁仍通过，系统才进入 `WALK`。若当前是 `LANDING_COMPLIANT`，第一次 `motor maintenance enter` 只会要求恢复手机 Lock On/关节锁定；完成自动 mode 6 或 `go2 confirm-lock` 后回到 `FLIGHT_READY`，再执行一次 `motor maintenance enter` 才会进入人工定位。

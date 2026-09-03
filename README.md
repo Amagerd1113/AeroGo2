@@ -154,7 +154,9 @@ await state_machine.transition_to(
 
 完整状态、所有合法下一状态、每条激活条件和真机/DRY-RUN 边界见
 [`docs/STATE_TRANSITIONS_ZH.md`](docs/STATE_TRANSITIONS_ZH.md)。`FLIGHT_READY -> FLIGHT_MANUAL`
-采用一次性两把钥匙：AeroGo2 Shell `flight authorize` 成功后，30 秒内再由 RadioMaster CH5 LOW->HIGH 请求正常 Arm。
+采用一次性两把钥匙：AeroGo2 Shell `flight authorize` 成功后，30 秒内再由 RadioMaster CH5 LOW->HIGH 请求正常 Arm。进入 `FLIGHT_MANUAL` 后，触地检测仍保持禁用，直到 Pixhawk 新鲜遥测连续 1.0 秒证明 `armed=true` 且 `landed=false`；用 `touchdown status` 查看本架次的离地锁存和触地确认进度。Go2 原始 `mode=6` 或本机实测的 `mode=0,error_code=1002` 都会自动确认关节锁。手机切换 Lock On 的瞬时姿态扰动使用可调的 2.0 秒初始宽限和 0.5 秒持续越界确认滤波；必须重新静止后才进入 `FLIGHT_READY`。若固件两种锁定信号都不回报，仍可在 `GO2_JOINT_LOCK_WAIT` 中使用守卫式 `go2 confirm-lock`。
+
+0.3.12 允许在确认触地后从 `TOUCHDOWN_VERIFY` 进入受保护的 `MANUAL_POSITIONING`，由操作者手动把 F446 调到 WALK 端点，再通过 `motor endpoint walk` 与 `motor confirm walk` 完成验证。若已经进入腿部柔顺的 `LANDING_COMPLIANT`，系统会先恢复关节锁定，绝不在柔顺姿态下直接移动变形机构。
 
 规格未定义的恢复边（例如从飞行中的任意 FAULT 直接变形）不会被推测性开放。
 
@@ -169,12 +171,13 @@ await state_machine.transition_to(
 7. Pixhawk 状态过期时禁止新的变形动作。
 8. RC failsafe 立即把 CH5/CH9/CH10 高层请求恢复为安全值。
 9. 自动降落失效会停止外部 setpoint，但绝不自动停旋翼或 disarm。
-10. RadioMaster 人工接管优先于自动降落。
-11. 启动固定进入 `BOOT_SAFE`，不恢复运动。
-12. 构型未知时同时禁止飞行许可和步行许可。
-13. F446 手动命令在普通模式不可用；Phase 1 中维护模式本身也不可用。
-14. 终端不能绕过 `SystemManager` 直调硬件运动接口。
-15. Ubuntu 不实现飞行中电机急停。
+10. 只有连续确认实际离地后才启用本架次触地检测；地面 armed/landed 状态不能直接触发 `TOUCHDOWN_VERIFY`。
+11. RadioMaster 人工接管优先于自动降落。
+12. 启动固定进入 `BOOT_SAFE`，不恢复运动。
+13. 构型未知时同时禁止飞行许可和步行许可。
+14. F446 手动命令在普通模式不可用；Phase 1 中维护模式本身也不可用。
+15. 终端不能绕过 `SystemManager` 直调硬件运动接口。
+16. Ubuntu 不实现飞行中电机急停。
 
 `SafetyMonitor.evaluate(snapshot)` 是纯函数：它只返回违规项，由
 `SystemManager` 决定停止 setpoint、停止变形或进入 `FAULT`，Monitor 本身不
@@ -352,7 +355,7 @@ aerogo2 x8-spin \
   watch status|rc|f446|esc|faults
   rc | rc raw | rc mapping | rc check
   pixhawk status|messages|statustext|params
-  go2 status|motion|controller
+  go2 status|motion|controller|confirm-lock
   esc [1|2|3|4] | esc mapping | esc health
 
 构型与检查
@@ -360,7 +363,7 @@ aerogo2 x8-spin \
   audit [pixhawk|f446|rc|configuration]
   preflight [flight|transform-flight|transform-walk|autoland]
   check invariant|communication|sensors
-  flight status|enable-check|ready
+  flight status|enable-check|ready|auth-status|authorize|revoke
 
 F446
   motor status|current|parameters
@@ -501,8 +504,8 @@ mypy src/aerogo2
 pytest -q
 ```
 
-当前交付基线（2026-07-27）：Ruff format/check 通过，strict mypy 通过，
-完整测试套件 `595 passed`；六个规定 dry-run 场景均通过。
+当前交付基线（2026-09-02）：定向 Ruff check 通过，strict mypy 通过，
+完整测试套件 `627 passed`；六个规定 dry-run 场景均通过。
 
 测试覆盖：
 

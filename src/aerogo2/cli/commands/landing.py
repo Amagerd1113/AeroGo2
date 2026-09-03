@@ -11,6 +11,12 @@ def command_specs() -> Tuple[CommandSpec, ...]:
     return (
         readonly("autoland status", "Show automatic landing state", "landing", "query_controller"),
         readonly(
+            "touchdown status",
+            "Show airborne latch and touchdown confirmation progress",
+            "landing",
+            "query_controller",
+        ),
+        readonly(
             "landing compliance",
             "Show calibrated foot contact and landing compliance progress",
             "landing",

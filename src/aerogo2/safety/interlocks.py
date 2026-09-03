@@ -9,6 +9,7 @@ from aerogo2.common.config import AppConfig
 from aerogo2.common.enums import (
     AutoLandingRequest,
     Configuration,
+    F446State,
     SystemState,
 )
 from aerogo2.common.models import SystemSnapshot
@@ -93,10 +94,13 @@ class SafetyInterlocks:
             expected_state = self._config.f446.expected_walk_state
         else:
             expected_state = self._config.f446.expected_flight_state
-        if snapshot.f446.state is not expected_state:
+        if not self._f446_configuration_state_is_verified(snapshot, expected_state):
             reject(
                 "F446_CONFIGURATION_UNVERIFIED",
-                f"F446 state {snapshot.f446.state.value} does not prove {expected_current.value} configuration.",
+                (
+                    f"F446 state {snapshot.f446.state.value} does not prove "
+                    f"{expected_current.value} configuration by a limit or guarded operator mark."
+                ),
             )
 
         if target is Configuration.WALK:
@@ -124,7 +128,10 @@ class SafetyInterlocks:
         self._require_fresh_devices(snapshot, reject)
         if snapshot.configuration is not Configuration.WALK:
             reject("WALK_CONFIGURATION_UNVERIFIED", "WALK configuration is not verified.")
-        if snapshot.f446.state is not self._config.f446.expected_walk_state:
+        if not self._f446_configuration_state_is_verified(
+            snapshot,
+            self._config.f446.expected_walk_state,
+        ):
             reject("F446_WALK_STATE_MISMATCH", "F446 is not in the expected WALK state.")
         if snapshot.f446.duty != 0 or snapshot.f446.faulted:
             reject("F446_NOT_SAFE", "F446 must be stopped and fault-free.")
@@ -155,7 +162,10 @@ class SafetyInterlocks:
                 "FLIGHT_CONFIGURATION_UNVERIFIED",
                 "FLIGHT configuration is not verified.",
             )
-        if snapshot.f446.state is not self._config.f446.expected_flight_state:
+        if not self._f446_configuration_state_is_verified(
+            snapshot,
+            self._config.f446.expected_flight_state,
+        ):
             reject("F446_FLIGHT_STATE_MISMATCH", "F446 is not in the expected FLIGHT state.")
         if snapshot.f446.duty != 0 or snapshot.f446.faulted:
             reject("F446_NOT_SAFE", "F446 must be stopped and fault-free.")
@@ -186,10 +196,10 @@ class SafetyInterlocks:
             )
         if not self._go2_stationary(snapshot):
             reject("GO2_NOT_STATIONARY", "Go2 must remain stationary.")
-        if not snapshot.go2.joints_locked:
+        if not snapshot.joint_lock_confirmed:
             reject(
                 "GO2_JOINT_LOCK_REQUIRED",
-                "Go2 must authoritatively report JOINT_LOCK before flight enable.",
+                "Go2 joint lock must be confirmed by telemetry or guarded operator assertion.",
             )
         if snapshot.active_fault_codes:
             reject("ACTIVE_FAULTS", "Active faults prevent flight readiness.")
@@ -319,6 +329,20 @@ class SafetyInterlocks:
                 None if exact_zero else self._config.safety.maximum_safe_esc_rpm_for_transform
             ),
         ).safe
+
+    @staticmethod
+    def _f446_configuration_state_is_verified(
+        snapshot: SystemSnapshot,
+        expected_state: F446State,
+    ) -> bool:
+        if snapshot.f446.state is expected_state:
+            return True
+        return (
+            snapshot.configuration_source == "operator"
+            and snapshot.f446.state is F446State.IDLE
+            and snapshot.f446.duty == 0
+            and not snapshot.f446.faulted
+        )
 
     def _go2_stationary(self, snapshot: SystemSnapshot) -> bool:
         velocity_components = snapshot.go2.body_velocity

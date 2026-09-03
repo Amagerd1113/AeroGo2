@@ -1,10 +1,10 @@
 # AeroGo2 aarch64 Ubuntu 实机部署与调试
 
-> F446 �˹� `mr/mf`����� `s`���˹���λȷ�Ϻ� HW-039 �Զ���ת�ĵ�ǰ���̣��� [F446_MANUAL_POSITIONING_ZH.md](F446_MANUAL_POSITIONING_ZH.md) Ϊ׼��
+> F446 �˹� `mr/mf`����� `s`���˹���λȷ�Ϻ� HW-039 �Զ���ת�ĵ�ǰ���̣��� [F446_MANUAL_POSITIONING_ZH.md](F446_MANUAL_POSITIONING_ZH.md) Ϊ׼��
 
 本文用于 Unitree 机载 Ubuntu aarch64。实机链路包括：
 
-- Unitree SDK2：订阅 Go2 SportModeState，只调用高层 StopMove、BalanceStand 和 SwitchJoystick；手机端人工选择飞行锁定，且必须确认 mode=6 JOINT_LOCK。
+- Unitree SDK2：订阅 Go2 SportModeState，只调用高层 StopMove、BalanceStand 和 SwitchJoystick；手机端人工选择飞行锁定。`mode=6` 或本机实测的 `mode=0,error_code=1002` 都会自动确认；其他固件仍保留带完整互锁和精确口令的人工确认。
 - F446：异步串口读取文本协议，只用受过流和超时保护的 limf、limr；到位后再次核对限位状态和 duty=0。
 - Pixhawk：读取心跳、解锁、落地、RC、姿态和 4 路 ESC 遥测。
 - SystemManager：在 WALK 与 FLIGHT_READY 之间执行有安全守卫的形态切换。
@@ -101,7 +101,7 @@ transform flight
 TRANSFORM_TO_FLIGHT
 ~~~
 
-只有当前形态是 WALK、Go2 静止保持满足、RC 新鲜、Pixhawk 未解锁、ESC 在线且 RPM=0、F446 无故障且电流裕量满足时，才发送 limf 或 limr。目标限位与 duty=0 验证通过后进入 `GO2_JOINT_LOCK_WAIT`。此时在 Unitree 手机端选择“锁关节/Joint Lock”；Shell 检测到 mode=6 后自动进入 `FLIGHT_READY`。可用单行命令 `transform status` 查看当前模式和剩余等待时间。
+只有当前形态是 WALK、Go2 静止保持满足、RC 新鲜、Pixhawk 未解锁、ESC 在线且 RPM=0、F446 无故障且电流裕量满足时，才发送 limf 或 limr。目标限位与 duty=0 验证通过后进入 `GO2_JOINT_LOCK_WAIT`。此时先在 Unitree 手机端选择 Lock On；Shell 检测到 mode=6 或 `error_code=1002` 后，会等待姿态扰动滤波结束并重新静止，再自动进入 `FLIGHT_READY`。若固件两种信号都不回报，才使用 `go2 confirm-lock` 和精确口令 `CONFIRM_GO2_JOINT_LOCK`。可用 `transform status` 检查锁定来源和滤波计时。
 
 FLIGHT 到 WALK：先确认落地且未解锁，CH9 稳定为 WALK_REQUEST。
 
@@ -117,7 +117,7 @@ TRANSFORM_TO_WALK
 
 仅在 WALK 且 F446 确认 WALK 限位时允许 walk stop 与 walk stand。它们使用 Unitree SportClient 高层接口，不直接下发关节电机命令。
 
-Unitree 高层接口没有可证明进入 mode=6 的公开 JointLock 方法，`StandUp` 也不等于锁关节。0.3.9 因此等待操作者在手机端选择 mode=6；检测成功后才禁用摇杆输入并进入 `FLIGHT_READY`。模式 1→6 的小幅姿态调整不会再误触发变形运动故障；真正进入行走模式、速度越界或超时仍会 fail-closed。飞行中锁丢失会触发 `GO2_JOINT_LOCK_LOST`，但不会自动 Disarm。
+Unitree 高层接口没有可证明进入 mode=6 的公开 JointLock 方法，`StandUp` 也不等于锁关节。0.3.13 根据这台 Go2 的前后对照实测，把配置项 `joint_lock_state_codes: [1002]` 作为 Lock On 遥测证据；普通站立的 100 不会被识别为锁定。识别后软件调用 `SwitchJoystick(false)`，并持续监测连接、状态码和速度；若 1002 消失，关节锁确认也会丢失并触发既有保护。
 
 主状态机没有直接 arm/disarm API；`flight authorize` 只在完整互锁通过后开启 30 秒一次性许可，随后必须由 RadioMaster CH5 LOW->HIGH 触发 Pixhawk Lua 的普通受检 Arm。Lua 阻断 MAVLink Arm/force-arm 绕过，但保留正常 Disarm。完整条件见 `STATE_TRANSITIONS_ZH.md`。
 

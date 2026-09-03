@@ -45,6 +45,8 @@ STATE_ACTIONS: Final[Mapping[str, FrozenSet[SystemState]]] = MappingProxyType(
                 SystemState.BOOT_SAFE,
                 SystemState.WALK,
                 SystemState.FLIGHT_READY,
+                SystemState.TOUCHDOWN_VERIFY,
+                SystemState.LANDING_COMPLIANT,
             }
         ),
         "manual_exit": frozenset({SystemState.MANUAL_POSITIONING}),
@@ -76,6 +78,9 @@ STATE_ACTIONS: Final[Mapping[str, FrozenSet[SystemState]]] = MappingProxyType(
             }
         ),
         "walk_permit": frozenset({SystemState.WALK}),
+        "go2_confirm_lock": frozenset(
+            {SystemState.GO2_JOINT_LOCK_WAIT, SystemState.FLIGHT_READY}
+        ),
         "ground_arm_authorize": frozenset({SystemState.FLIGHT_READY}),
         "ground_arm_revoke": frozenset({SystemState.FLIGHT_READY}),
     }

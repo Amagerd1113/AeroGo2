@@ -105,12 +105,28 @@ class SafetyMonitor:
                 "Pixhawk armed without a live AeroGo2 shell authorization.",
                 "Stop supervised outputs; retain RadioMaster control and do not auto-disarm.",
             )
-        if snapshot.state in _FLIGHT_JOINT_LOCK_STATES and not snapshot.go2.joints_locked:
+        if snapshot.state in _FLIGHT_JOINT_LOCK_STATES and not snapshot.joint_lock_confirmed:
             add(
                 "GO2_JOINT_LOCK_LOST",
                 (SafetySeverity.EMERGENCY if snapshot.pixhawk.armed else SafetySeverity.FAULT),
-                "Go2 no longer reports JOINT_LOCK in a flight-configuration state.",
+                "Go2 joint-lock confirmation was lost in a flight-configuration state.",
                 "Stop AeroGo2-owned outputs, retain RadioMaster/Pixhawk control, and do not auto-disarm.",
+            )
+        elif (
+            snapshot.state in _FLIGHT_JOINT_LOCK_STATES
+            and snapshot.joint_lock_source == "operator"
+            and (
+                snapshot.go2.fault_code not in self._config.go2.accepted_state_codes
+                or self._go2_joint_lock_transition_is_unsafe(snapshot)
+                or self._go2_is_moving(snapshot)
+                or snapshot.go2.moving
+            )
+        ):
+            add(
+                "GO2_OPERATOR_LOCK_UNSAFE",
+                (SafetySeverity.EMERGENCY if snapshot.pixhawk.armed else SafetySeverity.FAULT),
+                "Go2 telemetry became unsafe after operator-confirmed joint lock.",
+                "Retain RadioMaster/Pixhawk control and restore a stationary phone-app Lock On state.",
             )
 
         if snapshot.state is SystemState.LANDING_COMPLIANT:
@@ -202,10 +218,12 @@ class SafetyMonitor:
                 add(
                     "GO2_UNSAFE_DURING_JOINT_LOCK",
                     SafetySeverity.FAULT,
-                    "Go2 entered a locomotion/unsafe-speed state while waiting for mode=6 JOINT_LOCK.",
+                    "Go2 entered a sustained locomotion/unsafe-speed state while waiting for Joint Lock.",
                     "Stop the F446 mechanism and keep the Go2 stationary; select Joint Lock in the Unitree app.",
                 )
-            elif snapshot.state is not SystemState.GO2_JOINT_LOCK_WAIT and self._go2_is_moving(snapshot):
+            elif snapshot.state is not SystemState.GO2_JOINT_LOCK_WAIT and self._go2_is_moving(
+                snapshot
+            ):
                 add(
                     "GO2_MOVING_DURING_TRANSFORM",
                     SafetySeverity.FAULT,
@@ -399,6 +417,7 @@ class SafetyMonitor:
         limit = self._config.safety.stationary_velocity_mps
         return (
             snapshot.go2.locomotion_mode not in allowed_modes
+            or snapshot.go2.fault_code not in self._config.go2.accepted_state_codes
             or not math.isfinite(snapshot.go2.velocity_mps)
             or len(components) != 3
             or any(not math.isfinite(value) or abs(value) >= limit for value in components)

@@ -81,6 +81,10 @@ class Go2Config:
     sport_state_topic: str = "rt/sportmodestate"
     command_timeout_s: float = 2.0
     joint_lock_operator_timeout_s: float = 60.0
+    joint_lock_transition_grace_s: float = 2.0
+    joint_lock_unsafe_confirm_s: float = 0.5
+    joint_lock_state_codes: Tuple[int, ...] = (1002,)
+    accepted_state_codes: Tuple[int, ...] = (0, 100, 1002)
     landing_compliance_enabled: bool = False
     foot_force_contact_thresholds: Tuple[int, int, int, int] = (0, 0, 0, 0)
     landing_contact_min_feet: int = 3
@@ -112,6 +116,7 @@ class SafetyConfig:
     stationary_velocity_mps: float
     stationary_confirm_s: float
     maximum_safe_esc_rpm_for_transform: float
+    airborne_confirm_s: float
     touchdown_confirm_s: float
     touchdown_max_vertical_speed_mps: float
     touchdown_max_tilt_rad: float
@@ -307,6 +312,36 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
             return None
         return (parsed[0], parsed[1], parsed[2], parsed[3])
 
+    def integer_list(
+        section: Mapping[str, Any],
+        key: str,
+        label: str,
+        *,
+        minimum: int,
+        maximum: int,
+    ) -> Optional[Tuple[int, ...]]:
+        item = value(section, key, label)
+        if item is None:
+            return None
+        if not isinstance(item, (list, tuple)) or not item:
+            errors.append(f"{label} must contain at least one integer")
+            return None
+        parsed: List[int] = []
+        valid = True
+        for index, raw_item in enumerate(item):
+            if type(raw_item) is not int:
+                errors.append(f"{label}[{index}] must be an integer")
+                valid = False
+                continue
+            if raw_item < minimum or raw_item > maximum:
+                errors.append(f"{label}[{index}] must be within {minimum}..{maximum}")
+                valid = False
+            parsed.append(raw_item)
+        if len(set(parsed)) != len(parsed):
+            errors.append(f"{label} must not contain duplicate values")
+            valid = False
+        return tuple(parsed) if valid else None
+
     def finite_number(
         section: Mapping[str, Any],
         key: str,
@@ -432,9 +467,7 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
         maximum=4095,
     )
     default_firmware_timeout_ms = (
-        15000
-        if transform_timeout_s is None
-        else max(100, int(round(transform_timeout_s * 1000.0)))
+        15000 if transform_timeout_s is None else max(100, int(round(transform_timeout_s * 1000.0)))
     )
     firmware_timeout_ms = (
         integer(
@@ -491,6 +524,36 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
             "joint_lock_operator_timeout_s",
             "go2.joint_lock_operator_timeout_s",
             positive=True,
+        )
+    if "joint_lock_transition_grace_s" in go2:
+        finite_number(
+            go2,
+            "joint_lock_transition_grace_s",
+            "go2.joint_lock_transition_grace_s",
+            positive=True,
+        )
+    if "joint_lock_unsafe_confirm_s" in go2:
+        finite_number(
+            go2,
+            "joint_lock_unsafe_confirm_s",
+            "go2.joint_lock_unsafe_confirm_s",
+            positive=True,
+        )
+    if "joint_lock_state_codes" in go2:
+        integer_list(
+            go2,
+            "joint_lock_state_codes",
+            "go2.joint_lock_state_codes",
+            minimum=0,
+            maximum=4_294_967_295,
+        )
+    if "accepted_state_codes" in go2:
+        integer_list(
+            go2,
+            "accepted_state_codes",
+            "go2.accepted_state_codes",
+            minimum=0,
+            maximum=4_294_967_295,
         )
 
     compliance_enabled: Optional[bool] = False
@@ -574,6 +637,14 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
         minimum=1,
         maximum=700,
     )
+
+    if "airborne_confirm_s" in safety:
+        finite_number(
+            safety,
+            "airborne_confirm_s",
+            "safety.airborne_confirm_s",
+            positive=True,
+        )
 
     for key in (
         "stationary_velocity_mps",
@@ -730,9 +801,7 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
                     round(float(_required(f446, "transform_timeout_s")) * 1000.0),
                 )
             ),
-            automatic_stall_threshold_adc=int(
-                f446.get("automatic_stall_threshold_adc", 0)
-            ),
+            automatic_stall_threshold_adc=int(f446.get("automatic_stall_threshold_adc", 0)),
             stall_blanking_ms=int(f446.get("stall_blanking_ms", 500)),
             stall_overcurrent_ms=int(f446.get("stall_overcurrent_ms", 180)),
             current_safe_margin_adc=_required(f446, "current_safe_margin_adc"),
@@ -745,8 +814,16 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
             domain_id=int(go2.get("domain_id", 0)),
             sport_state_topic=str(go2.get("sport_state_topic", "rt/sportmodestate")),
             command_timeout_s=float(go2.get("command_timeout_s", 2.0)),
-            joint_lock_operator_timeout_s=float(
-                go2.get("joint_lock_operator_timeout_s", 60.0)
+            joint_lock_operator_timeout_s=float(go2.get("joint_lock_operator_timeout_s", 60.0)),
+            joint_lock_transition_grace_s=float(
+                go2.get("joint_lock_transition_grace_s", 2.0)
+            ),
+            joint_lock_unsafe_confirm_s=float(go2.get("joint_lock_unsafe_confirm_s", 0.5)),
+            joint_lock_state_codes=tuple(
+                int(item) for item in go2.get("joint_lock_state_codes", (1002,))
+            ),
+            accepted_state_codes=tuple(
+                int(item) for item in go2.get("accepted_state_codes", (0, 100, 1002))
             ),
             landing_compliance_enabled=bool(go2.get("landing_compliance_enabled", False)),
             foot_force_contact_thresholds=foot_force_thresholds,
@@ -777,6 +854,7 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
             maximum_safe_esc_rpm_for_transform=float(
                 _required(safety, "maximum_safe_esc_rpm_for_transform")
             ),
+            airborne_confirm_s=float(safety.get("airborne_confirm_s", 1.0)),
             touchdown_confirm_s=float(_required(safety, "touchdown_confirm_s")),
             touchdown_max_vertical_speed_mps=float(
                 _required(safety, "touchdown_max_vertical_speed_mps")

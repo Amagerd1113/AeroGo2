@@ -223,6 +223,8 @@ class SystemSnapshot:
     autoland_active: bool = False
     external_setpoint_active: bool = False
     maintenance_mode: bool = False
+    joint_lock_confirmed: bool = False
+    joint_lock_source: str = "none"
     ground_arm_authorized: bool = False
     ground_arm_authorization_expires_at: Optional[float] = None
     active_fault_codes: Tuple[str, ...] = ()
@@ -230,6 +232,16 @@ class SystemSnapshot:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "active_fault_codes", tuple(self.active_fault_codes))
+        if self.go2.connected and self.go2.joints_locked:
+            object.__setattr__(self, "joint_lock_confirmed", True)
+            object.__setattr__(self, "joint_lock_source", "telemetry")
+        elif self.joint_lock_source == "telemetry":
+            object.__setattr__(self, "joint_lock_confirmed", False)
+            object.__setattr__(self, "joint_lock_source", "none")
+        elif self.joint_lock_confirmed and self.joint_lock_source == "none":
+            object.__setattr__(self, "joint_lock_source", "operator")
+        elif not self.joint_lock_confirmed:
+            object.__setattr__(self, "joint_lock_source", "none")
 
     def with_state(self, state: SystemState, timestamp: Optional[float] = None) -> SystemSnapshot:
         return replace(

@@ -54,13 +54,15 @@ def command_specs() -> Tuple[CommandSpec, ...]:
             SystemState.BOOT_SAFE,
             SystemState.WALK,
             SystemState.FLIGHT_READY,
+            SystemState.TOUCHDOWN_VERIFY,
+            SystemState.LANDING_COMPLIANT,
         }
     )
     specs.extend(
         (
             command(
                 "motor maintenance enter",
-                "Enter guarded F446 manual positioning",
+                "Enter guarded F446 manual positioning, including post-touchdown WALK recovery",
                 "motor",
                 "manual_enter",
                 aliases=("manual enter",),

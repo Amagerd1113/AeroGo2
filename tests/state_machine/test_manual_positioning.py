@@ -224,6 +224,16 @@ async def test_manual_forward_stop_and_operator_flight_confirmation(
         assert world.manager.state is SystemState.FLIGHT_READY
         assert world.manager.snapshot.configuration is Configuration.FLIGHT
         assert world.manager.snapshot.configuration_source == "operator"
+
+        already_locked = await world.manager.confirm_operator_joint_lock(
+            operator_confirmed=True
+        )
+        assert already_locked.ok
+        assert already_locked.code == "GO2_JOINT_LOCK_ALREADY_CONFIRMED"
+
+        authorized = await world.manager.authorize_ground_arm()
+        assert authorized.ok
+        assert world.manager.snapshot.ground_arm_authorized
     finally:
         await world.shutdown()
 

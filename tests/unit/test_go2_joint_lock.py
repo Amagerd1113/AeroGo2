@@ -25,6 +25,15 @@ def _joint_lock_message() -> SimpleNamespace:
     )
 
 
+def _idle_1002_message() -> SimpleNamespace:
+    return SimpleNamespace(
+        velocity=(0.0, 0.0, 0.0),
+        imu_state=SimpleNamespace(rpy=(0.02, -0.01, 0.0)),
+        mode=0,
+        error_code=1002,
+    )
+
+
 def _balance_stand_message() -> SimpleNamespace:
     return SimpleNamespace(
         velocity=(0.0, 0.0, 0.0),
@@ -49,6 +58,63 @@ def test_go2_mode_six_is_authoritative_joint_lock(
     assert status.locomotion_mode == "JOINT_LOCK"
     assert status.standing
     assert status.stable
+
+
+def test_go2_error_code_1002_is_authoritative_joint_lock_on_compatible_firmware(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    bridge = UnitreeGo2Bridge(app_config.go2, clock=clock)
+    bridge._on_state(_idle_1002_message())
+    bridge._connected = True
+
+    status = bridge.get_status()
+
+    assert status.fault_code == 1002
+    assert status.locomotion_mode == "IDLE_STAND"
+    assert status.standing
+    assert status.stable
+    assert status.joints_locked
+
+
+@pytest.mark.asyncio
+async def test_1002_lock_finalization_disables_joystick_without_changing_raw_mode(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    bridge = UnitreeGo2Bridge(app_config.go2, clock=clock, allow_control=True)
+    calls: list[object] = []
+
+    class Client:
+        def SwitchJoystick(self, enabled: bool) -> int:
+            calls.append(("SwitchJoystick", enabled))
+            return 0
+
+    bridge._client = Client()
+    bridge._connected = True
+    bridge._on_state(_idle_1002_message())
+
+    assert await bridge.finalize_operator_joint_lock()
+    assert calls == [("SwitchJoystick", False)]
+    assert bridge.get_status().locomotion_mode == "IDLE_STAND"
+    assert bridge.get_status().joints_locked
+
+
+def test_go2_idle_code_100_remains_unlocked(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    bridge = UnitreeGo2Bridge(app_config.go2, clock=clock)
+    message = _idle_1002_message()
+    message.error_code = 100
+    bridge._on_state(message)
+    bridge._connected = True
+
+    status = bridge.get_status()
+
+    assert status.fault_code == 100
+    assert status.locomotion_mode == "IDLE_STAND"
+    assert not status.joints_locked
 
 
 @pytest.mark.asyncio
@@ -255,7 +321,7 @@ def _hardware_manager(world: SimulationWorld) -> SystemManager:
 
 
 @pytest.mark.asyncio
-async def test_hardware_transform_waits_for_phone_mode_six_without_false_fault(
+async def test_hardware_transform_filters_phone_transition_and_accepts_1002_lock(
     app_config: AppConfig,
 ) -> None:
     world = SimulationWorld(app_config)
@@ -281,7 +347,11 @@ async def test_hardware_transform_waits_for_phone_mode_six_without_false_fault(
             + 0.01
         )
         world._heartbeat_all()
-        manager.accept_rc_status(world.rc_monitor.update(world._channels, connected=True, failsafe=False, timestamp=world.clock.monotonic()))
+        manager.accept_rc_status(
+            world.rc_monitor.update(
+                world._channels, connected=True, failsafe=False, timestamp=world.clock.monotonic()
+            )
+        )
         await manager.refresh_snapshot()
 
         result = await manager.request_transform_flight(operator_confirmed=True)
@@ -294,7 +364,7 @@ async def test_hardware_transform_waits_for_phone_mode_six_without_false_fault(
 
         world.go2.inject_status(
             locomotion_mode="BALANCE_STAND",
-            body_velocity=(-0.005, -0.001, -0.021),
+            body_velocity=(-0.005, -0.001, -0.20),
             stable=False,
             controller_active=True,
             joints_locked=False,
@@ -302,19 +372,250 @@ async def test_hardware_transform_waits_for_phone_mode_six_without_false_fault(
         await manager.tick()
         assert manager.state is SystemState.GO2_JOINT_LOCK_WAIT
         assert all(item.code != "GO2_MOVING_DURING_TRANSFORM" for item in manager.violations)
+        assert all(
+            item.code != "GO2_UNSAFE_DURING_JOINT_LOCK" for item in manager.violations
+        )
 
         world.go2.inject_status(
-            locomotion_mode="JOINT_LOCK",
+            locomotion_mode="IDLE_STAND",
             body_velocity=(0.0, 0.0, 0.0),
             stable=True,
             standing=True,
             controller_active=False,
+            fault_code=1002,
             joints_locked=True,
         )
         await manager.tick()
 
         assert manager.state is SystemState.FLIGHT_READY
         assert manager.snapshot.go2.joints_locked
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_joint_lock_wait_faults_after_continuous_unsafe_motion_filter(
+    app_config: AppConfig,
+) -> None:
+    world = SimulationWorld(app_config)
+    manager = _hardware_manager(world)
+    try:
+        assert (await manager.start()).ok
+        world._feed_rc(debounce=True)
+        assert (await manager.connect_all()).ok
+        world._set_switches(morphology=1900, autoland=1000, flight_enable=1000)
+        manager.accept_rc_status(
+            world.rc_monitor.update(
+                world._channels,
+                connected=True,
+                failsafe=False,
+                timestamp=world.clock.monotonic(),
+            )
+        )
+        world.clock.advance(
+            max(
+                app_config.safety.stationary_confirm_s,
+                app_config.f446.current_clear_hold_s,
+            )
+            + 0.01
+        )
+        world._heartbeat_all()
+        manager.accept_rc_status(
+            world.rc_monitor.update(
+                world._channels,
+                connected=True,
+                failsafe=False,
+                timestamp=world.clock.monotonic(),
+            )
+        )
+        await manager.refresh_snapshot()
+        waiting = await manager.request_transform_flight(operator_confirmed=True)
+        assert waiting.code == "GO2_JOINT_LOCK_OPERATOR_REQUIRED"
+
+        world.go2.inject_status(
+            locomotion_mode="LOCOMOTION",
+            body_velocity=(0.20, 0.0, 0.0),
+            stable=False,
+            controller_active=True,
+            joints_locked=False,
+        )
+        await manager.tick()
+        assert manager.state is SystemState.GO2_JOINT_LOCK_WAIT
+
+        world.clock.advance(app_config.go2.joint_lock_transition_grace_s + 0.01)
+        world._heartbeat_all()
+        manager.accept_rc_status(
+            world.rc_monitor.update(
+                world._channels,
+                connected=True,
+                failsafe=False,
+                timestamp=world.clock.monotonic(),
+            )
+        )
+        await manager.tick()
+        assert manager.state is SystemState.GO2_JOINT_LOCK_WAIT
+
+        world.clock.advance(app_config.go2.joint_lock_unsafe_confirm_s + 0.01)
+        world._heartbeat_all()
+        manager.accept_rc_status(
+            world.rc_monitor.update(
+                world._channels,
+                connected=True,
+                failsafe=False,
+                timestamp=world.clock.monotonic(),
+            )
+        )
+        await manager.tick()
+
+        assert manager.state is SystemState.FAULT
+        assert any(
+            item.code == "GO2_UNSAFE_DURING_JOINT_LOCK" for item in manager.violations
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_guarded_operator_lock_confirmation_enters_flight_ready_and_tracks_source(
+    app_config: AppConfig,
+) -> None:
+    world = SimulationWorld(app_config)
+    manager = _hardware_manager(world)
+    try:
+        assert (await manager.start()).ok
+        world._feed_rc(debounce=True)
+        assert (await manager.connect_all()).ok
+        world._set_switches(morphology=1900, autoland=1000, flight_enable=1000)
+        manager.accept_rc_status(
+            world.rc_monitor.update(
+                world._channels,
+                connected=True,
+                failsafe=False,
+                timestamp=world.clock.monotonic(),
+            )
+        )
+        world.clock.advance(
+            max(
+                app_config.safety.stationary_confirm_s,
+                app_config.f446.current_clear_hold_s,
+            )
+            + 0.01
+        )
+        world._heartbeat_all()
+        manager.accept_rc_status(
+            world.rc_monitor.update(
+                world._channels,
+                connected=True,
+                failsafe=False,
+                timestamp=world.clock.monotonic(),
+            )
+        )
+        await manager.refresh_snapshot()
+        waiting = await manager.request_transform_flight(operator_confirmed=True)
+        assert waiting.code == "GO2_JOINT_LOCK_OPERATOR_REQUIRED"
+        assert manager.state is SystemState.GO2_JOINT_LOCK_WAIT
+
+        world.go2.inject_status(
+            locomotion_mode="IDLE_STAND",
+            body_velocity=(0.0, 0.0, 0.0),
+            velocity_mps=0.0,
+            stable=True,
+            standing=True,
+            moving=False,
+            controller_active=False,
+            fault_code=1002,
+            joints_locked=False,
+        )
+        await manager.refresh_snapshot()
+
+        result = await manager.confirm_operator_joint_lock(operator_confirmed=True)
+
+        assert result.ok
+        assert result.code == "FLIGHT_READY_OPERATOR_LOCK"
+        assert manager.state is SystemState.FLIGHT_READY
+        assert not manager.snapshot.go2.joints_locked
+        assert manager.snapshot.joint_lock_confirmed
+        assert manager.snapshot.joint_lock_source == "operator"
+        status = manager.query("go2 status")
+        assert status["joint_lock_telemetry"] is False
+        assert status["joint_lock_confirmed"] is True
+        assert status["joint_lock_source"] == "operator"
+
+        world.go2.inject_status(
+            locomotion_mode="LOCOMOTION",
+            body_velocity=(0.1, 0.0, 0.0),
+            velocity_mps=0.1,
+            stable=False,
+            moving=True,
+            controller_active=True,
+        )
+        await manager.tick()
+
+        assert manager.state is SystemState.FAULT
+        assert any(item.code == "GO2_OPERATOR_LOCK_UNSAFE" for item in manager.violations)
+        assert not manager.snapshot.joint_lock_confirmed
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_operator_lock_confirmation_rejects_unstable_go2(
+    app_config: AppConfig,
+) -> None:
+    world = SimulationWorld(app_config)
+    manager = _hardware_manager(world)
+    try:
+        assert (await manager.start()).ok
+        world._feed_rc(debounce=True)
+        assert (await manager.connect_all()).ok
+        world._set_switches(morphology=1900, autoland=1000, flight_enable=1000)
+        manager.accept_rc_status(
+            world.rc_monitor.update(
+                world._channels,
+                connected=True,
+                failsafe=False,
+                timestamp=world.clock.monotonic(),
+            )
+        )
+        world.clock.advance(
+            max(
+                app_config.safety.stationary_confirm_s,
+                app_config.f446.current_clear_hold_s,
+            )
+            + 0.01
+        )
+        world._heartbeat_all()
+        manager.accept_rc_status(
+            world.rc_monitor.update(
+                world._channels,
+                connected=True,
+                failsafe=False,
+                timestamp=world.clock.monotonic(),
+            )
+        )
+        await manager.refresh_snapshot()
+        waiting = await manager.request_transform_flight(operator_confirmed=True)
+        assert waiting.code == "GO2_JOINT_LOCK_OPERATOR_REQUIRED"
+        world.go2.inject_status(
+            locomotion_mode="IDLE_STAND",
+            body_velocity=(0.0, 0.0, 0.0),
+            velocity_mps=0.0,
+            stable=False,
+            standing=True,
+            moving=False,
+            controller_active=False,
+            fault_code=1002,
+            joints_locked=False,
+        )
+        world._heartbeat_all()
+        await manager.refresh_snapshot()
+
+        result = await manager.confirm_operator_joint_lock(operator_confirmed=True)
+
+        assert not result.ok
+        assert result.code == "GO2_NOT_STATIONARY"
+        assert manager.state is SystemState.GO2_JOINT_LOCK_WAIT
+        assert not manager.snapshot.joint_lock_confirmed
     finally:
         await manager.shutdown()
 

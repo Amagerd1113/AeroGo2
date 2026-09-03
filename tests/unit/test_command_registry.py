@@ -70,6 +70,7 @@ flight authorize
 flight ready
 flight revoke
 flight status
+go2 confirm-lock
 go2 controller
 go2 motion
 go2 status
@@ -77,6 +78,7 @@ health
 help
 history
 landing compliance
+touchdown status
 log export
 log mark
 log start
@@ -326,6 +328,7 @@ def test_read_only_commands_require_no_confirmation(name: str) -> None:
     [
         ("transform flight", "TRANSFORM_TO_FLIGHT"),
         ("transform walk", "TRANSFORM_TO_WALK"),
+        ("go2 confirm-lock", "CONFIRM_GO2_JOINT_LOCK"),
     ],
 )
 def test_dangerous_commands_publish_exact_confirmation_metadata(name: str, phrase: str) -> None:
@@ -359,6 +362,22 @@ def test_phase_one_rejects_manual_motor_command_before_maintenance_check() -> No
     assert decision.code == "STATE_DENIED"
 
 
+def test_go2_confirm_lock_allows_automatic_transition_race_in_flight_ready() -> None:
+    policy = build_registry().get("go2 confirm-lock").permission
+
+    decision = policy.evaluate(
+        CommandContext(
+            runtime_mode=RuntimeMode.HARDWARE,
+            state=SystemState.FLIGHT_READY,
+            phase=3,
+            maintenance_mode=False,
+            hardware_write_enabled=True,
+        )
+    )
+
+    assert decision.allowed
+
+
 def test_manual_motor_command_is_still_rejected_outside_maintenance_in_phase_three() -> None:
     policy = build_registry().get("motor mr").permission
 
@@ -385,6 +404,13 @@ def test_manual_motor_command_has_two_stage_warning_metadata() -> None:
     assert "No F446 local limit stop" in confirmation.warning
 
 
+def test_manual_positioning_entry_is_available_after_touchdown() -> None:
+    allowed = build_registry().get("motor maintenance enter").permission.allowed_states
+
+    assert SystemState.TOUCHDOWN_VERIFY in allowed
+    assert SystemState.LANDING_COMPLIANT in allowed
+
+
 HARDWARE_ACTUATOR_COMMANDS = (
     "transform flight",
     "transform walk",
@@ -398,6 +424,7 @@ HARDWARE_ACTUATOR_COMMANDS = (
     "stop",
     "flight authorize",
     "flight revoke",
+    "go2 confirm-lock",
 )
 
 DRY_RUN_ONLY_ACTUATOR_COMMANDS = (
@@ -413,6 +440,7 @@ PERMITTED_STATE = {
     "transform walk": SystemState.FLIGHT_READY,
     "flight authorize": SystemState.FLIGHT_READY,
     "flight revoke": SystemState.FLIGHT_READY,
+    "go2 confirm-lock": SystemState.GO2_JOINT_LOCK_WAIT,
 }
 
 

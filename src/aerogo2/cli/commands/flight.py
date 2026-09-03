@@ -12,6 +12,25 @@ def command_specs() -> Tuple[CommandSpec, ...]:
         readonly("flight status", "Show flight readiness", "flight", "query_pixhawk"),
         readonly("flight enable-check", "Audit CH5 flight enable", "flight", "query_guards"),
         readonly("flight ready", "Audit FLIGHT_READY requirements", "flight", "query_guards"),
+        command(
+            "go2 confirm-lock",
+            "Confirm phone-app Lock On, or acknowledge an already automatic confirmation",
+            "flight",
+            "go2_confirm_lock",
+            capability=CommandPermission.SAFE_CONTROL,
+            allowed_states=frozenset(
+                {SystemState.GO2_JOINT_LOCK_WAIT, SystemState.FLIGHT_READY}
+            ),
+            requires_hardware_write=True,
+            confirmation=ConfirmationPolicy.exact(
+                "CONFIRM_GO2_JOINT_LOCK",
+                prompt="Visually verify Unitree phone-app Lock On, then type the exact phrase",
+                warning=(
+                    "Use this manual fallback only when neither mode 6 nor a configured "
+                    "joint-lock state code is reported."
+                ),
+            ),
+        ),
         readonly(
             "flight auth-status",
             "Show the one-shot ground Arm authorization",

@@ -21,6 +21,15 @@ go2:
   # Time allowed for the operator to select Joint Lock (mode 6) in the Unitree app.
   # F446 is already stopped at the verified FLIGHT endpoint during this wait.
   joint_lock_operator_timeout_s: 60.0
+  # Filter the short posture transient produced while the phone app enters Lock On.
+  # Unsafe motion must outlast both the initial grace and continuous-confirm window.
+  joint_lock_transition_grace_s: 2.0
+  joint_lock_unsafe_confirm_s: 0.5
+  # This Go2 EDU firmware reports Lock On as mode=0 plus error_code=1002.
+  joint_lock_state_codes: [1002]
+  # Firmware-specific SportModeState.error_code values accepted as normal posture.
+  # Values in joint_lock_state_codes additionally imply Joint Lock.
+  accepted_state_codes: [0, 100, 1002]
   # Keep disabled until all four raw foot-force channels have been calibrated
   # on this exact robot. Threshold order is the SDK foot_force[0..3] order.
   landing_compliance_enabled: false

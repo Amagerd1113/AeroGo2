@@ -86,6 +86,7 @@ class CommandService:
                 "config_reload": "reload_config",
                 "ground_arm_authorize": "authorize_ground_arm",
                 "ground_arm_revoke": "revoke_ground_arm",
+                "go2_confirm_lock": "_confirm_operator_joint_lock",
             }
             handler_name = handler_names.get(action)
             if handler_name is None:
@@ -179,7 +180,10 @@ class CommandService:
             "f446_overms": "overms",
         }
         if action in timing_by_action:
-            return cast(OperationResult, await self._manager.set_f446_timing_parameter(timing_by_action[action], value))
+            return cast(
+                OperationResult,
+                await self._manager.set_f446_timing_parameter(timing_by_action[action], value),
+            )
         operation_by_action = {
             "f446_mf": "mf",
             "f446_mr": "mr",
@@ -202,6 +206,12 @@ class CommandService:
         return CommandResult(
             CommandStatus.UNAVAILABLE,
             f"Command action '{action}' is registered but not executable in Phase 1",
+        )
+
+    async def _confirm_operator_joint_lock(self) -> OperationResult:
+        return cast(
+            OperationResult,
+            await self._manager.confirm_operator_joint_lock(operator_confirmed=True),
         )
 
     async def _home_walk(self) -> OperationResult:
