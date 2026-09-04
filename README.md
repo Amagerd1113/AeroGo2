@@ -12,6 +12,15 @@ F446 人工 `mr/mf`、快捷 `s`、人工到位确认、实时 HW-039 和自动�
 
 主系统不会解锁 Pixhawk，也不会自动启动 X8 桨电机。
 
+## Impact-Aware 着陆扩展（默认禁用）
+
+本工程以 GitHub `main` 短提交 `851146d` 为上游基线，加入了固定展开构型下的
+impact-aware 着陆算法、Go2 LowCmd 唯一 owner 候选和飞控旋翼 residual 主机接口。
+当前实验主线只使用法向一维模型；未经 N 标定的 Go2 SDK 足力 counts 只用于接触事件。
+LowCmd owner 已注入 runtime 但默认禁用；真实多速率控制链和 Pixhawk residual 执行端
+尚未接入，因此论文目标提交、正 κ 和硬件自动着陆继续 fail closed。当前文件职责、配置、参数及测试边界见
+[Impact-Aware 着陆算法当前说明](docs/IMPACT_AWARE_MPC_INTEGRATION_ZH.md)。
+
 <!-- Encoding-damaged duplicate hidden.
 
 AeroGo2 ?????? DRY-RUN?HW-RO ??????????????
@@ -153,7 +162,9 @@ await state_machine.transition_to(
 发布事件、进入动作，以及进入动作失败时转入 `FAULT`。
 
 完整状态、所有合法下一状态、每条激活条件和真机/DRY-RUN 边界见
-[`docs/STATE_TRANSITIONS_ZH.md`](docs/STATE_TRANSITIONS_ZH.md)。`FLIGHT_READY -> FLIGHT_MANUAL`
+[`docs/STATE_TRANSITIONS_ZH.md`](docs/STATE_TRANSITIONS_ZH.md)，状态机、独立 LowCmd 控制权和
+Impact-aware 多速率数据流的总图见
+[`docs/AEROGO2_CURRENT_PROJECT_GRAPH_ZH.png`](docs/AEROGO2_CURRENT_PROJECT_GRAPH_ZH.png)。`FLIGHT_READY -> FLIGHT_MANUAL`
 采用一次性两把钥匙：AeroGo2 Shell `flight authorize` 成功后，30 秒内再由 RadioMaster CH5 LOW->HIGH 请求正常 Arm。进入 `FLIGHT_MANUAL` 后，触地检测仍保持禁用，直到 Pixhawk 新鲜遥测连续 1.0 秒证明 `armed=true` 且 `landed=false`；用 `touchdown status` 查看本架次的离地锁存和触地确认进度。Go2 原始 `mode=6` 或本机实测的 `mode=0,error_code=1002` 都会自动确认关节锁。手机切换 Lock On 的瞬时姿态扰动使用可调的 2.0 秒初始宽限和 0.5 秒持续越界确认滤波；必须重新静止后才进入 `FLIGHT_READY`。若固件两种锁定信号都不回报，仍可在 `GO2_JOINT_LOCK_WAIT` 中使用守卫式 `go2 confirm-lock`。
 
 0.3.12 允许在确认触地后从 `TOUCHDOWN_VERIFY` 进入受保护的 `MANUAL_POSITIONING`，由操作者手动把 F446 调到 WALK 端点，再通过 `motor endpoint walk` 与 `motor confirm walk` 完成验证。若已经进入腿部柔顺的 `LANDING_COMPLIANT`，系统会先恢复关节锁定，绝不在柔顺姿态下直接移动变形机构。
@@ -304,14 +315,15 @@ aerogo2 x8-bench -- --list-ports
 只读检查真实 Pixhawk 参数和 X8 就绪状态：
 
 ```bash
-aerogo2 x8-bench -- --commands "streams on; audit std; x8diag 3"
+aerogo2 x8-bench -- --commands "audit std; x8diag 3"
 ```
 
-进入原始交互诊断终端：
-
-```bash
-aerogo2 x8-bench
-```
+`x8-bench` 不再提供原始交互终端或任意参数透传。它只接受显式白名单中的端口枚举、
+无硬件自测、只读 CAN 探测，以及 `status/listen/preflight/escdiag/offsetdiag/x8diag/
+nodediag/audit/getparam/modes/help` 等非驱动诊断命令；空参数、未知参数、交互 REPL、
+`setup/param/reboot/safety/arm/disarm/mode/takeoff/launch/flighttest/trigger/tx` 和所有直接
+电机输出命令都会在创建子进程前拒绝。这里的“只读”允许发送遥测、参数读取和节点信息
+请求，但不会写参数、改变飞行模式、解锁或产生电机控制量。
 
 推荐先用受限入口完成单臂低油门、短时间测试：
 
@@ -328,8 +340,8 @@ aerogo2 x8-spin \
 
 `x8-spin` 只允许 5–20% 和 0.5–5 秒，并要求 Pixhawk 明确为 DISARMED、标准参数
 匹配、ESC 遥测新鲜。它依次完成 `safety off`、`triggercheck`、`triggerwin`、
-`trigger off` 和 `safety on`，异常退出时也会再次停转并恢复安全开关。首次测试不要
-使用 `all`；四个单臂方向和映射验收通过后再测试全部 X8。
+`trigger off` 和 `safety on`，异常退出时也会再次停转并恢复安全开关。当前入口只允许
+逐个测试 `rr/lf/lr/rf`；由于工程中还没有四路映射验收记录，`all` 在代码中始终被拒绝。
 
 ## 终端命令
 

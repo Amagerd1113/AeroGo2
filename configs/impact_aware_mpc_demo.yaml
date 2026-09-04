@@ -1,0 +1,139 @@
+# SYNTHETIC NUMERICAL TEST ONLY - NOT A GO2 OR ROTOR PARAMETER SET.
+# These values exercise equations and software constraints.  They are not
+# measurements from the paper and must never be copied into hardware config.
+
+schema_version: 3
+profile: synthetic_demo
+parameters_identified: false
+physical_use_prohibited: true
+allow_hardware_output: false
+
+frames:
+  world: ENU_Z_UP
+  body: X_FORWARD_Y_LEFT_Z_UP
+  rotor_order: [RR, LF, LR, RF]
+
+rotor:
+  geometry:
+    configuration: FIXED_DEPLOYED_LOCKED
+    reference_origin: TOTAL_SYSTEM_COM_C
+    # Fixed synthetic lever-arm vectors; these are not AeroGo2 measurements.
+    lever_arms_from_com_body_m:
+      - [-0.30, -0.20, 0.10]
+      - [0.30, 0.20, 0.10]
+      - [-0.30, 0.20, 0.10]
+      - [0.30, -0.20, 0.10]
+    thrust_directions_body:
+      - [0.0, 0.0, 1.0]
+      - [0.0, 0.0, 1.0]
+      - [0.0, 0.0, 1.0]
+      - [0.0, 0.0, 1.0]
+  aerodynamics:
+    thrust_coefficient_n_per_rad_s_squared: 1.0e-5
+    drag_torque_coefficient_nm_per_rad_s_squared: 1.0e-7
+    spin_directions: [1, 1, -1, -1]
+  actuator:
+    time_constants_s: [0.08, 0.08, 0.08, 0.08]
+    thrust_min_n: [0.0, 0.0, 0.0, 0.0]
+    thrust_max_n: [40.0, 40.0, 40.0, 40.0]
+    thrust_rate_min_n_per_s: [-200.0, -200.0, -200.0, -200.0]
+    thrust_rate_max_n_per_s: [200.0, 200.0, 200.0, 200.0]
+  correction_safety:
+    target_gain: 0.0
+    maximum_correction_n: [10.0, 10.0, 10.0, 10.0]
+    maximum_gain_rise_per_s: 0.25
+
+dynamics:
+  mass_kg: 10.0
+  inertia_body_kg_m2:
+    - [0.50, 0.0, 0.0]
+    - [0.0, 0.60, 0.0]
+    - [0.0, 0.0, 0.70]
+  gravity_world_m_per_s2: [0.0, 0.0, -9.80665]
+  reference_point: TOTAL_SYSTEM_COM_C
+
+contact:
+  friction_coefficients: [0.70, 0.70, 0.70, 0.70]
+  normal_force_max_n: [100.0, 100.0, 100.0, 100.0]
+  contact_on_threshold_n: [20.0, 20.0, 20.0, 20.0]
+  contact_off_threshold_n: [10.0, 10.0, 10.0, 10.0]
+  filter_time_constant_s: 0.01
+  contact_confirm_s: 0.05
+  release_confirm_s: 0.05
+  # Synthetic SDK-index calibration used only to exercise the pure adapter.
+  # It is not a Go2 mapping and is prohibited for hardware by this profile.
+  go2_lowstate_force_adapter:
+    mapping_version: synthetic-foot-map-v1
+    mapping_hash: sha256:fa1e6ca6a679ace557f41f98d65ef44ac4e96e6d30b461a3a2b0e78db6aa2ab6
+    calibration_version: synthetic-foot-cal-v1
+    calibration_hash: sha256:6b70b40bf3b3b6f67d02624bbb71e23eab5f827f45fe90df4bd87344a82617fe
+    algorithm_leg_order: [SYNTH_0, SYNTH_1, SYNTH_2, SYNTH_3]
+    sdk_indices_by_leg: [0, 1, 2, 3]
+    source: LOWSTATE_FOOT_FORCE_RAW_INT16
+    offsets_sdk_by_algorithm_leg: [0.0, 0.0, 0.0, 0.0]
+    scales_n_per_sdk_unit_by_algorithm_leg: [1.0, 1.0, 1.0, 1.0]
+    signs_by_algorithm_leg: [1, 1, 1, 1]
+    maximum_valid_normal_force_n_by_algorithm_leg: [100.0, 100.0, 100.0, 100.0]
+
+impact:
+  maximum_normal_impulse_ns: 10.0
+  impact_duration_s: 0.02
+  maximum_average_normal_force_n: 300.0
+
+mpc:
+  horizon_steps: 4
+  dt_s: 0.05
+  solver:
+    max_iterations: 80
+    ftol: 1.0e-7
+    constraint_tolerance: 1.0e-5
+    timeout_s: 3.0
+    display: false
+  weights:
+    tracking: [20, 20, 40, 10, 10, 30, 15, 15, 15, 5, 5, 5]
+    input: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.002, 0.002, 0.002, 0.002]
+    input_rate: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
+    slack: [1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000]
+    terminal_tracking: [40, 40, 80, 20, 20, 60, 30, 30, 30, 10, 10, 10]
+    impulse: [1.0, 1.0, 5.0]
+    touchdown_velocity: [5.0, 5.0, 20.0]
+  state_bounds:
+    lower: [-5, -5, -1, -5, -5, -5, -3.1416, -3.1416, -3.1416, -5, -5, -5, 0, 0, 0, 0]
+    upper: [5, 5, 5, 5, 5, 5, 3.1416, 3.1416, 3.1416, 5, 5, 5, 40, 40, 40, 40]
+    soft_mask: [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]
+
+admittance:
+  transition_duration_s: 0.20
+  touchdown_inertia: [2.0, 2.0, 1.0]
+  stance_inertia: [3.0, 3.0, 2.0]
+  touchdown_damping: [40.0, 40.0, 30.0]
+  stance_damping: [60.0, 60.0, 50.0]
+  restoring_stiffness: [300.0, 300.0, 250.0]
+  stance_stiffness: [120.0, 120.0, 180.0]
+  force_error_deadband_n: [2.0, 2.0, 2.0]
+  correction_position_limit_m: [0.08, 0.08, 0.12]
+  correction_velocity_limit_m_per_s: [0.50, 0.50, 0.80]
+  contact_release_policy: reset
+  anti_windup_enabled: true
+  leg_order: [SYNTH_0, SYNTH_1, SYNTH_2, SYNTH_3]
+  legs:
+    - workspace_lower_m: [-0.60, -0.50, -0.70]
+      workspace_upper_m: [0.60, 0.50, -0.05]
+      joint_lower_rad: [-3.0, -3.0, -3.0]
+      joint_upper_rad: [3.0, 3.0, 3.0]
+      joint_rate_limit_rad_per_s: [2.0, 2.0, 2.0]
+    - workspace_lower_m: [-0.60, -0.50, -0.70]
+      workspace_upper_m: [0.60, 0.50, -0.05]
+      joint_lower_rad: [-3.0, -3.0, -3.0]
+      joint_upper_rad: [3.0, 3.0, 3.0]
+      joint_rate_limit_rad_per_s: [2.0, 2.0, 2.0]
+    - workspace_lower_m: [-0.60, -0.50, -0.70]
+      workspace_upper_m: [0.60, 0.50, -0.05]
+      joint_lower_rad: [-3.0, -3.0, -3.0]
+      joint_upper_rad: [3.0, 3.0, 3.0]
+      joint_rate_limit_rad_per_s: [2.0, 2.0, 2.0]
+    - workspace_lower_m: [-0.60, -0.50, -0.70]
+      workspace_upper_m: [0.60, 0.50, -0.05]
+      joint_lower_rad: [-3.0, -3.0, -3.0]
+      joint_upper_rad: [3.0, 3.0, 3.0]
+      joint_rate_limit_rad_per_s: [2.0, 2.0, 2.0]

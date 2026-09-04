@@ -1,5 +1,5 @@
 include requirements.txt
-recursive-include configs *.yaml
+recursive-include configs *.yaml *.urdf *.txt
 recursive-include scripts *.py
 recursive-include tests *.py *.json *.txt
 recursive-include deploy *

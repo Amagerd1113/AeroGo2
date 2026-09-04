@@ -20,11 +20,38 @@ class SystemState(Enum):
     AUTO_LANDING_READY = auto()
     AUTO_LANDING = auto()
     TOUCHDOWN_VERIFY = auto()
+    GO2_GROUND_HANDOVER = auto()
     LANDING_COMPLIANT = auto()
     FLIGHT_TO_WALK_PRECHECK = auto()
     TRANSFORM_TO_WALK = auto()
     FAULT = auto()
     EMERGENCY_STOP = auto()
+
+
+class Go2ControlAuthorityState(str, Enum):
+    """Externally auditable owner of the Go2 joint-control authority.
+
+    This is deliberately separate from both ``SystemState`` and the internal
+    LowCmd writer lifecycle.  In particular, an absent SportModeState sample
+    while MotionSwitcher is released is not interpreted as a lost joint lock.
+    """
+
+    UNKNOWN = "UNKNOWN"
+    HIGH_LEVEL_JOINT_LOCK = "HIGH_LEVEL_JOINT_LOCK"
+    LOWCMD_ACQUIRING = "LOWCMD_ACQUIRING"
+    LOWCMD_ACTIVE = "LOWCMD_ACTIVE"
+    LOWCMD_SAFE_HOLD = "LOWCMD_SAFE_HOLD"
+    HIGH_LEVEL_REACQUIRING = "HIGH_LEVEL_REACQUIRING"
+    FAULT = "FAULT"
+
+
+class ImpactLandingPhase(str, Enum):
+    """Physical sub-phase of the paper controller inside ``AUTO_LANDING``."""
+
+    INACTIVE = "inactive"
+    PRE_TOUCHDOWN = "pre_touchdown"
+    TOUCHDOWN = "touchdown"
+    POST_TOUCHDOWN_RECOVERY = "post_touchdown_recovery"
 
 
 class RuntimeMode(Enum):

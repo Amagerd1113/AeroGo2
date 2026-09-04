@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Deque, Iterable, Optional
+from typing import Awaitable, Callable, Deque, Iterable, Optional, cast
 
 from prompt_toolkit import PromptSession
 
@@ -100,7 +100,7 @@ class ConfirmationService:
     async def _prompt(self, prompt: str) -> str:
         if self._session is None:
             self._session = PromptSession(history=CommandHistory.confirmation_history())
-        return await self._session.prompt_async(prompt)
+        return cast(str, await self._session.prompt_async(prompt))
 
     @staticmethod
     def _default_warning_writer(message: str) -> None:

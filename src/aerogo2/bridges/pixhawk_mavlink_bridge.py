@@ -12,6 +12,7 @@ from aerogo2.common.clock import Clock, RealClock
 from aerogo2.common.config import PixhawkConfig
 from aerogo2.common.exceptions import BridgeError
 from aerogo2.common.models import EscTelemetry, PixhawkStatus
+from aerogo2.common.numeric import finite_real
 from aerogo2.common.results import OperationResult
 
 _ESC_TELEMETRY_FIRST_SLOT = {
@@ -24,6 +25,10 @@ _GROUND_ARM_AUTH_MAGIC = 6202.0
 _GROUND_ARM_AUTH_PROTOCOL = 1.0
 _GROUND_ARM_AUTH_HEARTBEAT_S = 0.4
 _GROUND_ARM_AUTH_ACK_TIMEOUT_S = 1.5
+# COMMAND_LONG parameters are IEEE-754 float32 on the wire. Every positive
+# integer through 2**24 is exactly representable, whereas a wider sequence
+# domain can round distinct authorization transactions to the same value.
+_GROUND_ARM_AUTH_MAX_EXACT_SEQUENCE = (1 << 24) - 1
 
 
 @dataclass(frozen=True)
@@ -73,10 +78,15 @@ class MavlinkPixhawkBridge:
         self._setpoint_active = False
         self._ground_arm_authorized = False
         self._ground_arm_authorization_deadline = 0.0
+        # The remote live gate is closed immediately on the first observed
+        # armed edge.  Retain one bounded logical receipt so SystemManager can
+        # classify that same edge as authorized before explicitly consuming it.
+        self._ground_arm_consumed_receipt = False
         self._ground_arm_authorization_task: Optional[asyncio.Task[None]] = None
         self._ground_arm_authorization_lock = asyncio.Lock()
         self._ground_arm_authorization_sequence = 0
-        self._ground_arm_authorization_ack: Optional[Tuple[int, asyncio.Future[int]]] = None
+        self._ground_arm_authorization_ack: Optional[Tuple[int, bool, asyncio.Future[int]]] = None
+        self._ground_arm_consumption_generation = 0
         self._status = PixhawkStatus(
             esc=tuple(
                 EscTelemetry(slot, position, healthy=False)
@@ -92,6 +102,7 @@ class MavlinkPixhawkBridge:
             from pymavlink import mavutil  # type: ignore[import-untyped]
         except ImportError as exc:
             raise BridgeError("pymavlink is required for the Pixhawk bridge") from exc
+        connection: Optional[Any] = None
         try:
             connection = mavutil.mavlink_connection(
                 self._config.connection,
@@ -107,6 +118,11 @@ class MavlinkPixhawkBridge:
                 timeout=self._config.heartbeat_timeout_s + 1.0,
             )
         except (OSError, asyncio.TimeoutError, RuntimeError) as exc:
+            if connection is not None:
+                try:
+                    connection.close()
+                except (OSError, RuntimeError):
+                    pass
             raise BridgeError(
                 f"Cannot receive Pixhawk heartbeat on {self._config.connection}: {exc}"
             ) from exc
@@ -142,10 +158,11 @@ class MavlinkPixhawkBridge:
         self._setpoint_active = False
         self._ground_arm_authorized = False
         self._ground_arm_authorization_deadline = 0.0
+        self._ground_arm_consumed_receipt = False
         pending = self._ground_arm_authorization_ack
         self._ground_arm_authorization_ack = None
-        if pending is not None and not pending[1].done():
-            pending[1].cancel()
+        if pending is not None and not pending[2].done():
+            pending[2].cancel()
         self._esc_groups.clear()
         if connection is not None:
             try:
@@ -204,12 +221,33 @@ class MavlinkPixhawkBridge:
                         "PIXHAWK_DISCONNECTED",
                         "Cannot authorize flight while Pixhawk is disconnected",
                     )
+                if self._status.armed:
+                    return OperationResult.failure(
+                        "PIXHAWK_ALREADY_ARMED",
+                        "Ground-arm authorization cannot be opened after Pixhawk is armed",
+                    )
                 await self._cancel_ground_arm_authorization_task()
+                self._ground_arm_consumed_receipt = False
+                consumption_generation = self._ground_arm_consumption_generation
                 exchange = await self._exchange_ground_arm_authorization(True, ttl_s)
                 if not exchange.ok:
                     self._ground_arm_authorized = False
                     self._ground_arm_authorization_deadline = 0.0
                     return exchange
+                if (
+                    self._ground_arm_consumption_generation != consumption_generation
+                    or self._status.armed
+                ):
+                    self._ground_arm_authorized = False
+                    self._ground_arm_authorization_deadline = 0.0
+                    try:
+                        self._send_ground_arm_authorization(False, 0.0, 0)
+                    except (BridgeError, OSError, RuntimeError, ValueError):
+                        pass
+                    return OperationResult.failure(
+                        "PIXHAWK_ARM_AUTH_GATE_CONSUMED",
+                        "Pixhawk armed while authorization was being acknowledged; the one-shot gate was closed",
+                    )
                 self._ground_arm_authorized = True
                 self._ground_arm_authorization_deadline = self._clock.monotonic() + ttl_s
                 self._ground_arm_authorization_task = asyncio.create_task(
@@ -223,6 +261,7 @@ class MavlinkPixhawkBridge:
 
             self._ground_arm_authorized = False
             self._ground_arm_authorization_deadline = 0.0
+            self._ground_arm_consumed_receipt = False
             await self._cancel_ground_arm_authorization_task()
             if not self._connected:
                 return OperationResult.success(
@@ -231,10 +270,15 @@ class MavlinkPixhawkBridge:
             return await self._exchange_ground_arm_authorization(False, 0.0)
 
     def ground_arm_authorization_active(self) -> bool:
-        return (
-            self._connected
-            and self._ground_arm_authorized
+        live_gate = (
+            self._ground_arm_authorized
             and self._ground_arm_authorization_deadline > self._clock.monotonic()
+        )
+        # True may also mean the unconsumed receipt for the current armed
+        # interval. The remote enable heartbeat has already stopped; this is
+        # only evidence for the manager's FLIGHT_READY->FLIGHT_MANUAL commit.
+        return self._connected and (
+            live_gate or (self._ground_arm_consumed_receipt and self._status.armed)
         )
 
     async def _exchange_ground_arm_authorization(
@@ -244,11 +288,11 @@ class MavlinkPixhawkBridge:
     ) -> OperationResult:
         loop = asyncio.get_running_loop()
         self._ground_arm_authorization_sequence = (
-            self._ground_arm_authorization_sequence % 2_000_000_000
+            self._ground_arm_authorization_sequence % _GROUND_ARM_AUTH_MAX_EXACT_SEQUENCE
         ) + 1
         sequence = self._ground_arm_authorization_sequence
         future: asyncio.Future[int] = loop.create_future()
-        self._ground_arm_authorization_ack = (sequence, future)
+        self._ground_arm_authorization_ack = (sequence, enabled, future)
         try:
             self._send_ground_arm_authorization(enabled, ttl_s, sequence)
             result = await asyncio.wait_for(future, timeout=_GROUND_ARM_AUTH_ACK_TIMEOUT_S)
@@ -316,7 +360,12 @@ class MavlinkPixhawkBridge:
         except (BridgeError, OSError, RuntimeError, ValueError):
             pass
         finally:
-            current = asyncio.current_task()
+            # Interpreter/test-loop teardown can finalize the coroutine after
+            # the event loop has gone away. Cleanup must remain best-effort.
+            try:
+                current = asyncio.current_task()
+            except RuntimeError:
+                current = None
             if self._ground_arm_authorization_task is current:
                 self._ground_arm_authorization_task = None
             if self._ground_arm_authorized:
@@ -400,13 +449,14 @@ class MavlinkPixhawkBridge:
             self._connected = False
             self._ground_arm_authorized = False
             self._ground_arm_authorization_deadline = 0.0
+            self._ground_arm_consumed_receipt = False
             task = self._ground_arm_authorization_task
             self._ground_arm_authorization_task = None
             if task is not None and task is not asyncio.current_task():
                 task.cancel()
             pending = self._ground_arm_authorization_ack
-            if pending is not None and not pending[1].done():
-                pending[1].set_exception(BridgeError("Pixhawk reader stopped"))
+            if pending is not None and not pending[2].done():
+                pending[2].set_exception(BridgeError("Pixhawk reader stopped"))
 
     def _request_telemetry(self) -> None:
         connection = self._require_connection()
@@ -449,6 +499,34 @@ class MavlinkPixhawkBridge:
         if kind == "HEARTBEAT":
             mavlink = self._require_mavlink()
             armed = bool(int(message.base_mode) & mavlink.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+            armed_rising = armed and not status.armed
+            if armed_rising:
+                # Authorization is one-shot: stop enable heartbeats and fence
+                # an enable ACK that may still be in flight at the first arm.
+                self._ground_arm_consumption_generation += 1
+                self._ground_arm_consumed_receipt = bool(
+                    self._ground_arm_authorized and self._ground_arm_authorization_deadline > now
+                )
+                self._ground_arm_authorized = False
+                self._ground_arm_authorization_deadline = 0.0
+                authorization_task = self._ground_arm_authorization_task
+                self._ground_arm_authorization_task = None
+                if authorization_task is not None and not authorization_task.done():
+                    authorization_task.cancel()
+                pending = self._ground_arm_authorization_ack
+                if pending is not None and pending[1] and not pending[2].done():
+                    pending[2].set_exception(
+                        BridgeError("Pixhawk armed before the authorization ACK committed")
+                    )
+                if self._connected:
+                    try:
+                        self._send_ground_arm_authorization(False, 0.0, 0)
+                    except (BridgeError, OSError, RuntimeError, ValueError):
+                        pass
+            elif not armed and status.armed:
+                # Disarm invalidates an unconsumed receipt. A later arm always
+                # requires a new authorization transaction.
+                self._ground_arm_consumed_receipt = False
             mode = str(mavlink.mode_string_v10(message))
             system_status = int(getattr(message, "system_status", 0))
             failsafe = system_status >= int(mavlink.mavlink.MAV_STATE_CRITICAL)
@@ -465,35 +543,63 @@ class MavlinkPixhawkBridge:
             if int(getattr(message, "command", -1)) == _GROUND_ARM_AUTH_COMMAND:
                 pending = self._ground_arm_authorization_ack
                 sequence = int(getattr(message, "result_param2", 0))
-                if pending is not None and pending[0] == sequence and not pending[1].done():
-                    pending[1].set_result(int(getattr(message, "result", -1)))
+                if pending is not None and pending[0] == sequence and not pending[2].done():
+                    pending[2].set_result(int(getattr(message, "result", -1)))
         elif kind == "ATTITUDE":
+            roll = finite_real(getattr(message, "roll", None))
+            pitch = finite_real(getattr(message, "pitch", None))
+            yaw = finite_real(getattr(message, "yaw", None))
+            rollspeed = finite_real(getattr(message, "rollspeed", None))
+            pitchspeed = finite_real(getattr(message, "pitchspeed", None))
+            yawspeed = finite_real(getattr(message, "yawspeed", None))
+            if (
+                roll is None
+                or pitch is None
+                or yaw is None
+                or rollspeed is None
+                or pitchspeed is None
+                or yawspeed is None
+            ):
+                return
             status = replace(
                 status,
-                roll_rad=float(message.roll),
-                pitch_rad=float(message.pitch),
-                yaw_rad=float(message.yaw),
-                angular_velocity=(
-                    float(message.rollspeed),
-                    float(message.pitchspeed),
-                    float(message.yawspeed),
-                ),
+                attitude_timestamp=now,
+                roll_rad=roll,
+                pitch_rad=pitch,
+                yaw_rad=yaw,
+                angular_velocity=(rollspeed, pitchspeed, yawspeed),
             )
         elif kind == "GLOBAL_POSITION_INT":
+            relative_alt = finite_real(getattr(message, "relative_alt", None))
+            vx = finite_real(getattr(message, "vx", None))
+            vy = finite_real(getattr(message, "vy", None))
+            vz = finite_real(getattr(message, "vz", None))
+            if relative_alt is None or vx is None or vy is None or vz is None:
+                return
             status = replace(
                 status,
-                relative_altitude_m=float(message.relative_alt) / 1000.0,
-                vertical_velocity_mps=float(message.vz) / 100.0,
+                kinematics_timestamp=now,
+                relative_altitude_m=relative_alt / 1000.0,
+                vertical_velocity_mps=vz / 100.0,
                 local_velocity=(
-                    float(message.vx) / 100.0,
-                    float(message.vy) / 100.0,
-                    float(message.vz) / 100.0,
+                    vx / 100.0,
+                    vy / 100.0,
+                    vz / 100.0,
                 ),
             )
         elif kind == "EXTENDED_SYS_STATE":
             mavlink = self._require_mavlink().mavlink
-            landed = int(message.landed_state) == int(mavlink.MAV_LANDED_STATE_ON_GROUND)
-            status = replace(status, landed=landed)
+            raw_landed_state = getattr(message, "landed_state", None)
+            # pymavlink supplies a plain integer enum. Do not coerce floats,
+            # strings, booleans, or arbitrary integer-like values into a
+            # ground-only safety permission.
+            if type(raw_landed_state) is not int:
+                return
+            landed_state = raw_landed_state
+            if landed_state not in {0, 1, 2, 3, 4}:
+                return
+            landed = landed_state == int(mavlink.MAV_LANDED_STATE_ON_GROUND)
+            status = replace(status, landed=landed, landed_state_timestamp=now)
         elif kind == "SYS_STATUS":
             millivolts = int(getattr(message, "voltage_battery", 65535))
             status = replace(

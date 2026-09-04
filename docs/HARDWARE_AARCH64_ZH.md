@@ -131,6 +131,11 @@ X8 motor-test 与飞行 Arm 隔离；仅可在全部拆桨、限流供电并固�
   --check
 ~~~
 
+`x8-bench` 仅允许显式的非驱动诊断白名单，不能进入原始交互终端，也不能透传
+`safety off`、arm、飞行、参数写入或电机命令。需要只读核对时使用例如
+`x8-bench -- --commands "audit std; x8diag 3"`；唯一保留的电机台架路径是下面具有
+拆桨、固定机架、精确确认和幅值/时长上限的 `x8-spin`。
+
 确认 Pixhawk 为 DISARMED、4 路 ESC 遥测新鲜且 RPM=0 后，先以单臂 10%、2 秒测试：
 
 ~~~bash
@@ -144,7 +149,7 @@ X8 motor-test 与飞行 Arm 隔离；仅可在全部拆桨、限流供电并固�
   --confirm-x8 X8_PROPS_REMOVED_AND_AIRFRAME_SECURED
 ~~~
 
-target 可选 rr、lf、lr、rf、all；油门仅允许 5–20%，时间仅允许 0.5–5 秒。第一次禁止使用 all，四个单臂方向和映射全部验收通过后再测试 all。
+target 只可选 rr、lf、lr、rf；油门仅允许 5–20%，时间仅允许 0.5–5 秒。工程尚无可验证的四路映射验收记录，因此 `all` 在代码中始终被拒绝。
 
 命令会依次审计标准参数、检查 ESC 遥测与 DISARMED 联锁、限时发送 MAVLink MOTOR_TEST、停转并恢复 safety on；任一步失败都终止，退出清理也会再次停转和恢复安全开关。
 

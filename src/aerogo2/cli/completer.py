@@ -10,7 +10,7 @@ from prompt_toolkit.document import Document
 from aerogo2.cli.registry import CommandRegistry
 
 
-class AeroGo2Completer(Completer):
+class AeroGo2Completer(Completer):  # type: ignore[misc]
     """Complete hierarchical command words, aliases, and declared options."""
 
     def __init__(self, registry: CommandRegistry, include_aliases: bool = True) -> None:

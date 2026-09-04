@@ -11,13 +11,21 @@ from aerogo2.common.enums import (
     AutoLandingRequest,
     Configuration,
     F446State,
+    Go2ControlAuthorityState,
     MorphologyRequest,
     SystemState,
 )
-from aerogo2.common.models import SystemSnapshot
+from aerogo2.common.models import LowCmdOwnershipState, SystemSnapshot
+from aerogo2.common.numeric import finite_real
 from aerogo2.common.results import GuardResult
 from aerogo2.safety.esc_telemetry import assess_esc_telemetry
 from aerogo2.safety.go2_contact import assess_foot_contact
+from aerogo2.safety.pixhawk_freshness import (
+    assess_pixhawk_source_freshness,
+    pixhawk_ground_state_is_current,
+    pixhawk_touchdown_payload_is_valid,
+    timestamps_are_coherent,
+)
 from aerogo2.safety.rc_interlock import assess_flight_enable
 from aerogo2.safety.watchdog import timestamp_is_fresh
 
@@ -71,6 +79,7 @@ _MUTABLE_ALLOWED_TRANSITIONS: Dict[SystemState, Set[SystemState]] = {
         SystemState.BOOT_SAFE,
         SystemState.FLIGHT_MANUAL,
         SystemState.FLIGHT_TO_WALK_PRECHECK,
+        SystemState.LANDING_COMPLIANT,
         SystemState.FAULT,
         SystemState.EMERGENCY_STOP,
     },
@@ -98,6 +107,12 @@ _MUTABLE_ALLOWED_TRANSITIONS: Dict[SystemState, Set[SystemState]] = {
         SystemState.FLIGHT_MANUAL,
         SystemState.FLIGHT_TO_WALK_PRECHECK,
         SystemState.LANDING_COMPLIANT,
+        SystemState.GO2_GROUND_HANDOVER,
+        SystemState.FAULT,
+        SystemState.EMERGENCY_STOP,
+    },
+    SystemState.GO2_GROUND_HANDOVER: {
+        SystemState.FLIGHT_READY,
         SystemState.FAULT,
         SystemState.EMERGENCY_STOP,
     },
@@ -145,6 +160,22 @@ TRANSFORM_STATES: FrozenSet[SystemState] = frozenset(
     | frozenset((SystemState.GO2_JOINT_LOCK_WAIT,))
 )
 
+# A live or ambiguous LowCmd handoff may only coexist with flight states that
+# are explicitly supervised by the sole-writer watchdog.  In particular it
+# must never leak into a morphology/manual state where F446 can move.  FAULT
+# and EMERGENCY_STOP are handled by the unconditional fail-closed edge above.
+_LOWCMD_OWNERSHIP_ALLOWED_STATES: FrozenSet[SystemState] = frozenset(
+    (
+        SystemState.FLIGHT_READY,
+        SystemState.FLIGHT_MANUAL,
+        SystemState.AUTO_LANDING_READY,
+        SystemState.AUTO_LANDING,
+        SystemState.TOUCHDOWN_VERIFY,
+        SystemState.FAULT,
+        SystemState.EMERGENCY_STOP,
+    )
+)
+
 
 class TransitionGuards:
     """Evaluates state graph legality and state-specific safety conditions."""
@@ -172,6 +203,18 @@ class TransitionGuards:
 
         if new_state in (SystemState.FAULT, SystemState.EMERGENCY_STOP):
             return GuardResult.allow()
+
+        if (
+            snapshot.go2.low_level_status.ownership_pending
+            and new_state not in _LOWCMD_OWNERSHIP_ALLOWED_STATES
+        ):
+            self._reject(
+                codes,
+                messages,
+                "GO2_LOWCMD_EXPLICIT_RELEASE_REQUIRED",
+                "Complete the supported-ground LowCmd-to-high-level handover before "
+                f"entering {new_state.name}",
+            )
 
         if current in TRANSFORM_STATES or new_state in TRANSFORM_STATES:
             initial_flight_precheck = (
@@ -320,14 +363,14 @@ class TransitionGuards:
                 self._require_go2_joint_lock(snapshot, codes, messages)
 
         if new_state is SystemState.FLIGHT_MANUAL:
-            if current is SystemState.FLIGHT_READY and not snapshot.ground_arm_authorized:
+            if current is SystemState.FLIGHT_READY and snapshot.ground_arm_authorized is not True:
                 self._reject(
                     codes,
                     messages,
                     "GROUND_ARM_AUTHORIZATION_REQUIRED",
                     "AeroGo2 shell authorization is required before RadioMaster arming",
                 )
-            if current is SystemState.FLIGHT_READY and not snapshot.pixhawk.armed:
+            if current is SystemState.FLIGHT_READY and snapshot.pixhawk.armed is not True:
                 self._reject(
                     codes,
                     messages,
@@ -347,6 +390,7 @@ class TransitionGuards:
                     )
 
         if new_state is SystemState.AUTO_LANDING_READY:
+            self._require_autoland_sources_current(snapshot, codes, messages)
             if not snapshot.pixhawk.armed:
                 self._reject(
                     codes,
@@ -364,15 +408,20 @@ class TransitionGuards:
                     "AUTOLAND_READY_NOT_REQUESTED",
                     "RC CH10 is not AUTO_READY/AUTO_EXECUTE",
                 )
-            if not snapshot.landing_estimate.valid:
+            if (
+                self._config.go2.low_level.enabled
+                and snapshot.go2.control_authority.state
+                is not Go2ControlAuthorityState.LOWCMD_SAFE_HOLD
+            ):
                 self._reject(
                     codes,
                     messages,
-                    "AUTOLAND_ESTIMATOR_INVALID",
-                    snapshot.landing_estimate.reason,
+                    "GO2_LOWCMD_SAFE_HOLD_REQUIRED",
+                    "Automatic landing preparation requires the acquired LowCmd owner in verified safe-hold",
                 )
 
         if new_state is SystemState.AUTO_LANDING:
+            self._require_autoland_sources_current(snapshot, codes, messages)
             if snapshot.rc.auto_landing_request is not AutoLandingRequest.AUTO_EXECUTE:
                 self._reject(
                     codes,
@@ -387,21 +436,199 @@ class TransitionGuards:
                     "PIXHAWK_NOT_ARMED",
                     "Automatic landing requires an armed aircraft",
                 )
-            if not snapshot.landing_estimate.valid:
+            if (
+                self._config.go2.low_level.enabled
+                and snapshot.go2.control_authority.state
+                is not Go2ControlAuthorityState.LOWCMD_SAFE_HOLD
+            ):
+                self._reject(
+                    codes,
+                    messages,
+                    "GO2_LOWCMD_SAFE_HOLD_REQUIRED",
+                    "AUTO_LANDING may start only from the same healthy LowCmd safe-hold epoch",
+                )
+
+        if new_state is SystemState.TOUCHDOWN_VERIFY:
+            source_freshness = assess_pixhawk_source_freshness(
+                snapshot.pixhawk,
+                snapshot.timestamp,
+                self._config.safety.pixhawk_timeout_s,
+                self._config.safety.touchdown_max_source_age_s,
+            )
+            source_timestamps = [
+                snapshot.pixhawk.attitude_timestamp,
+                snapshot.pixhawk.kinematics_timestamp,
+                snapshot.pixhawk.landed_state_timestamp,
+            ]
+            estimate_current = True
+            if current is SystemState.AUTO_LANDING:
+                estimate = snapshot.landing_estimate
+                source_timestamps.append(estimate.timestamp)
+                estimate_current = bool(
+                    type(estimate.valid) is bool
+                    and estimate.valid is True
+                    and type(estimate.ground_detected) is bool
+                    and estimate.ground_detected is True
+                    and finite_real(estimate.height_m) is not None
+                    and finite_real(estimate.vertical_velocity_mps) is not None
+                    and finite_real(estimate.horizontal_velocity_mps) is not None
+                    and timestamp_is_fresh(
+                        snapshot.timestamp,
+                        estimate.timestamp,
+                        self._config.safety.controller_timeout_s,
+                    )
+                )
+            if not source_freshness.touchdown:
+                self._reject(
+                    codes,
+                    messages,
+                    "PIXHAWK_TOUCHDOWN_EVIDENCE_STALE",
+                    "One or more independently timed Pixhawk touchdown sources are stale",
+                )
+            if not pixhawk_touchdown_payload_is_valid(snapshot.pixhawk):
+                self._reject(
+                    codes,
+                    messages,
+                    "PIXHAWK_TOUCHDOWN_PAYLOAD_INVALID",
+                    "Pixhawk touchdown telemetry contains malformed or non-finite values",
+                )
+            if not estimate_current:
                 self._reject(
                     codes,
                     messages,
                     "AUTOLAND_ESTIMATOR_INVALID",
-                    snapshot.landing_estimate.reason,
+                    "The automatic-landing estimate is invalid, lacks ground detection, or is stale",
                 )
-
-        if new_state is SystemState.TOUCHDOWN_VERIFY:
+            if not timestamps_are_coherent(
+                source_timestamps,
+                self._config.safety.touchdown_max_source_skew_s,
+            ):
+                self._reject(
+                    codes,
+                    messages,
+                    "PIXHAWK_TOUCHDOWN_EVIDENCE_INCOHERENT",
+                    "Touchdown sources are outside the allowed mutual-skew window",
+                )
             if not snapshot.pixhawk.landed:
                 self._reject(
                     codes,
                     messages,
                     "PIXHAWK_NOT_LANDED",
                     "Pixhawk landed state is not confirmed",
+                )
+            if current is SystemState.AUTO_LANDING and self._config.go2.low_level.enabled:
+                evidence = snapshot.impact_recovery
+                low_level = snapshot.go2.low_level_status
+                maximum_low_state_age = self._config.go2.low_level.low_state_max_age_s
+                retained_safe_hold = bool(
+                    not self._config.go2.low_level.enabled
+                    or (
+                        snapshot.go2.control_authority.state
+                        is Go2ControlAuthorityState.LOWCMD_SAFE_HOLD
+                        and low_level.ownership_state
+                        in {LowCmdOwnershipState.HOLDING, LowCmdOwnershipState.SAFE_HOLD}
+                        and low_level.owner_epoch > 0
+                        and evidence.go2_ownership_epoch == low_level.owner_epoch
+                        and low_level.healthy
+                        and low_level.connected
+                        and low_level.publisher_active
+                        and low_level.writer_alive
+                        and low_level.watchdog_healthy
+                        and low_level.safe_hold_active
+                        and low_level.safe_hold_settled
+                        and low_level.target_sequence is None
+                        and low_level.target_deadline is None
+                        and low_level.high_level_released
+                        and low_level.network_exclusivity_verified
+                        and low_level.mapping_hash_verified
+                        and low_level.active_mapping_hash == self._config.go2.low_level.mapping_hash
+                        and maximum_low_state_age is not None
+                        and timestamp_is_fresh(
+                            snapshot.timestamp,
+                            low_level.low_state_timestamp,
+                            maximum_low_state_age,
+                        )
+                    )
+                )
+                if (
+                    not snapshot.impact_landing_exit_ready
+                    or not snapshot.post_touchdown_stable_dwell_complete
+                    or snapshot.post_touchdown_last_stability_check_at is None
+                    or not math.isfinite(snapshot.post_touchdown_last_stability_check_at)
+                    or snapshot.timestamp < snapshot.post_touchdown_last_stability_check_at
+                    or snapshot.timestamp - snapshot.post_touchdown_last_stability_check_at
+                    > self._config.safety.post_touchdown_stability_max_check_gap_s
+                    or snapshot.external_setpoint_active
+                    or not evidence.confirmed
+                    or not retained_safe_hold
+                    or evidence.landing_session_id != snapshot.impact_landing_session_id
+                    or snapshot.timestamp >= evidence.valid_until
+                    or not timestamp_is_fresh(
+                        snapshot.timestamp,
+                        evidence.timestamp,
+                        self._config.safety.impact_recovery_status_max_age_s,
+                    )
+                    or not timestamp_is_fresh(
+                        snapshot.timestamp,
+                        evidence.residual_zero_status_timestamp,
+                        self._config.safety.impact_recovery_status_max_age_s,
+                    )
+                ):
+                    self._reject(
+                        codes,
+                        messages,
+                        "IMPACT_RECOVERY_EXIT_NOT_CONFIRMED",
+                        "AUTO_LANDING must retain control until recovery, immutable FC CLEAR/execution proof, fresh persistent-zero status, and the post-touchdown stable dwell are all confirmed",
+                    )
+
+        if new_state is SystemState.GO2_GROUND_HANDOVER:
+            # The SportModeState publisher may legitimately have been silent
+            # while MotionSwitcher was released.  SystemManager waits for a
+            # causally-new post-handover Go2 sample before leaving this state;
+            # requiring the pre-handover sample here would make the handover
+            # impossible after a normal flight-duration LowCmd session.
+            self._require_fresh_devices(
+                snapshot,
+                codes,
+                messages,
+                include_rc=False,
+                include_go2=False,
+            )
+            self._require_disarmed(snapshot, codes, messages)
+            self._require_rotors_stopped(snapshot, codes, messages)
+            self._require_pixhawk_ground_state_current(snapshot, codes, messages)
+            if not snapshot.pixhawk.landed:
+                self._reject(
+                    codes,
+                    messages,
+                    "TOUCHDOWN_NOT_CONFIRMED",
+                    "Pixhawk must report landed during the Go2 control handover",
+                )
+            low_level = snapshot.go2.low_level_status
+            if (
+                self._config.go2.low_level.enabled
+                and snapshot.go2.control_authority.state
+                is not Go2ControlAuthorityState.HIGH_LEVEL_REACQUIRING
+            ):
+                self._reject(
+                    codes,
+                    messages,
+                    "GO2_HIGH_LEVEL_REACQUISITION_REQUIRED",
+                    "The explicit authority transaction must be waiting for a post-handover JOINT_LOCK sample",
+                )
+            if low_level.ownership_pending:
+                self._reject(
+                    codes,
+                    messages,
+                    "GO2_LOWCMD_RELEASE_UNCONFIRMED",
+                    "Ground handover requires a stopped writer, zero epoch, and confirmed high-level service",
+                )
+            if snapshot.f446.duty != 0 or snapshot.f446.faulted:
+                self._reject(
+                    codes,
+                    messages,
+                    "F446_NOT_SAFE",
+                    "F446 must remain stopped and fault-free during ground handover",
                 )
 
         if new_state is SystemState.LANDING_COMPLIANT:
@@ -418,6 +645,7 @@ class TransitionGuards:
             self._require_no_active_faults(snapshot, codes, messages)
             self._require_go2_joint_lock(snapshot, codes, messages)
             self._require_go2_foot_contact(snapshot, codes, messages)
+            self._require_pixhawk_ground_state_current(snapshot, codes, messages)
             if not snapshot.pixhawk.landed:
                 self._reject(
                     codes,
@@ -444,6 +672,7 @@ class TransitionGuards:
             self._require_disarmed(snapshot, codes, messages)
             self._require_rotors_stopped(snapshot, codes, messages)
             self._require_go2_stationary(snapshot, codes, messages)
+            self._require_pixhawk_ground_state_current(snapshot, codes, messages)
             if not snapshot.pixhawk.landed:
                 self._reject(
                     codes,
@@ -487,6 +716,13 @@ class TransitionGuards:
         if new_state is SystemState.BOOT_SAFE:
             self._require_disarmed(snapshot, codes, messages)
             self._require_rotors_stopped(snapshot, codes, messages)
+            if snapshot.go2.low_level_status.ownership_pending:
+                self._reject(
+                    codes,
+                    messages,
+                    "GO2_LOWCMD_EXPLICIT_RELEASE_REQUIRED",
+                    "BOOT_SAFE requires a completed LowCmd-to-high-level handover",
+                )
             if snapshot.active_fault_codes:
                 self._reject(
                     codes,
@@ -611,6 +847,7 @@ class TransitionGuards:
         codes: List[str],
         messages: List[str],
         include_rc: bool,
+        include_go2: bool = True,
     ) -> None:
         now = snapshot.timestamp
         checks: Tuple[Tuple[str, bool, float, float], ...] = (
@@ -626,13 +863,16 @@ class TransitionGuards:
                 snapshot.f446.timestamp,
                 self._config.safety.f446_timeout_s,
             ),
-            (
-                "GO2",
-                snapshot.go2.connected,
-                snapshot.go2.timestamp,
-                self._config.safety.go2_timeout_s,
-            ),
         )
+        if include_go2:
+            checks += (
+                (
+                    "GO2",
+                    snapshot.go2.connected,
+                    snapshot.go2.timestamp,
+                    self._config.safety.go2_timeout_s,
+                ),
+            )
         for name, connected, timestamp, timeout in checks:
             if not connected or timestamp <= 0.0 or not timestamp_is_fresh(now, timestamp, timeout):
                 self._reject(
@@ -653,6 +893,86 @@ class TransitionGuards:
                 )
             ):
                 self._reject(codes, messages, "RC_TIMEOUT", "RC status is failsafe or stale")
+
+    def _require_pixhawk_ground_state_current(
+        self,
+        snapshot: SystemSnapshot,
+        codes: List[str],
+        messages: List[str],
+    ) -> None:
+        if not pixhawk_ground_state_is_current(
+            snapshot.pixhawk,
+            snapshot.timestamp,
+            self._config.safety.pixhawk_timeout_s,
+            self._config.safety.touchdown_max_source_age_s,
+        ):
+            self._reject(
+                codes,
+                messages,
+                "PIXHAWK_GROUND_STATE_STALE",
+                "Pixhawk heartbeat and landed state must both be fresh",
+            )
+
+    def _require_autoland_sources_current(
+        self,
+        snapshot: SystemSnapshot,
+        codes: List[str],
+        messages: List[str],
+    ) -> None:
+        freshness = assess_pixhawk_source_freshness(
+            snapshot.pixhawk,
+            snapshot.timestamp,
+            self._config.safety.pixhawk_timeout_s,
+            self._config.safety.touchdown_max_source_age_s,
+        )
+        if not freshness.touchdown:
+            self._reject(
+                codes,
+                messages,
+                "PIXHAWK_TOUCHDOWN_SOURCE_STALE",
+                "Independent Pixhawk attitude, kinematics, or landed-state telemetry is stale",
+            )
+        if not pixhawk_touchdown_payload_is_valid(snapshot.pixhawk):
+            self._reject(
+                codes,
+                messages,
+                "PIXHAWK_TOUCHDOWN_PAYLOAD_INVALID",
+                "Pixhawk touchdown telemetry contains malformed or non-finite values",
+            )
+        estimate = snapshot.landing_estimate
+        if (
+            not estimate.valid
+            or not estimate.ground_detected
+            or finite_real(estimate.height_m) is None
+            or finite_real(estimate.vertical_velocity_mps) is None
+            or finite_real(estimate.horizontal_velocity_mps) is None
+            or not timestamp_is_fresh(
+                snapshot.timestamp,
+                estimate.timestamp,
+                self._config.safety.controller_timeout_s,
+            )
+        ):
+            self._reject(
+                codes,
+                messages,
+                "AUTOLAND_ESTIMATOR_INVALID",
+                "Landing estimate is invalid, lacks ground detection, or is stale",
+            )
+        elif freshness.touchdown and not timestamps_are_coherent(
+            (
+                snapshot.pixhawk.attitude_timestamp,
+                snapshot.pixhawk.kinematics_timestamp,
+                snapshot.pixhawk.landed_state_timestamp,
+                estimate.timestamp,
+            ),
+            self._config.safety.touchdown_max_source_skew_s,
+        ):
+            self._reject(
+                codes,
+                messages,
+                "PIXHAWK_TOUCHDOWN_SOURCE_INCOHERENT",
+                "Pixhawk touchdown telemetry and landing estimate are outside the allowed mutual-skew window",
+            )
 
     @staticmethod
     def _require_disarmed(snapshot: SystemSnapshot, codes: List[str], messages: List[str]) -> None:
@@ -725,13 +1045,17 @@ class TransitionGuards:
                 "Go2 must be stable and stationary",
             )
 
-    @staticmethod
     def _require_go2_joint_lock(
+        self,
         snapshot: SystemSnapshot,
         codes: List[str],
         messages: List[str],
     ) -> None:
-        if not snapshot.joint_lock_confirmed:
+        if not snapshot.joint_lock_confirmed or (
+            self._config.go2.low_level.enabled
+            and snapshot.go2.control_authority.state
+            is not Go2ControlAuthorityState.HIGH_LEVEL_JOINT_LOCK
+        ):
             TransitionGuards._reject(
                 codes,
                 messages,

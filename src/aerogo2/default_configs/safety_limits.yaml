@@ -8,6 +8,15 @@ safety:
   touchdown_max_tilt_rad: 0.2
   touchdown_max_height_delta_m: 0.02
   touchdown_max_esc_rpm: 50.0
+  # Provisional simulation values only. Re-identify on the instrumented rig.
+  touchdown_max_source_age_s: 0.30
+  touchdown_max_source_skew_s: 0.25
+  post_touchdown_stable_confirm_s: 1.0
+  post_touchdown_stability_max_check_gap_s: 0.1
+  aborted_impact_airborne_confirm_s: 0.5
+  impact_recovery_status_max_age_s: 0.1
+  impact_recovery_completion_timeout_s: 5.0
+  impact_recovery_finalization_timeout_s: 2.0
   pixhawk_timeout_s: 1.0
   f446_timeout_s: 0.5
   go2_timeout_s: 0.5

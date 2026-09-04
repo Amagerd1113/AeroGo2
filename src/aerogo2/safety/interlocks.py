@@ -10,11 +10,19 @@ from aerogo2.common.enums import (
     AutoLandingRequest,
     Configuration,
     F446State,
+    Go2ControlAuthorityState,
     SystemState,
 )
-from aerogo2.common.models import SystemSnapshot
+from aerogo2.common.models import LowCmdOwnershipState, SystemSnapshot
+from aerogo2.common.numeric import finite_real
 from aerogo2.common.results import GuardResult
 from aerogo2.safety.esc_telemetry import assess_esc_telemetry
+from aerogo2.safety.pixhawk_freshness import (
+    assess_pixhawk_source_freshness,
+    pixhawk_ground_state_is_current,
+    pixhawk_touchdown_payload_is_valid,
+    timestamps_are_coherent,
+)
 from aerogo2.safety.rc_interlock import assess_flight_enable
 from aerogo2.safety.watchdog import timestamp_is_fresh
 
@@ -104,6 +112,11 @@ class SafetyInterlocks:
             )
 
         if target is Configuration.WALK:
+            if not self._pixhawk_ground_state_current(snapshot):
+                reject(
+                    "PIXHAWK_GROUND_STATE_STALE",
+                    "Pixhawk heartbeat and landed state must both be fresh.",
+                )
             if not snapshot.pixhawk.landed:
                 reject("TOUCHDOWN_NOT_CONFIRMED", "Pixhawk must report landed.")
             if snapshot.autoland_active or snapshot.external_setpoint_active:
@@ -126,6 +139,13 @@ class SafetyInterlocks:
             messages.append(message)
 
         self._require_fresh_devices(snapshot, reject)
+        if not self._pixhawk_ground_state_current(snapshot):
+            reject(
+                "PIXHAWK_GROUND_STATE_STALE",
+                "Pixhawk heartbeat and landed state must both be fresh.",
+            )
+        elif not snapshot.pixhawk.landed:
+            reject("TOUCHDOWN_NOT_CONFIRMED", "Pixhawk must report landed before walking.")
         if snapshot.configuration is not Configuration.WALK:
             reject("WALK_CONFIGURATION_UNVERIFIED", "WALK configuration is not verified.")
         if not self._f446_configuration_state_is_verified(
@@ -156,7 +176,14 @@ class SafetyInterlocks:
             codes.append(code)
             messages.append(message)
 
-        self._require_fresh_devices(snapshot, reject, require_go2=True)
+        low_level = snapshot.go2.low_level_status
+        lowcmd_pending = low_level.ownership_pending
+        self._require_fresh_devices(
+            snapshot,
+            reject,
+            require_go2=True,
+            allow_lowcmd_lowstate=lowcmd_pending,
+        )
         if snapshot.configuration is not Configuration.FLIGHT:
             reject(
                 "FLIGHT_CONFIGURATION_UNVERIFIED",
@@ -194,18 +221,25 @@ class SafetyInterlocks:
                 "FLIGHT_ENABLE_NOT_LOW",
                 "CH5 must remain LOW until the flight-enable precheck passes.",
             )
-        if not self._go2_stationary(snapshot):
-            reject("GO2_NOT_STATIONARY", "Go2 must remain stationary.")
-        if not snapshot.joint_lock_confirmed:
-            reject(
-                "GO2_JOINT_LOCK_REQUIRED",
-                "Go2 joint lock must be confirmed by telemetry or guarded operator assertion.",
-            )
+        if lowcmd_pending:
+            if not self._lowcmd_holding_is_healthy(snapshot):
+                reject(
+                    "GO2_LOWCMD_NOT_READY_FOR_ARM",
+                    "The sole LowCmd owner must report a fresh, settled safe-hold before flight enable.",
+                )
+        else:
+            if not self._go2_stationary(snapshot):
+                reject("GO2_NOT_STATIONARY", "Go2 must remain stationary.")
+            if not snapshot.joint_lock_confirmed:
+                reject(
+                    "GO2_JOINT_LOCK_REQUIRED",
+                    "Go2 joint lock must be confirmed by telemetry or guarded operator assertion.",
+                )
         if snapshot.active_fault_codes:
             reject("ACTIVE_FAULTS", "Active faults prevent flight readiness.")
         return self._result(codes, messages)
 
-    def can_start_autoland(self, snapshot: SystemSnapshot) -> GuardResult:
+    def _can_autoland_environment(self, snapshot: SystemSnapshot) -> GuardResult:
         codes: List[str] = []
         messages: List[str] = []
 
@@ -230,6 +264,35 @@ class SafetyInterlocks:
             self._config.safety.pixhawk_timeout_s,
         ):
             reject("PIXHAWK_TIMEOUT", "Pixhawk heartbeat is unavailable or stale.")
+        pixhawk_sources = assess_pixhawk_source_freshness(
+            snapshot.pixhawk,
+            snapshot.timestamp,
+            self._config.safety.pixhawk_timeout_s,
+            self._config.safety.touchdown_max_source_age_s,
+        )
+        if not pixhawk_sources.touchdown:
+            reject(
+                "PIXHAWK_TOUCHDOWN_SOURCE_STALE",
+                "Independent Pixhawk attitude, kinematics, or landed-state telemetry is stale.",
+            )
+        elif not pixhawk_touchdown_payload_is_valid(snapshot.pixhawk):
+            reject(
+                "PIXHAWK_TOUCHDOWN_PAYLOAD_INVALID",
+                "Pixhawk touchdown telemetry contains malformed or non-finite values.",
+            )
+        elif not timestamps_are_coherent(
+            (
+                snapshot.pixhawk.attitude_timestamp,
+                snapshot.pixhawk.kinematics_timestamp,
+                snapshot.pixhawk.landed_state_timestamp,
+                snapshot.landing_estimate.timestamp,
+            ),
+            self._config.safety.touchdown_max_source_skew_s,
+        ):
+            reject(
+                "PIXHAWK_TOUCHDOWN_SOURCE_INCOHERENT",
+                "Pixhawk touchdown telemetry and landing estimate are outside the allowed mutual-skew window.",
+            )
         if not snapshot.pixhawk.armed:
             reject("PIXHAWK_DISARMED", "Automatic landing requires an armed Pixhawk.")
         if snapshot.pixhawk.failsafe:
@@ -261,10 +324,30 @@ class SafetyInterlocks:
             snapshot.landing_estimate.vertical_velocity_mps,
             snapshot.landing_estimate.horizontal_velocity_mps,
         )
-        if any(value is None or not math.isfinite(value) for value in estimate_values):
+        if any(finite_real(value) is None for value in estimate_values):
             reject("AUTOLAND_ESTIMATOR_INVALID", "Landing estimate values must be finite.")
         if snapshot.active_fault_codes:
             reject("ACTIVE_FAULTS", "Active faults prevent automatic landing.")
+        return self._result(codes, messages)
+
+    def can_start_autoland(self, snapshot: SystemSnapshot) -> GuardResult:
+        """Check environment plus the authority state for an autoland phase."""
+
+        base = self._can_autoland_environment(snapshot)
+        codes = list(base.codes)
+        messages = list(base.messages)
+        if self._config.go2.low_level.enabled:
+            expected = (
+                Go2ControlAuthorityState.LOWCMD_ACTIVE
+                if snapshot.state is SystemState.AUTO_LANDING
+                else Go2ControlAuthorityState.LOWCMD_SAFE_HOLD
+            )
+            if snapshot.go2.control_authority.state is not expected:
+                codes.append("GO2_CONTROL_AUTHORITY_NOT_READY_FOR_AUTOLAND")
+                messages.append(
+                    "Go2 control authority must be "
+                    f"{expected.value} for this automatic-landing phase."
+                )
         return self._result(codes, messages)
 
     def can_send_landing_setpoint(self, snapshot: SystemSnapshot) -> GuardResult:
@@ -273,7 +356,19 @@ class SafetyInterlocks:
                 "AUTOLAND_NOT_ACTIVE",
                 "External setpoints are permitted only in active AUTO_LANDING.",
             )
-        return self.can_start_autoland(snapshot)
+        base = self._can_autoland_environment(snapshot)
+        codes = list(base.codes)
+        messages = list(base.messages)
+        if (
+            self._config.go2.low_level.enabled
+            and snapshot.go2.control_authority.state is not Go2ControlAuthorityState.LOWCMD_ACTIVE
+        ):
+            codes.append("GO2_LOWCMD_ACTIVE_REQUIRED_FOR_SETPOINT")
+            messages.append(
+                "A landing setpoint requires the exact healthy LOWCMD_ACTIVE owner; "
+                "SAFE_HOLD is terminal for this landing session."
+            )
+        return self._result(codes, messages)
 
     def can_move_go2(self, snapshot: SystemSnapshot) -> GuardResult:
         if snapshot.state is not SystemState.WALK:
@@ -286,6 +381,7 @@ class SafetyInterlocks:
         reject_result: Callable[[str, str], None],
         *,
         require_go2: bool = False,
+        allow_lowcmd_lowstate: bool = False,
     ) -> None:
         if not snapshot.pixhawk.connected or not timestamp_is_fresh(
             snapshot.timestamp,
@@ -299,12 +395,16 @@ class SafetyInterlocks:
             self._config.safety.f446_timeout_s,
         ):
             reject_result("F446_TIMEOUT", "F446 status is unavailable or stale.")
-        if (require_go2 or self._config.go2.enabled) and (
-            not snapshot.go2.connected
-            or not timestamp_is_fresh(
-                snapshot.timestamp,
-                snapshot.go2.timestamp,
-                self._config.safety.go2_timeout_s,
+        if (
+            (require_go2 or self._config.go2.enabled)
+            and not allow_lowcmd_lowstate
+            and (
+                not snapshot.go2.connected
+                or not timestamp_is_fresh(
+                    snapshot.timestamp,
+                    snapshot.go2.timestamp,
+                    self._config.safety.go2_timeout_s,
+                )
             )
         ):
             reject_result("GO2_TIMEOUT", "Go2 status is unavailable or stale.")
@@ -321,14 +421,24 @@ class SafetyInterlocks:
         *,
         exact_zero: bool,
     ) -> bool:
-        return assess_esc_telemetry(
-            snapshot,
-            self._config.esc.slots,
-            exact_zero=exact_zero,
-            maximum_abs_rpm=(
-                None if exact_zero else self._config.safety.maximum_safe_esc_rpm_for_transform
-            ),
-        ).safe
+        return bool(
+            assess_esc_telemetry(
+                snapshot,
+                self._config.esc.slots,
+                exact_zero=exact_zero,
+                maximum_abs_rpm=(
+                    None if exact_zero else self._config.safety.maximum_safe_esc_rpm_for_transform
+                ),
+            ).safe
+        )
+
+    def _pixhawk_ground_state_current(self, snapshot: SystemSnapshot) -> bool:
+        return pixhawk_ground_state_is_current(
+            snapshot.pixhawk,
+            snapshot.timestamp,
+            self._config.safety.pixhawk_timeout_s,
+            self._config.safety.touchdown_max_source_age_s,
+        )
 
     @staticmethod
     def _f446_configuration_state_is_verified(
@@ -358,6 +468,37 @@ class SafetyInterlocks:
             and snapshot.go2.stable
             and not snapshot.go2.moving
             and not snapshot.go2.controller_active
+        )
+
+    def _lowcmd_holding_is_healthy(self, snapshot: SystemSnapshot) -> bool:
+        status = snapshot.go2.low_level_status
+        configured_hash = self._config.go2.low_level.mapping_hash
+        maximum_age = self._config.go2.low_level.low_state_max_age_s
+        low_state_fresh = (
+            maximum_age is not None
+            and status.connected
+            and timestamp_is_fresh(
+                snapshot.timestamp,
+                status.low_state_timestamp,
+                maximum_age,
+            )
+        )
+        return (
+            status.ownership_state is LowCmdOwnershipState.HOLDING
+            and status.owns_lowcmd
+            and status.healthy
+            and status.writer_alive
+            and status.watchdog_healthy
+            and status.safe_hold_active
+            and status.safe_hold_settled
+            and status.target_sequence is None
+            and status.target_deadline is None
+            and status.high_level_released
+            and status.network_exclusivity_verified
+            and status.mapping_hash_verified
+            and configured_hash is not None
+            and status.active_mapping_hash == configured_hash
+            and low_state_fresh
         )
 
     def _f446_current_unsafe(self, snapshot: SystemSnapshot) -> bool:

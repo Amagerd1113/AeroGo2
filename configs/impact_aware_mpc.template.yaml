@@ -1,0 +1,134 @@
+# Production identification template for the paper controller.
+#
+# This file is intentionally NOT included by configs/system.yaml or
+# configs/hardware.yaml.  Null values must be identified on the actual robot;
+# copying values from the synthetic demo is prohibited.  Hardware output must
+# remain disabled until the implemented host residual contract has a matching
+# flight-controller firmware/transport and the cross-device atomic committer is
+# implemented, independently watched, and accepted.  The
+# Go2 LowCmd owner deliberately rejects an unpaired paper command.
+
+schema_version: 3
+profile: production
+parameters_identified: false
+allow_hardware_output: false
+
+frames:
+  world: ENU_Z_UP
+  body: X_FORWARD_Y_LEFT_Z_UP
+  rotor_order: [RR, LF, LR, RF]
+
+rotor:
+  geometry:
+    # Landing-only model: the frame is fully deployed and independently
+    # mechanically locked. There is no folding motor/angle/kinematics input.
+    configuration: FIXED_DEPLOYED_LOCKED
+    reference_origin: TOTAL_SYSTEM_COM_C
+    # Four directly measured, constant vectors from the identified total-system
+    # CoM to each rotor thrust-axis centre, in [RR, LF, LR, RF] order [m].
+    # Record the reference leg pose, payload and battery state in the associated
+    # commissioning record, and bound CoM/inertia drift over the allowed landing
+    # envelope. This model deliberately does not update lever arms online.
+    # Do not enter the bare arm-tube length or reuse the synthetic demo values.
+    lever_arms_from_com_body_m: null
+    # Identify all four unit vectors in the declared body frame.  Do not
+    # assume parallel +Z axes without an installation survey.
+    thrust_directions_body: null
+  aerodynamics:
+    thrust_coefficient_n_per_rad_s_squared: null
+    drag_torque_coefficient_nm_per_rad_s_squared: null
+    spin_directions: null
+  actuator:
+    time_constants_s: null
+    thrust_min_n: null
+    thrust_max_n: null
+    thrust_rate_min_n_per_s: null
+    thrust_rate_max_n_per_s: null
+  correction_safety:
+    # Hard mathematical range is 0..1. Start at 0 for every new test session.
+    target_gain: 0.0
+    maximum_correction_n: null
+    maximum_gain_rise_per_s: null
+
+dynamics:
+  mass_kg: null
+  inertia_body_kg_m2: null
+  gravity_world_m_per_s2: [0.0, 0.0, -9.80665]
+  # Reduced rigid-body position, velocity and inertia are all referenced to C.
+  # Go2 leg FK/IK remains referenced to B and must use the explicit B<->C transform.
+  reference_point: TOTAL_SYSTEM_COM_C
+
+contact:
+  friction_coefficients: null
+  normal_force_max_n: null
+  contact_on_threshold_n: null
+  contact_off_threshold_n: null
+  filter_time_constant_s: null
+  contact_confirm_s: null
+  release_confirm_s: null
+  # Optional scalar contact-detection source. Remove this whole subsection if
+  # a separately validated force sensor/estimator is used. Go2 LowState exposes
+  # only two SDK-indexed int16[4] arrays: do not assume anatomical order or
+  # that either public field is already N. All vectors below except
+  # sdk_indices_by_leg are in algorithm_leg_order.
+  go2_lowstate_force_adapter:
+    mapping_version: null
+    mapping_hash: null
+    calibration_version: null
+    calibration_hash: null
+    algorithm_leg_order: null
+    sdk_indices_by_leg: null
+    # Select exactly LOWSTATE_FOOT_FORCE_RAW_INT16 or
+    # LOWSTATE_FOOT_FORCE_ESTIMATED_INT16 after comparative calibration.
+    source: null
+    offsets_sdk_by_algorithm_leg: null
+    scales_n_per_sdk_unit_by_algorithm_leg: null
+    signs_by_algorithm_leg: null
+    maximum_valid_normal_force_n_by_algorithm_leg: null
+
+impact:
+  maximum_normal_impulse_ns: null
+  impact_duration_s: null
+  maximum_average_normal_force_n: null
+
+mpc:
+  horizon_steps: null
+  dt_s: null
+  solver:
+    max_iterations: null
+    ftol: null
+    constraint_tolerance: null
+    timeout_s: null
+    display: false
+  # Diagonal weights. Dimensions: tracking=12, input=16, state/slack=16,
+  # impulse=3, touchdown_velocity=3.
+  weights:
+    tracking: null
+    input: null
+    input_rate: null
+    slack: null
+    terminal_tracking: null
+    impulse: null
+    touchdown_velocity: null
+  state_bounds:
+    lower: null
+    upper: null
+    soft_mask: null
+
+admittance:
+  transition_duration_s: null
+  touchdown_inertia: null
+  stance_inertia: null
+  touchdown_damping: null
+  stance_damping: null
+  restoring_stiffness: null
+  stance_stiffness: null
+  force_error_deadband_n: null
+  correction_position_limit_m: null
+  correction_velocity_limit_m_per_s: null
+  contact_release_policy: null
+  anti_windup_enabled: true
+  # Leg order and each leg's workspace/joint limits must match the dedicated
+  # Unitree LowCmd adapter; the current SportClient bridge is not sufficient.
+  leg_order: null
+  legs: null

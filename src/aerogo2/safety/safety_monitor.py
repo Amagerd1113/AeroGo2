@@ -11,10 +11,23 @@ import math
 from typing import Callable, Dict, List, Optional
 
 from aerogo2.common.config import AppConfig
-from aerogo2.common.enums import Configuration, F446State, SafetySeverity, SystemState
-from aerogo2.common.models import SafetyViolation, SystemSnapshot
+from aerogo2.common.enums import (
+    Configuration,
+    F446State,
+    Go2ControlAuthorityState,
+    SafetySeverity,
+    SystemState,
+)
+from aerogo2.common.models import LowCmdOwnershipState, SafetyViolation, SystemSnapshot
+from aerogo2.common.numeric import finite_real
 from aerogo2.safety.esc_telemetry import assess_esc_telemetry
 from aerogo2.safety.go2_contact import assess_foot_contact
+from aerogo2.safety.pixhawk_freshness import (
+    assess_pixhawk_source_freshness,
+    pixhawk_ground_state_is_current,
+    pixhawk_touchdown_payload_is_valid,
+    timestamps_are_coherent,
+)
 from aerogo2.safety.rc_interlock import assess_flight_enable
 from aerogo2.safety.watchdog import timestamp_is_fresh
 
@@ -52,6 +65,35 @@ _FLIGHT_JOINT_LOCK_STATES = frozenset(
         SystemState.TRANSFORM_TO_WALK,
     )
 )
+_LOWCMD_STABLE_OWNER_STATES = frozenset(
+    (
+        LowCmdOwnershipState.HOLDING,
+        LowCmdOwnershipState.MPC_ACTIVE,
+        LowCmdOwnershipState.SAFE_HOLD,
+    )
+)
+_LOWCMD_ALLOWED_SYSTEM_STATES = frozenset(
+    (
+        # FLIGHT_READY is the only normal state in which the ground-only
+        # ownership handover may have completed before Pixhawk arming.
+        SystemState.FLIGHT_READY,
+        SystemState.FLIGHT_MANUAL,
+        SystemState.AUTO_LANDING_READY,
+        SystemState.AUTO_LANDING,
+        SystemState.TOUCHDOWN_VERIFY,
+        # A fault must not make the sole writer disappear while airborne.
+        SystemState.FAULT,
+        SystemState.EMERGENCY_STOP,
+    )
+)
+_LOWCMD_REQUIRED_SYSTEM_STATES = frozenset(
+    (
+        SystemState.FLIGHT_MANUAL,
+        SystemState.AUTO_LANDING_READY,
+        SystemState.AUTO_LANDING,
+        SystemState.TOUCHDOWN_VERIFY,
+    )
+)
 
 
 class SafetyMonitor:
@@ -85,6 +127,43 @@ class SafetyMonitor:
 
         self._evaluate_freshness(snapshot, add)
 
+        if snapshot.state in _AUTOLAND_STATES:
+            source_freshness = assess_pixhawk_source_freshness(
+                snapshot.pixhawk,
+                snapshot.timestamp,
+                self._config.safety.pixhawk_timeout_s,
+                self._config.safety.touchdown_max_source_age_s,
+            )
+            if not source_freshness.touchdown:
+                add(
+                    "PIXHAWK_TOUCHDOWN_SOURCE_STALE",
+                    SafetySeverity.FAULT,
+                    "One or more independent Pixhawk touchdown sources are disconnected, invalid, future-dated, or stale.",
+                    "Stop external descent setpoints and return control to RadioMaster/Pixhawk.",
+                )
+            elif not pixhawk_touchdown_payload_is_valid(snapshot.pixhawk):
+                add(
+                    "PIXHAWK_TOUCHDOWN_PAYLOAD_INVALID",
+                    SafetySeverity.FAULT,
+                    "Pixhawk touchdown telemetry contains a malformed boolean or non-finite numeric value.",
+                    "Stop external descent setpoints and inspect the MAVLink telemetry source.",
+                )
+            elif not timestamps_are_coherent(
+                (
+                    snapshot.pixhawk.attitude_timestamp,
+                    snapshot.pixhawk.kinematics_timestamp,
+                    snapshot.pixhawk.landed_state_timestamp,
+                    snapshot.landing_estimate.timestamp,
+                ),
+                self._config.safety.touchdown_max_source_skew_s,
+            ):
+                add(
+                    "PIXHAWK_TOUCHDOWN_SOURCE_INCOHERENT",
+                    SafetySeverity.FAULT,
+                    "Pixhawk touchdown inputs and the landing estimate do not belong to one bounded observation window.",
+                    "Stop external descent setpoints and inspect MAVLink stream rates and estimator timing.",
+                )
+
         if snapshot.rc.failsafe:
             add(
                 "RC_FAILSAFE",
@@ -105,7 +184,125 @@ class SafetyMonitor:
                 "Pixhawk armed without a live AeroGo2 shell authorization.",
                 "Stop supervised outputs; retain RadioMaster control and do not auto-disarm.",
             )
-        if snapshot.state in _FLIGHT_JOINT_LOCK_STATES and not snapshot.joint_lock_confirmed:
+        low_level = snapshot.go2.low_level_status
+        lowcmd_owned = low_level.ownership_pending
+        lowcmd_stable = low_level.ownership_state in _LOWCMD_STABLE_OWNER_STATES
+        authority = snapshot.go2.control_authority
+        authority_state = authority.state
+        if lowcmd_owned and snapshot.state not in _LOWCMD_ALLOWED_SYSTEM_STATES:
+            add(
+                "GO2_LOWCMD_OUTSIDE_AUTHORIZED_STATE",
+                (SafetySeverity.EMERGENCY if snapshot.pixhawk.armed else SafetySeverity.FAULT),
+                "The dedicated LowCmd writer owns Go2 outside an authorized flight/fault state.",
+                "Keep the writer in safe-hold; release it only after verified ground, disarm, and zero-rotor checks.",
+            )
+        transition_authorized = self._authority_transition_is_authorized(snapshot)
+        if authority.transition_pending:
+            deadline = authority.transition_deadline
+            if (
+                not transition_authorized
+                or deadline is None
+                or not math.isfinite(deadline)
+                or snapshot.timestamp >= deadline
+            ):
+                add(
+                    "GO2_CONTROL_AUTHORITY_TRANSITION_TIMEOUT",
+                    (SafetySeverity.EMERGENCY if snapshot.pixhawk.armed else SafetySeverity.FAULT),
+                    "The Go2 control-authority transition is unauthorized, invalid, or timed out.",
+                    "Keep the current sole writer/ground handover fail-closed and inspect the ownership epoch before retrying.",
+                )
+        if self._authority_is_inconsistent(snapshot):
+            add(
+                "GO2_CONTROL_AUTHORITY_INCONSISTENT",
+                (SafetySeverity.EMERGENCY if snapshot.pixhawk.armed else SafetySeverity.FAULT),
+                "The explicit Go2 control-authority state contradicts LowCmd ownership facts.",
+                "Do not start SportClient or another LowCmd writer; retain the existing fail-closed owner and inspect the epoch.",
+            )
+        if (
+            lowcmd_owned
+            and not authority.transition_pending
+            and (not lowcmd_stable or not self._lowcmd_owner_healthy(snapshot))
+        ):
+            add(
+                "GO2_LOWCMD_OWNER_UNHEALTHY",
+                (SafetySeverity.EMERGENCY if snapshot.pixhawk.armed else SafetySeverity.FAULT),
+                "The sole Go2 LowCmd owner is active but its stream, watchdog, mapping, or LowState health is invalid.",
+                "Revoke the MPC lease so the same writer remains in safe-hold; do not stop LowCmd while airborne.",
+            )
+        if self._config.go2.low_level.enabled and snapshot.state in _LOWCMD_REQUIRED_SYSTEM_STATES:
+            recovery_finalizing = self._impact_recovery_finalization_authorized(snapshot)
+            if snapshot.state is SystemState.AUTO_LANDING and recovery_finalizing:
+                authority_missing = authority_state not in {
+                    Go2ControlAuthorityState.LOWCMD_ACTIVE,
+                    Go2ControlAuthorityState.LOWCMD_SAFE_HOLD,
+                }
+            else:
+                expected_authority = (
+                    Go2ControlAuthorityState.LOWCMD_ACTIVE
+                    if snapshot.state is SystemState.AUTO_LANDING
+                    else Go2ControlAuthorityState.LOWCMD_SAFE_HOLD
+                )
+                authority_missing = authority_state is not expected_authority
+        else:
+            authority_missing = False
+        if authority_missing:
+            add(
+                "GO2_LOWCMD_OWNER_MISSING",
+                (SafetySeverity.EMERGENCY if snapshot.pixhawk.armed else SafetySeverity.FAULT),
+                "This flight state does not have the required explicit LowCmd authority phase.",
+                "Use the independent flight fallback; acquire LowCmd only after returning to a supported, disarmed, zero-RPM state.",
+            )
+        if (
+            snapshot.state is SystemState.AUTO_LANDING
+            and self._config.go2.low_level.enabled
+            and (
+                authority_state
+                not in (
+                    {Go2ControlAuthorityState.LOWCMD_ACTIVE}
+                    if not self._impact_recovery_finalization_authorized(snapshot)
+                    else {
+                        Go2ControlAuthorityState.LOWCMD_ACTIVE,
+                        Go2ControlAuthorityState.LOWCMD_SAFE_HOLD,
+                    }
+                )
+                or not lowcmd_owned
+                or (
+                    low_level.ownership_state is not LowCmdOwnershipState.MPC_ACTIVE
+                    and not (
+                        self._impact_recovery_finalization_authorized(snapshot)
+                        and low_level.ownership_state
+                        in {LowCmdOwnershipState.HOLDING, LowCmdOwnershipState.SAFE_HOLD}
+                    )
+                )
+            )
+        ):
+            add(
+                "GO2_LOWCMD_MPC_INACTIVE",
+                (SafetySeverity.EMERGENCY if snapshot.pixhawk.armed else SafetySeverity.FAULT),
+                "AUTO_LANDING requires a healthy MPC target lease held by the sole LowCmd owner.",
+                "Abort impact-aware landing, clear the rotor residual, and retain the Go2 safe-hold stream.",
+            )
+        if lowcmd_stable and authority_state in {
+            Go2ControlAuthorityState.LOWCMD_ACTIVE,
+            Go2ControlAuthorityState.LOWCMD_SAFE_HOLD,
+        }:
+            tracking_failure = self._lowcmd_joint_tracking_failure(snapshot)
+            if tracking_failure is not None:
+                add(
+                    "GO2_JOINT_TRACKING_ERROR",
+                    (SafetySeverity.EMERGENCY if snapshot.pixhawk.armed else SafetySeverity.FAULT),
+                    tracking_failure,
+                    "Revoke the MPC lease into the same-owner safe hold and inspect mapping, timing, mechanics, gains, and joint limits.",
+                )
+        high_level_expected = (
+            snapshot.state in _FLIGHT_JOINT_LOCK_STATES
+            and not lowcmd_owned
+            and (
+                not self._config.go2.low_level.enabled
+                or authority_state is Go2ControlAuthorityState.HIGH_LEVEL_JOINT_LOCK
+            )
+        )
+        if high_level_expected and not snapshot.joint_lock_confirmed:
             add(
                 "GO2_JOINT_LOCK_LOST",
                 (SafetySeverity.EMERGENCY if snapshot.pixhawk.armed else SafetySeverity.FAULT),
@@ -128,9 +325,32 @@ class SafetyMonitor:
                 "Go2 telemetry became unsafe after operator-confirmed joint lock.",
                 "Retain RadioMaster/Pixhawk control and restore a stationary phone-app Lock On state.",
             )
+        if (
+            self._config.go2.low_level.enabled
+            and snapshot.state in _FLIGHT_JOINT_LOCK_STATES
+            and not lowcmd_owned
+            and authority_state
+            not in {
+                Go2ControlAuthorityState.HIGH_LEVEL_JOINT_LOCK,
+                Go2ControlAuthorityState.HIGH_LEVEL_REACQUIRING,
+            }
+        ):
+            add(
+                "GO2_CONTROL_AUTHORITY_UNKNOWN",
+                (SafetySeverity.EMERGENCY if snapshot.pixhawk.armed else SafetySeverity.FAULT),
+                "No authoritative high-level JOINT_LOCK or exclusive LowCmd owner is proven.",
+                "Keep all new actuation inhibited until the ownership transaction is reconciled.",
+            )
 
         if snapshot.state is SystemState.LANDING_COMPLIANT:
             contact = assess_foot_contact(snapshot.go2, self._config.go2)
+            if not self._pixhawk_ground_state_is_current(snapshot) or not snapshot.pixhawk.landed:
+                add(
+                    "PIXHAWK_GROUND_STATE_INVALID_DURING_LANDING_COMPLIANCE",
+                    SafetySeverity.FAULT,
+                    "Landing compliance lacks fresh landed-state evidence.",
+                    "Re-lock Go2 and restore current Pixhawk ground-state telemetry.",
+                )
             if snapshot.pixhawk.armed:
                 add(
                     "PIXHAWK_ARMED_DURING_LANDING_COMPLIANCE",
@@ -173,7 +393,61 @@ class SafetyMonitor:
                     "Re-lock Go2 before any morphology movement.",
                 )
 
+        if snapshot.state is SystemState.GO2_GROUND_HANDOVER:
+            if (
+                not self._pixhawk_ground_state_is_current(snapshot)
+                or snapshot.pixhawk.armed
+                or not snapshot.pixhawk.landed
+            ):
+                add(
+                    "GO2_HANDOVER_NOT_GROUNDED",
+                    SafetySeverity.EMERGENCY,
+                    "Go2 high-level handover is waiting while Pixhawk is armed or not landed.",
+                    "Keep personnel clear, stop supervised outputs, and do not issue Sport commands.",
+                )
+            if self._esc_is_unsafe(snapshot):
+                add(
+                    "ESC_RPM_NONZERO_DURING_GO2_HANDOVER",
+                    SafetySeverity.EMERGENCY,
+                    "ESC telemetry is not complete, healthy, finite, and exactly zero during Go2 handover.",
+                    "Keep the vehicle supported and do not continue the high-level handover.",
+                )
+            if snapshot.f446.duty != 0 or snapshot.f446.faulted:
+                add(
+                    "F446_UNSAFE_DURING_GO2_HANDOVER",
+                    SafetySeverity.FAULT,
+                    "F446 is moving or faulted during the Go2 high-level handover.",
+                    "Stop the folding drive and keep the deployed structure mechanically locked.",
+                )
+            if snapshot.go2.low_level_status.ownership_pending:
+                add(
+                    "GO2_LOWCMD_RELEASE_UNCONFIRMED",
+                    SafetySeverity.FAULT,
+                    "LowCmd ownership reappeared or remained ambiguous during the high-level handover.",
+                    "Do not issue Sport commands; retain the owner process and inspect the handover audit.",
+                )
+            if self._go2_joint_lock_transition_is_unsafe(snapshot):
+                add(
+                    "GO2_UNSAFE_DURING_GROUND_HANDOVER",
+                    SafetySeverity.FAULT,
+                    "Go2 entered a locomotion or unsafe-speed state while waiting for mode=6 JOINT_LOCK.",
+                    "Keep the vehicle supported and select Joint Lock without commanding locomotion.",
+                )
+
         if snapshot.state in _TRANSFORM_INTERLOCK_STATES:
+            if snapshot.state in {
+                SystemState.HOMING_TO_WALK,
+                SystemState.FLIGHT_TO_WALK_PRECHECK,
+                SystemState.TRANSFORM_TO_WALK,
+            } and (
+                not self._pixhawk_ground_state_is_current(snapshot) or not snapshot.pixhawk.landed
+            ):
+                add(
+                    "PIXHAWK_GROUND_STATE_INVALID_DURING_WALK_TRANSFORM",
+                    SafetySeverity.FAULT,
+                    "A WALK-directed morphology transaction lacks fresh landed-state evidence.",
+                    "Stop the F446 mechanism and restore current Pixhawk ground-state telemetry.",
+                )
             if snapshot.pixhawk.failsafe or snapshot.pixhawk.rc_failsafe:
                 add(
                     "PIXHAWK_FAILSAFE",
@@ -372,12 +646,21 @@ class SafetyMonitor:
             if not connected or not timestamp_is_fresh(snapshot.timestamp, timestamp, timeout_s):
                 add_violation(code, SafetySeverity.FAULT, message, action)
 
+        high_level_reacquisition_wait = bool(
+            snapshot.go2.control_authority.state is Go2ControlAuthorityState.HIGH_LEVEL_REACQUIRING
+            and snapshot.go2.control_authority.transition_pending
+            and self._authority_transition_is_authorized(snapshot)
+        )
         if self._config.go2.enabled and (
-            not snapshot.go2.connected
-            or not timestamp_is_fresh(
-                snapshot.timestamp,
-                snapshot.go2.timestamp,
-                self._config.safety.go2_timeout_s,
+            not snapshot.go2.low_level_status.ownership_pending
+            and not high_level_reacquisition_wait
+            and (
+                not snapshot.go2.connected
+                or not timestamp_is_fresh(
+                    snapshot.timestamp,
+                    snapshot.go2.timestamp,
+                    self._config.safety.go2_timeout_s,
+                )
             )
         ):
             add_violation(
@@ -386,6 +669,228 @@ class SafetyMonitor:
                 "Go2 status is disconnected, invalid, or stale.",
                 "Inhibit walking permission and all new transforms.",
             )
+
+        low_level = snapshot.go2.low_level_status
+        if low_level.ownership_pending:
+            maximum_age = self._config.go2.low_level.low_state_max_age_s
+            if (
+                maximum_age is None
+                or not low_level.connected
+                or not timestamp_is_fresh(
+                    snapshot.timestamp,
+                    low_level.low_state_timestamp,
+                    maximum_age,
+                )
+            ):
+                add_violation(
+                    "GO2_LOWSTATE_TIMEOUT",
+                    (SafetySeverity.EMERGENCY if snapshot.pixhawk.armed else SafetySeverity.FAULT),
+                    "The active LowCmd owner has disconnected, invalid, or stale LowState feedback.",
+                    "Keep the sole writer in its verified safe-hold path and use the independent flight fallback.",
+                )
+
+    def _lowcmd_owner_healthy(self, snapshot: SystemSnapshot) -> bool:
+        status = snapshot.go2.low_level_status
+        configured_hash = self._config.go2.low_level.mapping_hash
+        if status.ownership_state is LowCmdOwnershipState.MPC_ACTIVE:
+            deadline = status.target_deadline
+            phase_valid = (
+                status.target_sequence is not None
+                and deadline is not None
+                and math.isfinite(deadline)
+                and snapshot.timestamp < deadline
+                and not status.safe_hold_active
+                and not status.safe_hold_settled
+            )
+        elif status.ownership_state in {
+            LowCmdOwnershipState.HOLDING,
+            LowCmdOwnershipState.SAFE_HOLD,
+        }:
+            phase_valid = (
+                status.safe_hold_active
+                and status.safe_hold_settled
+                and status.target_sequence is None
+                and status.target_deadline is None
+            )
+        else:
+            phase_valid = False
+        return (
+            status.connected
+            and status.owner_epoch > 0
+            and status.healthy
+            and status.publisher_active
+            and status.writer_alive
+            and status.watchdog_healthy
+            and status.high_level_released
+            and status.network_exclusivity_verified
+            and status.mapping_hash_verified
+            and configured_hash is not None
+            and status.active_mapping_hash == configured_hash
+            and phase_valid
+        )
+
+    def _impact_recovery_finalization_authorized(self, snapshot: SystemSnapshot) -> bool:
+        evidence = snapshot.impact_recovery
+        status = snapshot.go2.low_level_status
+        return bool(
+            snapshot.state is SystemState.AUTO_LANDING
+            and evidence.confirmed
+            and evidence.landing_session_id == snapshot.impact_landing_session_id
+            and evidence.go2_ownership_epoch == status.owner_epoch
+            and timestamp_is_fresh(
+                snapshot.timestamp,
+                evidence.timestamp,
+                self._config.safety.impact_recovery_status_max_age_s,
+            )
+            and timestamp_is_fresh(
+                snapshot.timestamp,
+                evidence.residual_zero_status_timestamp,
+                self._config.safety.impact_recovery_status_max_age_s,
+            )
+            and snapshot.timestamp < evidence.valid_until
+        )
+
+    def _authority_transition_is_authorized(self, snapshot: SystemSnapshot) -> bool:
+        authority = snapshot.go2.control_authority
+        low_level = snapshot.go2.low_level_status
+        ground_state_current = self._pixhawk_ground_state_is_current(snapshot)
+        if authority.state is Go2ControlAuthorityState.LOWCMD_ACQUIRING:
+            return bool(
+                snapshot.state is SystemState.FLIGHT_READY
+                and ground_state_current
+                and not snapshot.pixhawk.armed
+                and snapshot.pixhawk.landed
+                and low_level.ownership_state is LowCmdOwnershipState.ACQUIRING
+                and low_level.owner_epoch > 0
+                and authority.ownership_epoch == low_level.owner_epoch
+            )
+        if authority.state is Go2ControlAuthorityState.HIGH_LEVEL_REACQUIRING:
+            return bool(
+                snapshot.state
+                in {
+                    SystemState.TOUCHDOWN_VERIFY,
+                    SystemState.GO2_GROUND_HANDOVER,
+                    SystemState.FLIGHT_READY,
+                    SystemState.BOOT_SAFE,
+                    SystemState.FAULT,
+                    SystemState.EMERGENCY_STOP,
+                }
+                and ground_state_current
+                and not snapshot.pixhawk.armed
+                and snapshot.pixhawk.landed
+                and low_level.ownership_state
+                in {
+                    LowCmdOwnershipState.RELEASING,
+                    LowCmdOwnershipState.OBSERVE_ONLY,
+                }
+            )
+        return False
+
+    def _pixhawk_ground_state_is_current(self, snapshot: SystemSnapshot) -> bool:
+        return pixhawk_ground_state_is_current(
+            snapshot.pixhawk,
+            snapshot.timestamp,
+            self._config.safety.pixhawk_timeout_s,
+            self._config.safety.touchdown_max_source_age_s,
+        )
+
+    @staticmethod
+    def _authority_is_inconsistent(snapshot: SystemSnapshot) -> bool:
+        authority = snapshot.go2.control_authority
+        low_level = snapshot.go2.low_level_status
+        state = authority.state
+        if state is Go2ControlAuthorityState.HIGH_LEVEL_JOINT_LOCK:
+            return low_level.ownership_pending or authority.ownership_epoch != 0
+        if state is Go2ControlAuthorityState.LOWCMD_ACQUIRING:
+            return bool(
+                low_level.ownership_state is not LowCmdOwnershipState.ACQUIRING
+                or low_level.owner_epoch <= 0
+                or authority.ownership_epoch != low_level.owner_epoch
+            )
+        if state is Go2ControlAuthorityState.LOWCMD_ACTIVE:
+            return bool(
+                low_level.ownership_state is not LowCmdOwnershipState.MPC_ACTIVE
+                or low_level.owner_epoch <= 0
+                or authority.ownership_epoch != low_level.owner_epoch
+            )
+        if state is Go2ControlAuthorityState.LOWCMD_SAFE_HOLD:
+            return bool(
+                low_level.ownership_state
+                not in {LowCmdOwnershipState.HOLDING, LowCmdOwnershipState.SAFE_HOLD}
+                or low_level.owner_epoch <= 0
+                or authority.ownership_epoch != low_level.owner_epoch
+            )
+        if state is Go2ControlAuthorityState.HIGH_LEVEL_REACQUIRING:
+            return bool(
+                low_level.ownership_state
+                not in {LowCmdOwnershipState.RELEASING, LowCmdOwnershipState.OBSERVE_ONLY}
+                or (
+                    low_level.ownership_state is LowCmdOwnershipState.OBSERVE_ONLY
+                    and low_level.ownership_pending
+                )
+            )
+        return False
+
+    def _lowcmd_joint_tracking_failure(self, snapshot: SystemSnapshot) -> Optional[str]:
+        status = snapshot.go2.low_level_status
+        limits = self._config.go2.low_level.tracking_position_error_limit_rad
+        references = status.tracking_reference_q_rad
+        errors = status.position_error_rad
+        motors = status.motors
+        if limits is None or len(limits) != 12:
+            return "The commissioned 12-joint tracking-error limits are unavailable."
+        if len(references) != 12 or len(errors) != 12 or len(motors) != 12:
+            return "The causally paired LowCmd/LowState tracking sample is incomplete."
+        feedback_time = status.tracking_error_timestamp
+        reference_time = status.tracking_reference_write_timestamp
+        maximum_age = self._config.go2.low_level.low_state_max_age_s
+        if maximum_age is None or not math.isfinite(maximum_age) or maximum_age <= 0.0:
+            return "The commissioned LowState age limit is unavailable or invalid."
+        if (
+            not math.isfinite(feedback_time)
+            or not math.isfinite(reference_time)
+            or reference_time <= 0.0
+            or feedback_time < reference_time
+            or status.tracking_reference_write_generation <= 0
+            or not timestamp_is_fresh(
+                snapshot.timestamp,
+                feedback_time,
+                maximum_age,
+            )
+        ):
+            return "The LowCmd/LowState tracking pair is stale, future-dated, or not causal."
+        maximum_ratio = 0.0
+        maximum_index = 0
+        for index, (reference, error, limit, motor) in enumerate(
+            zip(references, errors, limits, motors)
+        ):
+            measured_q = motor.q_rad
+            values = (reference, error, limit, motor.timestamp)
+            if (
+                motor.lost
+                or measured_q is None
+                or any(value is None for value in values)
+                or any(not math.isfinite(float(value)) for value in values if value is not None)
+                or not math.isfinite(measured_q)
+                or float(limit) <= 0.0
+                or motor.timestamp != feedback_time
+            ):
+                return f"Joint {index} has invalid paired tracking feedback."
+            measured_error = measured_q - float(reference)
+            if not math.isclose(measured_error, float(error), rel_tol=0.0, abs_tol=1.0e-9):
+                return (
+                    f"Joint {index} tracking error does not match its paired command and feedback."
+                )
+            ratio = abs(float(error)) / float(limit)
+            if ratio > maximum_ratio:
+                maximum_ratio = ratio
+                maximum_index = index
+        if maximum_ratio > 1.0:
+            return (
+                f"Joint {maximum_index} tracking error exceeds its commissioned limit "
+                f"({maximum_ratio:.3f} times the limit)."
+            )
+        return None
 
     def _esc_is_unsafe(self, snapshot: SystemSnapshot) -> bool:
         return not assess_esc_telemetry(
@@ -474,6 +979,7 @@ class SafetyMonitor:
             state_expected = Configuration.WALK
         elif snapshot.state in (
             SystemState.GO2_JOINT_LOCK_WAIT,
+            SystemState.GO2_GROUND_HANDOVER,
             SystemState.FLIGHT_READY,
             SystemState.FLIGHT_MANUAL,
             SystemState.AUTO_LANDING_READY,
@@ -537,4 +1043,4 @@ class SafetyMonitor:
             estimate.vertical_velocity_mps,
             estimate.horizontal_velocity_mps,
         )
-        return any(value is not None and not math.isfinite(value) for value in numeric_values)
+        return any(finite_real(value) is None for value in numeric_values)

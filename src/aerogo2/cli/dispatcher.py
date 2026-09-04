@@ -238,6 +238,23 @@ class CommandDispatcher:
                         + stop_result.message,
                     )
                 )
+            low_level = self.manager.snapshot.go2.low_level_status
+            if low_level.ownership_pending:
+                return DispatchOutcome(
+                    CommandResult(
+                        CommandStatus.REJECTED,
+                        "Console exit inhibited: Go2 LowCmd ownership is still pending "
+                        f"in {low_level.ownership_state.value} (epoch "
+                        f"{low_level.owner_epoch}). Keep this console and its safety "
+                        "monitor running, then use the explicit ground-only LowCmd "
+                        "release command after support/disarm/rotor-stop checks pass.",
+                        {
+                            "code": "GO2_LOW_CMD_OWNER_ACTIVE",
+                            "ownership_epoch": low_level.owner_epoch,
+                            "ownership_state": low_level.ownership_state.value,
+                        },
+                    )
+                )
             return DispatchOutcome(
                 CommandResult(CommandStatus.SUCCESS, "Console exit requested"),
                 should_exit=True,

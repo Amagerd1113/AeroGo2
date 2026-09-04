@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from aerogo2.bridges.go2_control_arbiter import Go2ControlArbiter
 from aerogo2.bridges.go2_sdk_bridge import UnitreeGo2Bridge
 from aerogo2.common.clock import ManualClock
 from aerogo2.common.config import AppConfig
@@ -14,6 +15,21 @@ from aerogo2.landing.safe_descent_controller import SafeDescentController
 from aerogo2.manager.system_manager import SystemManager
 from aerogo2.safety.safety_monitor import SafetyMonitor
 from aerogo2.simulation.world import SimulationWorld
+
+
+def _writable_bridge(app_config: AppConfig, clock: ManualClock) -> UnitreeGo2Bridge:
+    """Construct a writer through the same arbitration boundary as runtime."""
+
+    arbiter = Go2ControlArbiter(
+        domain_id=app_config.go2.domain_id,
+        network_interface=app_config.go2.network_interface,
+    )
+    return UnitreeGo2Bridge(
+        app_config.go2,
+        clock=clock,
+        allow_control=True,
+        control_arbiter=arbiter,
+    )
 
 
 def _joint_lock_message() -> SimpleNamespace:
@@ -82,7 +98,7 @@ async def test_1002_lock_finalization_disables_joystick_without_changing_raw_mod
     app_config: AppConfig,
     clock: ManualClock,
 ) -> None:
-    bridge = UnitreeGo2Bridge(app_config.go2, clock=clock, allow_control=True)
+    bridge = _writable_bridge(app_config, clock)
     calls: list[object] = []
 
     class Client:
@@ -122,7 +138,7 @@ async def test_unlocked_flight_pose_waits_for_operator_then_disables_joystick(
     app_config: AppConfig,
     clock: ManualClock,
 ) -> None:
-    bridge = UnitreeGo2Bridge(app_config.go2, clock=clock, allow_control=True)
+    bridge = _writable_bridge(app_config, clock)
     calls: list[object] = []
 
     class Client:
@@ -222,7 +238,7 @@ async def test_prelocked_go2_still_disables_original_remote(
     app_config: AppConfig,
     clock: ManualClock,
 ) -> None:
-    bridge = UnitreeGo2Bridge(app_config.go2, clock=clock, allow_control=True)
+    bridge = _writable_bridge(app_config, clock)
     bridge._on_state(_joint_lock_message())
     bridge._connected = True
     calls: list[object] = []
@@ -252,7 +268,7 @@ async def test_landing_balance_keeps_original_remote_disabled_then_relocks(
     app_config: AppConfig,
     clock: ManualClock,
 ) -> None:
-    bridge = UnitreeGo2Bridge(app_config.go2, clock=clock, allow_control=True)
+    bridge = _writable_bridge(app_config, clock)
     bridge._on_state(_joint_lock_message())
     bridge._connected = True
     calls: list[object] = []
@@ -372,9 +388,7 @@ async def test_hardware_transform_filters_phone_transition_and_accepts_1002_lock
         await manager.tick()
         assert manager.state is SystemState.GO2_JOINT_LOCK_WAIT
         assert all(item.code != "GO2_MOVING_DURING_TRANSFORM" for item in manager.violations)
-        assert all(
-            item.code != "GO2_UNSAFE_DURING_JOINT_LOCK" for item in manager.violations
-        )
+        assert all(item.code != "GO2_UNSAFE_DURING_JOINT_LOCK" for item in manager.violations)
 
         world.go2.inject_status(
             locomotion_mode="IDLE_STAND",
@@ -468,9 +482,7 @@ async def test_joint_lock_wait_faults_after_continuous_unsafe_motion_filter(
         await manager.tick()
 
         assert manager.state is SystemState.FAULT
-        assert any(
-            item.code == "GO2_UNSAFE_DURING_JOINT_LOCK" for item in manager.violations
-        )
+        assert any(item.code == "GO2_UNSAFE_DURING_JOINT_LOCK" for item in manager.violations)
     finally:
         await manager.shutdown()
 

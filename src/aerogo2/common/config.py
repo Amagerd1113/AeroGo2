@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Tuple
+from typing import AbstractSet, Any, Dict, List, Mapping, MutableMapping, Optional, Tuple
 
 import yaml
 
@@ -17,6 +19,204 @@ from aerogo2.common.immutable import frozen_mapping
 # The validated diagnostic uses FR/FL/RL/RR while the existing AeroGo2 model
 # uses RF/LF/LR/RR; only the spelling differs.
 X8_ESC_SLOT_MAPPING = {1: "RR", 2: "LF", 3: "LR", 4: "RF"}
+
+GO2_LOW_LEVEL_JOINT_COUNT = 12
+GO2_LOW_LEVEL_SAFE_HOLD_POLICIES = frozenset({"capture_current", "configured_pose"})
+
+_ROOT_KEYS = frozenset(
+    {"includes", "system", "pixhawk", "f446", "go2", "rc", "safety", "landing", "esc"}
+)
+_SYSTEM_KEYS = frozenset({"loop_hz", "dry_run", "hardware_write_enabled", "log_directory"})
+_PIXHAWK_KEYS = frozenset(
+    {
+        "connection",
+        "baud",
+        "heartbeat_timeout_s",
+        "target_system",
+        "target_component",
+        "rc9_option",
+        "rc10_option",
+    }
+)
+_F446_KEYS = frozenset(
+    {
+        "port",
+        "baud",
+        "flight_direction",
+        "walk_direction",
+        "flight_duty",
+        "walk_duty",
+        "expected_flight_state",
+        "expected_walk_state",
+        "response_timeout_s",
+        "transform_timeout_s",
+        "status_poll_hz",
+        "firmware_timeout_ms",
+        "automatic_stall_threshold_adc",
+        "stall_blanking_ms",
+        "stall_overcurrent_ms",
+        "current_safe_margin_adc",
+        "current_clear_hold_s",
+    }
+)
+_GO2_KEYS = frozenset(
+    {
+        "enabled",
+        "status_timeout_s",
+        "network_interface",
+        "domain_id",
+        "sport_state_topic",
+        "command_timeout_s",
+        "joint_lock_operator_timeout_s",
+        "joint_lock_transition_grace_s",
+        "joint_lock_unsafe_confirm_s",
+        "joint_lock_state_codes",
+        "accepted_state_codes",
+        "landing_compliance_enabled",
+        "foot_force_contact_thresholds",
+        "landing_contact_min_feet",
+        "landing_contact_confirm_s",
+        "landing_compliance_settle_s",
+        "low_level",
+    }
+)
+_RC_KEYS = frozenset(
+    {
+        "flight_enable_channel",
+        "flight_mode_channel",
+        "rtl_channel",
+        "land_channel",
+        "morphology_channel",
+        "auto_landing_channel",
+        "brake_channel",
+        "buzzer_channel",
+        "low_max",
+        "middle_min",
+        "middle_max",
+        "high_min",
+        "debounce_s",
+        "timeout_s",
+        "manual_override_deadband_us",
+    }
+)
+_SAFETY_KEYS = frozenset(
+    {
+        "stationary_velocity_mps",
+        "stationary_confirm_s",
+        "maximum_safe_esc_rpm_for_transform",
+        "airborne_confirm_s",
+        "touchdown_confirm_s",
+        "touchdown_max_vertical_speed_mps",
+        "touchdown_max_tilt_rad",
+        "touchdown_max_height_delta_m",
+        "touchdown_max_esc_rpm",
+        "touchdown_max_source_age_s",
+        "touchdown_max_source_skew_s",
+        "post_touchdown_stable_confirm_s",
+        "post_touchdown_stability_max_check_gap_s",
+        "aborted_impact_airborne_confirm_s",
+        "impact_recovery_status_max_age_s",
+        "impact_recovery_completion_timeout_s",
+        "impact_recovery_finalization_timeout_s",
+        "pixhawk_timeout_s",
+        "f446_timeout_s",
+        "go2_timeout_s",
+        "rc_timeout_s",
+        "controller_timeout_s",
+        "maximum_transform_current_adc",
+    }
+)
+_LANDING_KEYS = frozenset(
+    {
+        "controller_hz",
+        "maximum_descent_speed_mps",
+        "maximum_horizontal_speed_mps",
+        "maximum_yaw_rate_rad_s",
+        "controller_timeout_s",
+        "manual_override_deadband_us",
+        "default_abort_mode",
+    }
+)
+_ESC_KEYS = frozenset({"slot_1", "slot_2", "slot_3", "slot_4", "mavlink_display_shift"})
+_GO2_LOW_LEVEL_OBSERVE_REQUIRED_KEYS = (
+    "low_state_topic",
+    "low_state_max_age_s",
+    "mapping_version",
+    "mapping_hash",
+    "joint_names",
+    "motor_ids",
+    "directions",
+    "zero_offsets_rad",
+)
+_GO2_LOW_LEVEL_ACTUATION_REQUIRED_KEYS = (
+    *_GO2_LOW_LEVEL_OBSERVE_REQUIRED_KEYS,
+    "low_command_topic",
+    "send_period_s",
+    "maximum_jitter_s",
+    "target_ttl_s",
+    "acquire_timeout_s",
+    "release_timeout_s",
+    "safe_hold_policy",
+    "safe_hold_pose_rad",
+    "safe_hold_position_tolerance_rad",
+    "safe_hold_velocity_tolerance_rad_s",
+    "tracking_position_error_limit_rad",
+    "safe_hold_ack_timeout_s",
+    "restore_mode_form",
+    "restore_mode_name",
+    "q_min_rad",
+    "q_max_rad",
+    "dq_max_rad_s",
+    "maximum_delta_q_rad",
+    "kp",
+    "kd",
+    "tau_ff_nm",
+    "tau_limit_nm",
+    "feedback_loss_degraded_kp",
+    "feedback_loss_degraded_kd",
+    "feedback_loss_degraded_tau_ff_nm",
+    "firmware_torque_limit_nm",
+    "firmware_torque_clamp_verified",
+    "temperature_limit_c",
+)
+_GO2_LOW_LEVEL_KEYS = frozenset(
+    {
+        "enabled",
+        "observe_only_enabled",
+        *_GO2_LOW_LEVEL_ACTUATION_REQUIRED_KEYS,
+    }
+)
+
+
+def compute_go2_joint_mapping_hash(
+    mapping_version: str,
+    joint_names: Tuple[str, ...],
+    motor_ids: Tuple[int, ...],
+    directions: Tuple[int, ...],
+    zero_offsets_rad: Tuple[float, ...],
+) -> str:
+    """Return the canonical SHA-256 digest for a reviewed Go2 joint mapping.
+
+    The digest deliberately covers only coordinate/motor identity data.  Servo
+    gains and safety limits are validated independently and may be tuned without
+    silently changing the kinematic mapping identity used by command leases.
+    """
+
+    payload = {
+        "directions": [int(value) for value in directions],
+        "joint_names": [str(value) for value in joint_names],
+        "mapping_version": str(mapping_version),
+        "motor_ids": [int(value) for value in motor_ids],
+        "zero_offsets_rad": [float(value) for value in zero_offsets_rad],
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -73,6 +273,64 @@ class F446Config:
 
 
 @dataclass(frozen=True)
+class Go2LowLevelConfig:
+    """Fail-closed configuration for the sole Go2 ``rt/lowcmd`` owner.
+
+    Every hardware-dependent value is optional while this subsystem is
+    disabled.  Enabling it is accepted only after the YAML validator has seen
+    and cross-checked every field.
+    """
+
+    # ``enabled`` authorizes only the fully commissioned LowCmd path.
+    # ``observe_only_enabled`` may independently subscribe to LowState, but it
+    # can never acquire an ownership epoch or create a LowCmd publisher.
+    enabled: bool = False
+    observe_only_enabled: bool = False
+    low_state_topic: Optional[str] = None
+    low_command_topic: Optional[str] = None
+    send_period_s: Optional[float] = None
+    maximum_jitter_s: Optional[float] = None
+    low_state_max_age_s: Optional[float] = None
+    target_ttl_s: Optional[float] = None
+    acquire_timeout_s: Optional[float] = None
+    release_timeout_s: Optional[float] = None
+    safe_hold_policy: Optional[str] = None
+    safe_hold_pose_rad: Optional[Tuple[float, ...]] = None
+    safe_hold_position_tolerance_rad: Optional[Tuple[float, ...]] = None
+    safe_hold_velocity_tolerance_rad_s: Optional[Tuple[float, ...]] = None
+    tracking_position_error_limit_rad: Optional[Tuple[float, ...]] = None
+    safe_hold_ack_timeout_s: Optional[float] = None
+    restore_mode_form: Optional[str] = None
+    restore_mode_name: Optional[str] = None
+    mapping_version: Optional[str] = None
+    mapping_hash: Optional[str] = None
+    joint_names: Optional[Tuple[str, ...]] = None
+    motor_ids: Optional[Tuple[int, ...]] = None
+    directions: Optional[Tuple[int, ...]] = None
+    zero_offsets_rad: Optional[Tuple[float, ...]] = None
+    q_min_rad: Optional[Tuple[float, ...]] = None
+    q_max_rad: Optional[Tuple[float, ...]] = None
+    dq_max_rad_s: Optional[Tuple[float, ...]] = None
+    maximum_delta_q_rad: Optional[Tuple[float, ...]] = None
+    kp: Optional[Tuple[float, ...]] = None
+    kd: Optional[Tuple[float, ...]] = None
+    tau_ff_nm: Optional[Tuple[float, ...]] = None
+    tau_limit_nm: Optional[Tuple[float, ...]] = None
+    feedback_loss_degraded_kp: Optional[Tuple[float, ...]] = None
+    feedback_loss_degraded_kd: Optional[Tuple[float, ...]] = None
+    feedback_loss_degraded_tau_ff_nm: Optional[Tuple[float, ...]] = None
+    firmware_torque_limit_nm: Optional[Tuple[float, ...]] = None
+    firmware_torque_clamp_verified: Optional[bool] = None
+    temperature_limit_c: Optional[Tuple[float, ...]] = None
+
+    @property
+    def observation_enabled(self) -> bool:
+        """Whether the read-only LowState transport should be connected."""
+
+        return self.observe_only_enabled or self.enabled
+
+
+@dataclass(frozen=True)
 class Go2Config:
     enabled: bool
     status_timeout_s: float
@@ -90,6 +348,7 @@ class Go2Config:
     landing_contact_min_feet: int = 3
     landing_contact_confirm_s: float = 0.5
     landing_compliance_settle_s: float = 1.5
+    low_level: Go2LowLevelConfig = Go2LowLevelConfig()
 
 
 @dataclass(frozen=True)
@@ -122,6 +381,14 @@ class SafetyConfig:
     touchdown_max_tilt_rad: float
     touchdown_max_height_delta_m: float
     touchdown_max_esc_rpm: float
+    touchdown_max_source_age_s: float
+    touchdown_max_source_skew_s: float
+    post_touchdown_stable_confirm_s: float
+    post_touchdown_stability_max_check_gap_s: float
+    aborted_impact_airborne_confirm_s: float
+    impact_recovery_status_max_age_s: float
+    impact_recovery_completion_timeout_s: float
+    impact_recovery_finalization_timeout_s: float
     pixhawk_timeout_s: float
     f446_timeout_s: float
     go2_timeout_s: float
@@ -189,9 +456,51 @@ def _deep_merge(
     return target
 
 
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects ambiguous duplicate mapping keys."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeySafeLoader,
+    node: yaml.nodes.MappingNode,
+    deep: bool = False,
+) -> Dict[Any, Any]:
+    loader.flatten_mapping(node)
+    mapping: Dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found an unhashable mapping key",
+                key_node.start_mark,
+            ) from exc
+        if duplicate:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
 def _read_yaml(path: Path) -> Mapping[str, Any]:
     try:
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        loaded = yaml.load(
+            path.read_text(encoding="utf-8"),
+            Loader=_UniqueKeySafeLoader,
+        )
     except OSError as exc:
         raise ConfigurationError(f"Cannot read configuration {path}: {exc}") from exc
     except yaml.YAMLError as exc:
@@ -201,6 +510,19 @@ def _read_yaml(path: Path) -> Mapping[str, Any]:
     if not isinstance(loaded, Mapping):
         raise ConfigurationError(f"Top level of {path} must be a mapping")
     return loaded
+
+
+def _unknown_keys_error(
+    section: Mapping[str, Any],
+    allowed: AbstractSet[str],
+    label: str,
+) -> Optional[str]:
+    unknown = sorted(
+        (key if isinstance(key, str) else repr(key)) for key in section if key not in allowed
+    )
+    if not unknown:
+        return None
+    return f"{label} contains unknown keys: " + ", ".join(unknown)
 
 
 def _load_merged(path: Path, seen: Optional[Tuple[Path, ...]] = None) -> Dict[str, Any]:
@@ -239,6 +561,9 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
     """Return deterministic validation errors without permissive coercion."""
 
     errors: List[str] = []
+    root_error = _unknown_keys_error(raw, _ROOT_KEYS, "configuration root")
+    if root_error is not None:
+        errors.append(root_error)
     system = _section(raw, "system")
     pixhawk = _section(raw, "pixhawk")
     f446 = _section(raw, "f446")
@@ -247,6 +572,21 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
     safety = _section(raw, "safety")
     landing = _section(raw, "landing")
     esc = _section(raw, "esc")
+
+    section_schemas = (
+        (system, _SYSTEM_KEYS, "system"),
+        (pixhawk, _PIXHAWK_KEYS, "pixhawk"),
+        (f446, _F446_KEYS, "f446"),
+        (go2, _GO2_KEYS, "go2"),
+        (rc, _RC_KEYS, "rc"),
+        (safety, _SAFETY_KEYS, "safety"),
+        (landing, _LANDING_KEYS, "landing"),
+        (esc, _ESC_KEYS, "esc"),
+    )
+    for section, allowed, label in section_schemas:
+        unknown_error = _unknown_keys_error(section, allowed, label)
+        if unknown_error is not None:
+            errors.append(unknown_error)
 
     def value(section: Mapping[str, Any], key: str, label: str) -> Any:
         if key not in section:
@@ -375,6 +715,85 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
             errors.append(f"{label} must be a non-empty string")
             return None
         return item
+
+    def number_vector(
+        section: Mapping[str, Any],
+        key: str,
+        label: str,
+        *,
+        positive: bool = False,
+        nonnegative: bool = False,
+    ) -> Optional[Tuple[float, ...]]:
+        item = section.get(key)
+        if item is None:
+            return None
+        if not isinstance(item, (list, tuple)) or len(item) != GO2_LOW_LEVEL_JOINT_COUNT:
+            errors.append(
+                f"{label} must contain exactly {GO2_LOW_LEVEL_JOINT_COUNT} finite numbers"
+            )
+            return None
+        parsed: List[float] = []
+        valid = True
+        for index, raw_item in enumerate(item):
+            if isinstance(raw_item, bool) or not isinstance(raw_item, (int, float)):
+                errors.append(f"{label}[{index}] must be a finite number")
+                valid = False
+                continue
+            numeric = float(raw_item)
+            if not math.isfinite(numeric):
+                errors.append(f"{label}[{index}] must be finite")
+                valid = False
+                continue
+            if positive and numeric <= 0.0:
+                errors.append(f"{label}[{index}] must be positive")
+                valid = False
+            if nonnegative and numeric < 0.0:
+                errors.append(f"{label}[{index}] must be nonnegative")
+                valid = False
+            parsed.append(numeric)
+        return tuple(parsed) if valid and len(parsed) == GO2_LOW_LEVEL_JOINT_COUNT else None
+
+    def integer_vector(
+        section: Mapping[str, Any],
+        key: str,
+        label: str,
+    ) -> Optional[Tuple[int, ...]]:
+        item = section.get(key)
+        if item is None:
+            return None
+        if not isinstance(item, (list, tuple)) or len(item) != GO2_LOW_LEVEL_JOINT_COUNT:
+            errors.append(f"{label} must contain exactly {GO2_LOW_LEVEL_JOINT_COUNT} integers")
+            return None
+        parsed: List[int] = []
+        valid = True
+        for index, raw_item in enumerate(item):
+            if type(raw_item) is not int:
+                errors.append(f"{label}[{index}] must be an integer")
+                valid = False
+                continue
+            parsed.append(raw_item)
+        return tuple(parsed) if valid and len(parsed) == GO2_LOW_LEVEL_JOINT_COUNT else None
+
+    def text_vector(
+        section: Mapping[str, Any],
+        key: str,
+        label: str,
+    ) -> Optional[Tuple[str, ...]]:
+        item = section.get(key)
+        if item is None:
+            return None
+        if not isinstance(item, (list, tuple)) or len(item) != GO2_LOW_LEVEL_JOINT_COUNT:
+            errors.append(f"{label} must contain exactly {GO2_LOW_LEVEL_JOINT_COUNT} strings")
+            return None
+        parsed: List[str] = []
+        valid = True
+        for index, raw_item in enumerate(item):
+            if not isinstance(raw_item, str) or not raw_item.strip():
+                errors.append(f"{label}[{index}] must be a non-empty string")
+                valid = False
+                continue
+            parsed.append(raw_item)
+        return tuple(parsed) if valid and len(parsed) == GO2_LOW_LEVEL_JOINT_COUNT else None
 
     loop_hz = finite_number(system, "loop_hz", "system.loop_hz", positive=True)
     del loop_hz
@@ -601,6 +1020,361 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
                 "landing compliance is enabled"
             )
 
+    raw_low_level = go2.get("low_level")
+    if raw_low_level is None:
+        low_level: Mapping[str, Any] = {}
+    elif not isinstance(raw_low_level, Mapping):
+        errors.append("go2.low_level must be a mapping")
+        low_level = {}
+    else:
+        low_level = raw_low_level
+
+    low_level_enabled: Optional[bool]
+    if not low_level:
+        low_level_enabled = False
+    elif "enabled" not in low_level:
+        errors.append("Missing configuration key 'go2.low_level.enabled'")
+        low_level_enabled = None
+    elif low_level["enabled"] is None:
+        errors.append("go2.low_level.enabled must be a YAML boolean")
+        low_level_enabled = None
+    else:
+        low_level_enabled = boolean(low_level, "enabled", "go2.low_level.enabled")
+
+    observe_only_enabled: Optional[bool]
+    if low_level.get("observe_only_enabled") is None:
+        observe_only_enabled = False
+    else:
+        observe_only_enabled = boolean(
+            low_level,
+            "observe_only_enabled",
+            "go2.low_level.observe_only_enabled",
+        )
+
+    unknown_low_level_error = _unknown_keys_error(
+        low_level,
+        _GO2_LOW_LEVEL_KEYS,
+        "go2.low_level",
+    )
+    if unknown_low_level_error is not None:
+        errors.append(unknown_low_level_error)
+    if low_level_enabled is True or observe_only_enabled is True:
+        for key in _GO2_LOW_LEVEL_OBSERVE_REQUIRED_KEYS:
+            if key not in low_level or low_level[key] is None:
+                errors.append(
+                    f"Missing explicit configuration value 'go2.low_level.{key}' "
+                    "while LowState observation is enabled"
+                )
+    if low_level_enabled is True:
+        for key in _GO2_LOW_LEVEL_ACTUATION_REQUIRED_KEYS:
+            if key in _GO2_LOW_LEVEL_OBSERVE_REQUIRED_KEYS:
+                continue
+            if key not in low_level or low_level[key] is None:
+                errors.append(
+                    f"Missing explicit configuration value 'go2.low_level.{key}' "
+                    "while LowCmd actuation is enabled"
+                )
+
+    low_state_topic = (
+        nonempty_text(low_level, "low_state_topic", "go2.low_level.low_state_topic")
+        if low_level.get("low_state_topic") is not None
+        else None
+    )
+    low_command_topic = (
+        nonempty_text(low_level, "low_command_topic", "go2.low_level.low_command_topic")
+        if low_level.get("low_command_topic") is not None
+        else None
+    )
+    if (
+        low_state_topic is not None
+        and low_command_topic is not None
+        and low_state_topic == low_command_topic
+    ):
+        errors.append("go2.low_level state and command topics must be different")
+
+    timing_values: Dict[str, Optional[float]] = {}
+    safety_numbers: Dict[str, Optional[float]] = {}
+    for key in (
+        "send_period_s",
+        "low_state_max_age_s",
+        "target_ttl_s",
+        "acquire_timeout_s",
+        "release_timeout_s",
+        "safe_hold_ack_timeout_s",
+    ):
+        timing_values[key] = (
+            finite_number(low_level, key, f"go2.low_level.{key}", positive=True)
+            if low_level.get(key) is not None
+            else None
+        )
+    maximum_jitter_s = (
+        finite_number(low_level, "maximum_jitter_s", "go2.low_level.maximum_jitter_s")
+        if low_level.get("maximum_jitter_s") is not None
+        else None
+    )
+    if maximum_jitter_s is not None and maximum_jitter_s < 0.0:
+        errors.append("go2.low_level.maximum_jitter_s must be nonnegative")
+    send_period_s = timing_values["send_period_s"]
+    if (
+        send_period_s is not None
+        and maximum_jitter_s is not None
+        and maximum_jitter_s >= send_period_s
+    ):
+        errors.append("go2.low_level.maximum_jitter_s must be less than send_period_s")
+    for key in ("low_state_max_age_s", "target_ttl_s", "safe_hold_ack_timeout_s"):
+        item = timing_values[key]
+        if send_period_s is not None and item is not None and item < send_period_s:
+            errors.append(f"go2.low_level.{key} must be at least send_period_s")
+    if (
+        timing_values["safe_hold_ack_timeout_s"] is not None
+        and timing_values["release_timeout_s"] is not None
+        and timing_values["safe_hold_ack_timeout_s"] > timing_values["release_timeout_s"]
+    ):
+        errors.append("go2.low_level.safe_hold_ack_timeout_s must not exceed release_timeout_s")
+
+    safe_hold_policy = (
+        nonempty_text(low_level, "safe_hold_policy", "go2.low_level.safe_hold_policy")
+        if low_level.get("safe_hold_policy") is not None
+        else None
+    )
+    if safe_hold_policy is not None and safe_hold_policy not in GO2_LOW_LEVEL_SAFE_HOLD_POLICIES:
+        choices = ", ".join(sorted(GO2_LOW_LEVEL_SAFE_HOLD_POLICIES))
+        errors.append(f"go2.low_level.safe_hold_policy must be one of: {choices}")
+
+    for key in ("restore_mode_form", "restore_mode_name"):
+        if low_level.get(key) is not None:
+            nonempty_text(low_level, key, f"go2.low_level.{key}")
+
+    mapping_version = (
+        nonempty_text(low_level, "mapping_version", "go2.low_level.mapping_version")
+        if low_level.get("mapping_version") is not None
+        else None
+    )
+    mapping_hash = (
+        nonempty_text(low_level, "mapping_hash", "go2.low_level.mapping_hash")
+        if low_level.get("mapping_hash") is not None
+        else None
+    )
+    mapping_digest = (
+        None
+        if mapping_hash is None or not mapping_hash.startswith("sha256:")
+        else mapping_hash[len("sha256:") :]
+    )
+    if mapping_hash is not None and (
+        not mapping_hash.startswith("sha256:")
+        or mapping_digest is None
+        or len(mapping_digest) != 64
+        or any(char not in "0123456789abcdef" for char in mapping_digest)
+    ):
+        errors.append(
+            "go2.low_level.mapping_hash must use the form sha256:<64 lowercase hex digits>"
+        )
+
+    joint_names = text_vector(low_level, "joint_names", "go2.low_level.joint_names")
+    motor_ids = integer_vector(low_level, "motor_ids", "go2.low_level.motor_ids")
+    directions = integer_vector(low_level, "directions", "go2.low_level.directions")
+    zero_offsets_rad = number_vector(
+        low_level, "zero_offsets_rad", "go2.low_level.zero_offsets_rad"
+    )
+    q_min_rad = number_vector(low_level, "q_min_rad", "go2.low_level.q_min_rad")
+    q_max_rad = number_vector(low_level, "q_max_rad", "go2.low_level.q_max_rad")
+    dq_max_rad_s = number_vector(
+        low_level, "dq_max_rad_s", "go2.low_level.dq_max_rad_s", positive=True
+    )
+    number_vector(
+        low_level,
+        "maximum_delta_q_rad",
+        "go2.low_level.maximum_delta_q_rad",
+        positive=True,
+    )
+    kp = number_vector(low_level, "kp", "go2.low_level.kp", nonnegative=True)
+    kd = number_vector(low_level, "kd", "go2.low_level.kd", nonnegative=True)
+    tau_ff_nm = number_vector(low_level, "tau_ff_nm", "go2.low_level.tau_ff_nm")
+    tau_limit_nm = number_vector(
+        low_level, "tau_limit_nm", "go2.low_level.tau_limit_nm", positive=True
+    )
+    feedback_loss_degraded_kp = number_vector(
+        low_level,
+        "feedback_loss_degraded_kp",
+        "go2.low_level.feedback_loss_degraded_kp",
+        nonnegative=True,
+    )
+    feedback_loss_degraded_kd = number_vector(
+        low_level,
+        "feedback_loss_degraded_kd",
+        "go2.low_level.feedback_loss_degraded_kd",
+        nonnegative=True,
+    )
+    feedback_loss_degraded_tau_ff_nm = number_vector(
+        low_level,
+        "feedback_loss_degraded_tau_ff_nm",
+        "go2.low_level.feedback_loss_degraded_tau_ff_nm",
+    )
+    firmware_torque_limit_nm = number_vector(
+        low_level,
+        "firmware_torque_limit_nm",
+        "go2.low_level.firmware_torque_limit_nm",
+        positive=True,
+    )
+    firmware_torque_clamp_verified = (
+        boolean(
+            low_level,
+            "firmware_torque_clamp_verified",
+            "go2.low_level.firmware_torque_clamp_verified",
+        )
+        if low_level.get("firmware_torque_clamp_verified") is not None
+        else None
+    )
+    temperature_limit_c = number_vector(
+        low_level,
+        "temperature_limit_c",
+        "go2.low_level.temperature_limit_c",
+        positive=True,
+    )
+    safe_hold_pose_rad = number_vector(
+        low_level,
+        "safe_hold_pose_rad",
+        "go2.low_level.safe_hold_pose_rad",
+    )
+    safe_hold_position_tolerance_rad = number_vector(
+        low_level,
+        "safe_hold_position_tolerance_rad",
+        "go2.low_level.safe_hold_position_tolerance_rad",
+        positive=True,
+    )
+    safe_hold_velocity_tolerance_rad_s = number_vector(
+        low_level,
+        "safe_hold_velocity_tolerance_rad_s",
+        "go2.low_level.safe_hold_velocity_tolerance_rad_s",
+        positive=True,
+    )
+    tracking_position_error_limit_rad = number_vector(
+        low_level,
+        "tracking_position_error_limit_rad",
+        "go2.low_level.tracking_position_error_limit_rad",
+        positive=True,
+    )
+
+    if joint_names is not None and len(set(joint_names)) != GO2_LOW_LEVEL_JOINT_COUNT:
+        errors.append("go2.low_level.joint_names must be unique")
+    if motor_ids is not None:
+        if set(motor_ids) != set(range(GO2_LOW_LEVEL_JOINT_COUNT)):
+            errors.append(
+                "go2.low_level.motor_ids must be a permutation of the 12 Go2 leg slots 0..11"
+            )
+    if directions is not None and any(item not in (-1, 1) for item in directions):
+        errors.append("go2.low_level.directions must contain only -1 or 1")
+
+    if q_min_rad is not None and q_max_rad is not None:
+        for index, (lower, upper) in enumerate(zip(q_min_rad, q_max_rad)):
+            if lower >= upper:
+                errors.append(
+                    f"go2.low_level q_min_rad[{index}] must be less than q_max_rad[{index}]"
+                )
+    if safe_hold_pose_rad is not None and q_min_rad is not None and q_max_rad is not None:
+        for index, (pose, lower, upper) in enumerate(zip(safe_hold_pose_rad, q_min_rad, q_max_rad)):
+            if pose < lower or pose > upper:
+                errors.append(f"go2.low_level.safe_hold_pose_rad[{index}] must be within q limits")
+    if tau_ff_nm is not None and tau_limit_nm is not None:
+        for index, (feedforward, limit) in enumerate(zip(tau_ff_nm, tau_limit_nm)):
+            if abs(feedforward) > limit:
+                errors.append(
+                    f"go2.low_level.tau_ff_nm[{index}] must not exceed tau_limit_nm[{index}]"
+                )
+    if (
+        feedback_loss_degraded_kp is not None
+        and feedback_loss_degraded_kd is not None
+        and feedback_loss_degraded_tau_ff_nm is not None
+        and firmware_torque_limit_nm is not None
+        and tau_limit_nm is not None
+    ):
+        for index in range(GO2_LOW_LEVEL_JOINT_COUNT):
+            if kp is not None and feedback_loss_degraded_kp[index] > kp[index]:
+                errors.append(
+                    f"go2.low_level.feedback_loss_degraded_kp[{index}] must not exceed kp[{index}]"
+                )
+            if kd is not None and feedback_loss_degraded_kd[index] > kd[index]:
+                errors.append(
+                    f"go2.low_level.feedback_loss_degraded_kd[{index}] must not exceed kd[{index}]"
+                )
+            if firmware_torque_limit_nm[index] > tau_limit_nm[index]:
+                errors.append(
+                    f"go2.low_level.firmware_torque_limit_nm[{index}] must not exceed tau_limit_nm[{index}]"
+                )
+            if abs(feedback_loss_degraded_tau_ff_nm[index]) > firmware_torque_limit_nm[index]:
+                errors.append(
+                    "go2.low_level.feedback_loss_degraded_tau_ff_nm"
+                    f"[{index}] must not exceed firmware_torque_limit_nm[{index}]"
+                )
+    if low_level_enabled is True and firmware_torque_clamp_verified is not True:
+        errors.append(
+            "go2.low_level.firmware_torque_clamp_verified must be true after "
+            "a robot-specific torque-clamp test before low-level control is enabled"
+        )
+    if temperature_limit_c is not None and any(item > 150.0 for item in temperature_limit_c):
+        errors.append("go2.low_level.temperature_limit_c must not exceed 150 C")
+    if safe_hold_velocity_tolerance_rad_s is not None and dq_max_rad_s is not None:
+        if any(
+            tolerance > limit
+            for tolerance, limit in zip(safe_hold_velocity_tolerance_rad_s, dq_max_rad_s)
+        ):
+            errors.append(
+                "go2.low_level.safe_hold_velocity_tolerance_rad_s must not exceed dq_max_rad_s"
+            )
+    if (
+        safe_hold_position_tolerance_rad is not None
+        and q_min_rad is not None
+        and q_max_rad is not None
+        and any(
+            tolerance >= upper - lower
+            for tolerance, lower, upper in zip(
+                safe_hold_position_tolerance_rad, q_min_rad, q_max_rad
+            )
+        )
+    ):
+        errors.append(
+            "go2.low_level.safe_hold_position_tolerance_rad must be smaller than each q range"
+        )
+    if (
+        tracking_position_error_limit_rad is not None
+        and q_min_rad is not None
+        and q_max_rad is not None
+        and any(
+            tolerance >= upper - lower
+            for tolerance, lower, upper in zip(
+                tracking_position_error_limit_rad, q_min_rad, q_max_rad
+            )
+        )
+    ):
+        errors.append(
+            "go2.low_level.tracking_position_error_limit_rad must be smaller than each q range"
+        )
+
+    mapping_parts = (
+        mapping_version,
+        joint_names,
+        motor_ids,
+        directions,
+        zero_offsets_rad,
+    )
+    if mapping_hash is not None and all(item is not None for item in mapping_parts):
+        assert mapping_version is not None
+        assert joint_names is not None
+        assert motor_ids is not None
+        assert directions is not None
+        assert zero_offsets_rad is not None
+        expected_mapping_hash = compute_go2_joint_mapping_hash(
+            mapping_version,
+            joint_names,
+            motor_ids,
+            directions,
+            zero_offsets_rad,
+        )
+        if mapping_hash != expected_mapping_hash:
+            errors.append(
+                "go2.low_level.mapping_hash does not match the canonical reviewed mapping"
+            )
+
     channel_keys = (
         "flight_enable_channel",
         "flight_mode_channel",
@@ -655,13 +1429,95 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
         "touchdown_max_tilt_rad",
         "touchdown_max_height_delta_m",
         "touchdown_max_esc_rpm",
+        "touchdown_max_source_age_s",
+        "touchdown_max_source_skew_s",
+        "post_touchdown_stable_confirm_s",
+        "post_touchdown_stability_max_check_gap_s",
+        "aborted_impact_airborne_confirm_s",
+        "impact_recovery_status_max_age_s",
+        "impact_recovery_completion_timeout_s",
+        "impact_recovery_finalization_timeout_s",
         "pixhawk_timeout_s",
         "f446_timeout_s",
         "go2_timeout_s",
         "rc_timeout_s",
         "controller_timeout_s",
     ):
-        finite_number(safety, key, f"safety.{key}", positive=True)
+        safety_numbers[key] = finite_number(
+            safety,
+            key,
+            f"safety.{key}",
+            positive=True,
+        )
+    stable_confirm = safety_numbers.get("post_touchdown_stable_confirm_s")
+    touchdown_confirm = safety_numbers.get("touchdown_confirm_s")
+    stationary_confirm = safety_numbers.get("stationary_confirm_s")
+    stability_gap = safety_numbers.get("post_touchdown_stability_max_check_gap_s")
+    airborne_confirm = safety_numbers.get("aborted_impact_airborne_confirm_s")
+    touchdown_source_age = safety_numbers.get("touchdown_max_source_age_s")
+    touchdown_source_skew = safety_numbers.get("touchdown_max_source_skew_s")
+    if stable_confirm is not None and stability_gap is not None and stability_gap >= stable_confirm:
+        errors.append(
+            "safety.post_touchdown_stability_max_check_gap_s must be less than "
+            "post_touchdown_stable_confirm_s"
+        )
+    if (
+        stable_confirm is not None
+        and touchdown_source_age is not None
+        and touchdown_source_age >= stable_confirm
+    ):
+        errors.append(
+            "safety.touchdown_max_source_age_s must be less than post_touchdown_stable_confirm_s"
+        )
+    if (
+        touchdown_confirm is not None
+        and touchdown_source_age is not None
+        and touchdown_source_age >= touchdown_confirm
+    ):
+        errors.append("safety.touchdown_max_source_age_s must be less than touchdown_confirm_s")
+    if (
+        stationary_confirm is not None
+        and touchdown_source_age is not None
+        and touchdown_source_age >= stationary_confirm
+    ):
+        errors.append("safety.touchdown_max_source_age_s must be less than stationary_confirm_s")
+    if (
+        touchdown_source_age is not None
+        and touchdown_source_skew is not None
+        and touchdown_source_skew > touchdown_source_age
+    ):
+        errors.append(
+            "safety.touchdown_max_source_skew_s must be no greater than touchdown_max_source_age_s"
+        )
+    if (
+        airborne_confirm is not None
+        and touchdown_source_age is not None
+        and touchdown_source_age >= airborne_confirm
+    ):
+        errors.append(
+            "safety.touchdown_max_source_age_s must be less than aborted_impact_airborne_confirm_s"
+        )
+    if (
+        airborne_confirm is not None
+        and stability_gap is not None
+        and stability_gap >= airborne_confirm
+    ):
+        errors.append(
+            "safety.post_touchdown_stability_max_check_gap_s must be less than "
+            "aborted_impact_airborne_confirm_s"
+        )
+    recovery_timeout = safety_numbers.get("impact_recovery_completion_timeout_s")
+    finalization_timeout = safety_numbers.get("impact_recovery_finalization_timeout_s")
+    if (
+        recovery_timeout is not None
+        and finalization_timeout is not None
+        and stable_confirm is not None
+        and recovery_timeout <= finalization_timeout + stable_confirm
+    ):
+        errors.append(
+            "safety.impact_recovery_completion_timeout_s must exceed the sum of "
+            "impact_recovery_finalization_timeout_s and post_touchdown_stable_confirm_s"
+        )
     maximum_transform_current_adc = integer(
         safety,
         "maximum_transform_current_adc",
@@ -745,6 +1601,39 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
     landing = _section(raw, "landing")
     esc = _section(raw, "esc")
 
+    raw_low_level = go2.get("low_level", {})
+    low_level: Mapping[str, Any] = raw_low_level if isinstance(raw_low_level, Mapping) else {}
+
+    def optional_float_tuple(key: str) -> Optional[Tuple[float, ...]]:
+        item = low_level.get(key)
+        if item is None:
+            return None
+        return tuple(float(value) for value in item)
+
+    def optional_int_tuple(key: str) -> Optional[Tuple[int, ...]]:
+        item = low_level.get(key)
+        if item is None:
+            return None
+        return tuple(int(value) for value in item)
+
+    def optional_text_tuple(key: str) -> Optional[Tuple[str, ...]]:
+        item = low_level.get(key)
+        if item is None:
+            return None
+        return tuple(str(value) for value in item)
+
+    def optional_float(key: str) -> Optional[float]:
+        item = low_level.get(key)
+        return None if item is None else float(item)
+
+    def optional_text(key: str) -> Optional[str]:
+        item = low_level.get(key)
+        return None if item is None else str(item)
+
+    def optional_bool(key: str) -> Optional[bool]:
+        item = low_level.get(key)
+        return None if item is None else bool(item)
+
     raw_foot_force_thresholds = go2.get(
         "foot_force_contact_thresholds",
         (0, 0, 0, 0),
@@ -815,9 +1704,7 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
             sport_state_topic=str(go2.get("sport_state_topic", "rt/sportmodestate")),
             command_timeout_s=float(go2.get("command_timeout_s", 2.0)),
             joint_lock_operator_timeout_s=float(go2.get("joint_lock_operator_timeout_s", 60.0)),
-            joint_lock_transition_grace_s=float(
-                go2.get("joint_lock_transition_grace_s", 2.0)
-            ),
+            joint_lock_transition_grace_s=float(go2.get("joint_lock_transition_grace_s", 2.0)),
             joint_lock_unsafe_confirm_s=float(go2.get("joint_lock_unsafe_confirm_s", 0.5)),
             joint_lock_state_codes=tuple(
                 int(item) for item in go2.get("joint_lock_state_codes", (1002,))
@@ -830,6 +1717,54 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
             landing_contact_min_feet=int(go2.get("landing_contact_min_feet", 3)),
             landing_contact_confirm_s=float(go2.get("landing_contact_confirm_s", 0.5)),
             landing_compliance_settle_s=float(go2.get("landing_compliance_settle_s", 1.5)),
+            low_level=Go2LowLevelConfig(
+                enabled=bool(low_level.get("enabled", False)),
+                observe_only_enabled=bool(low_level.get("observe_only_enabled", False)),
+                low_state_topic=optional_text("low_state_topic"),
+                low_command_topic=optional_text("low_command_topic"),
+                send_period_s=optional_float("send_period_s"),
+                maximum_jitter_s=optional_float("maximum_jitter_s"),
+                low_state_max_age_s=optional_float("low_state_max_age_s"),
+                target_ttl_s=optional_float("target_ttl_s"),
+                acquire_timeout_s=optional_float("acquire_timeout_s"),
+                release_timeout_s=optional_float("release_timeout_s"),
+                safe_hold_policy=optional_text("safe_hold_policy"),
+                safe_hold_pose_rad=optional_float_tuple("safe_hold_pose_rad"),
+                safe_hold_position_tolerance_rad=optional_float_tuple(
+                    "safe_hold_position_tolerance_rad"
+                ),
+                safe_hold_velocity_tolerance_rad_s=optional_float_tuple(
+                    "safe_hold_velocity_tolerance_rad_s"
+                ),
+                tracking_position_error_limit_rad=optional_float_tuple(
+                    "tracking_position_error_limit_rad"
+                ),
+                safe_hold_ack_timeout_s=optional_float("safe_hold_ack_timeout_s"),
+                restore_mode_form=optional_text("restore_mode_form"),
+                restore_mode_name=optional_text("restore_mode_name"),
+                mapping_version=optional_text("mapping_version"),
+                mapping_hash=optional_text("mapping_hash"),
+                joint_names=optional_text_tuple("joint_names"),
+                motor_ids=optional_int_tuple("motor_ids"),
+                directions=optional_int_tuple("directions"),
+                zero_offsets_rad=optional_float_tuple("zero_offsets_rad"),
+                q_min_rad=optional_float_tuple("q_min_rad"),
+                q_max_rad=optional_float_tuple("q_max_rad"),
+                dq_max_rad_s=optional_float_tuple("dq_max_rad_s"),
+                maximum_delta_q_rad=optional_float_tuple("maximum_delta_q_rad"),
+                kp=optional_float_tuple("kp"),
+                kd=optional_float_tuple("kd"),
+                tau_ff_nm=optional_float_tuple("tau_ff_nm"),
+                tau_limit_nm=optional_float_tuple("tau_limit_nm"),
+                feedback_loss_degraded_kp=optional_float_tuple("feedback_loss_degraded_kp"),
+                feedback_loss_degraded_kd=optional_float_tuple("feedback_loss_degraded_kd"),
+                feedback_loss_degraded_tau_ff_nm=optional_float_tuple(
+                    "feedback_loss_degraded_tau_ff_nm"
+                ),
+                firmware_torque_limit_nm=optional_float_tuple("firmware_torque_limit_nm"),
+                firmware_torque_clamp_verified=optional_bool("firmware_torque_clamp_verified"),
+                temperature_limit_c=optional_float_tuple("temperature_limit_c"),
+            ),
         ),
         rc=RCConfig(
             flight_enable_channel=_required(rc, "flight_enable_channel"),
@@ -862,6 +1797,26 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
             touchdown_max_tilt_rad=float(_required(safety, "touchdown_max_tilt_rad")),
             touchdown_max_height_delta_m=float(_required(safety, "touchdown_max_height_delta_m")),
             touchdown_max_esc_rpm=float(_required(safety, "touchdown_max_esc_rpm")),
+            touchdown_max_source_age_s=float(_required(safety, "touchdown_max_source_age_s")),
+            touchdown_max_source_skew_s=float(_required(safety, "touchdown_max_source_skew_s")),
+            post_touchdown_stable_confirm_s=float(
+                _required(safety, "post_touchdown_stable_confirm_s")
+            ),
+            post_touchdown_stability_max_check_gap_s=float(
+                _required(safety, "post_touchdown_stability_max_check_gap_s")
+            ),
+            aborted_impact_airborne_confirm_s=float(
+                _required(safety, "aborted_impact_airborne_confirm_s")
+            ),
+            impact_recovery_status_max_age_s=float(
+                _required(safety, "impact_recovery_status_max_age_s")
+            ),
+            impact_recovery_completion_timeout_s=float(
+                _required(safety, "impact_recovery_completion_timeout_s")
+            ),
+            impact_recovery_finalization_timeout_s=float(
+                _required(safety, "impact_recovery_finalization_timeout_s")
+            ),
             pixhawk_timeout_s=float(_required(safety, "pixhawk_timeout_s")),
             f446_timeout_s=float(_required(safety, "f446_timeout_s")),
             go2_timeout_s=float(_required(safety, "go2_timeout_s")),

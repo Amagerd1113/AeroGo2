@@ -5,10 +5,14 @@ from __future__ import annotations
 import asyncio
 import math
 from dataclasses import replace
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 from aerogo2.bridges.f446_interface import F446Interface
 from aerogo2.bridges.go2_interface import Go2Interface
+from aerogo2.bridges.go2_lowlevel_interface import (
+    Go2LowLevelInterface,
+    Go2OwnershipPermit,
+)
 from aerogo2.bridges.pixhawk_interface import PixhawkInterface
 from aerogo2.bridges.rc_monitor import RCMonitor
 from aerogo2.common.clock import Clock, RealClock
@@ -17,6 +21,7 @@ from aerogo2.common.enums import (
     AutoLandingRequest,
     Configuration,
     F446State,
+    Go2ControlAuthorityState,
     RuntimeMode,
     SafetySeverity,
     SystemState,
@@ -25,8 +30,13 @@ from aerogo2.common.exceptions import AeroGo2Error, BridgeError, TransitionRejec
 from aerogo2.common.immutable import deep_thaw
 from aerogo2.common.models import (
     F446Status,
+    Go2ControlAuthorityStatus,
+    Go2LowLevelStatus,
+    Go2Status,
+    ImpactLandingRecoveryEvidence,
     LandingCommand,
     LandingEstimate,
+    LowCmdOwnershipState,
     OperatorRequest,
     RCStatus,
     SafetyViolation,
@@ -36,12 +46,19 @@ from aerogo2.common.models import (
 )
 from aerogo2.common.results import GuardResult, OperationResult
 from aerogo2.landing.controller_base import LandingControllerBase
+from aerogo2.landing.impact_aware.executor import ImpactAwareLowCmdExecutor
+from aerogo2.landing.impact_aware.integration import Go2JointPositionCommand
 from aerogo2.landing.safety_filter import LandingSafetyFilter
 from aerogo2.manager.state_machine import StateMachine
 from aerogo2.manager.transition_guards import TRANSFORM_STATES, TransitionGuards
 from aerogo2.safety.esc_telemetry import assess_esc_telemetry
 from aerogo2.safety.go2_contact import assess_foot_contact
 from aerogo2.safety.interlocks import SafetyInterlocks
+from aerogo2.safety.pixhawk_freshness import (
+    pixhawk_ground_state_is_current,
+    pixhawk_touchdown_sources_are_current,
+    timestamps_are_coherent,
+)
 from aerogo2.safety.safety_monitor import SafetyMonitor
 from aerogo2.safety.watchdog import timestamp_age, timestamp_is_fresh
 
@@ -68,11 +85,20 @@ class SystemManager:
         runtime_mode: RuntimeMode = RuntimeMode.DRY_RUN,
         event_logger: Optional[Any] = None,
         rc_monitor: Optional[RCMonitor] = None,
+        go2_low_level: Optional[Go2LowLevelInterface] = None,
+        impact_recovery_source: Optional[Callable[[], ImpactLandingRecoveryEvidence]] = None,
     ) -> None:
         self.config = config
         self._pixhawk = pixhawk
         self._f446 = f446
         self._go2 = go2
+        self._go2_low_level = go2_low_level
+        self._impact_recovery_source = impact_recovery_source
+        self._impact_lowcmd_executor: Optional[ImpactAwareLowCmdExecutor] = None
+        # Serialize the background tick against LowCmd ownership transfers.
+        # Shell commands are already dispatched serially; this closes the
+        # remaining snapshot-check-await-act race with the monitor task.
+        self._operation_lock = asyncio.Lock()
         self._landing_controller = landing_controller
         self._landing_safety_filter = LandingSafetyFilter(config)
         self._landing_interlocks = SafetyInterlocks(config)
@@ -95,6 +121,10 @@ class SystemManager:
             self._enter_go2_joint_lock_wait,
         )
         self._state_machine.set_entry_action(
+            SystemState.GO2_GROUND_HANDOVER,
+            self._enter_go2_joint_lock_wait,
+        )
+        self._state_machine.set_entry_action(
             SystemState.FLIGHT_READY,
             self._leave_manual_positioning,
         )
@@ -110,6 +140,18 @@ class SystemManager:
         self._rc = RCStatus(timestamp=now)
         self._estimate = LandingEstimate(timestamp=now)
         self._snapshot = SystemSnapshot(timestamp=now, state=SystemState.BOOT_SAFE)
+        self._go2_control_authority = Go2ControlAuthorityStatus(timestamp=now)
+        self._impact_landing_session_id = 0
+        self._impact_recovery = ImpactLandingRecoveryEvidence()
+        self._last_confirmed_impact_recovery: Optional[ImpactLandingRecoveryEvidence] = None
+        self._impact_recovery_wait_started_at: Optional[float] = None
+        self._impact_recovery_finalization_started_at: Optional[float] = None
+        self._impact_recovery_finalization_completed_at: Optional[float] = None
+        self._post_touchdown_stable_since: Optional[float] = None
+        self._post_touchdown_last_stability_check_at: Optional[float] = None
+        self._impact_landing_exit_ready = False
+        self._impact_recovery_safe_hold_confirmed = False
+        self._impact_recovery_setpoints_stopped = False
         self._active_violations: Dict[str, SafetyViolation] = {}
         self._violation_history: List[SafetyViolation] = []
         self._last_landing_command = LandingCommand(timestamp=now)
@@ -119,9 +161,21 @@ class SystemManager:
         self._airborne_confirmed = False
         self._touchdown_since: Optional[float] = None
         self._touchdown_height_reference: Optional[float] = None
+        # A failed post-impact recovery may not be reclassified by the simpler
+        # manual-touchdown path while the same continuous landed episode holds.
+        self._aborted_impact_touchdown_latched = False
+        self._aborted_impact_airborne_since: Optional[float] = None
+        self._aborted_impact_airborne_last_check_at: Optional[float] = None
         self._landing_contact_since: Optional[float] = None
         self._landing_compliant_since: Optional[float] = None
         self._go2_stationary_since: Optional[float] = None
+        # Ownership transfer has a stronger dwell requirement than morphology
+        # changes: the aircraft must also be positively disarmed and landed.
+        self._lowcmd_ground_stationary_since: Optional[float] = None
+        self._lowcmd_ground_stationary_source_start: Optional[Tuple[float, float]] = None
+        # A pre-LowCmd SportModeState sample must never be reused to complete
+        # the post-landing LowCmd-to-high-level handover.
+        self._go2_ground_handover_started_at: Optional[float] = None
         self._f446_current_clear_since: Optional[float] = None
         self._f446_current_clear_key: Optional[Tuple[Any, ...]] = None
         self._touchdown_confirmed = False
@@ -137,6 +191,10 @@ class SystemManager:
         self._manual_last_direction: Optional[str] = None
         self._manual_motion_started = False
         self._go2_joint_lock_deadline: Optional[float] = None
+        # Distinguish harmless cleanup after a partial startup from loss of
+        # authoritative telemetry after the system has entered an operational
+        # state.  FAULT is not itself proof that the vehicle is on the ground.
+        self._ever_entered_operational_state = False
         self._go2_joint_lock_entered_at: Optional[float] = None
         self._go2_joint_lock_unsafe_since: Optional[float] = None
         self._operator_joint_lock_confirmed = False
@@ -159,7 +217,7 @@ class SystemManager:
         return self._runtime_mode
 
     @property
-    def transitions(self) -> Tuple[Any, ...]:
+    def transitions(self) -> Tuple[TransitionRecord, ...]:
         return self._state_machine.history
 
     @property
@@ -191,7 +249,22 @@ class SystemManager:
             record.previous_state is SystemState.FLIGHT_READY
             and record.new_state is not SystemState.FLIGHT_READY
         ):
-            await self._revoke_ground_arm_authorization(f"state changed to {record.new_state.name}")
+            revoked = await self._revoke_ground_arm_authorization_unlocked(
+                f"state changed to {record.new_state.name}"
+            )
+            if not revoked.ok and record.new_state is not SystemState.FAULT:
+                # A normal-state transition must not silently commit while the
+                # independent Pixhawk arm authority remains ambiguous.  Raising
+                # makes StateMachine enter FAULT, whose entry action retries the
+                # revocation independently.
+                raise BridgeError(
+                    f"{revoked.code}: ground-arm gate revoke failed during "
+                    f"{record.previous_state.name}->{record.new_state.name}: "
+                    f"{revoked.message}"
+                )
+            # For a direct FLIGHT_READY->FAULT transition, allow the FAULT
+            # entry action to run and perform its own mandatory retry.  Raising
+            # here would skip that entry action in StateMachine's publish path.
 
         if (
             record.previous_state is SystemState.FLIGHT_READY
@@ -219,6 +292,19 @@ class SystemManager:
         await self.refresh_snapshot()
         return OperationResult.success("System started in BOOT_SAFE")
 
+    async def _connect_go2_low_level_if_enabled(self) -> None:
+        """Connect the read-only LowState endpoint when either tier requests it."""
+
+        if not self.config.go2.low_level.observation_enabled:
+            return
+        if self._go2_low_level is None:
+            raise BridgeError(
+                "Go2 LowState observation is enabled but no low-level bridge was injected"
+            )
+        result = await self._go2_low_level.connect()
+        if not result.ok:
+            raise BridgeError(f"{result.code}: {result.message}")
+
     async def connect_all(self) -> OperationResult:
         """Connect injected bridges and adopt only a verified idle configuration."""
 
@@ -226,6 +312,7 @@ class SystemManager:
             await self._pixhawk.connect()
             await self._f446.connect()
             await self._go2.connect()
+            await self._connect_go2_low_level_if_enabled()
             await self.refresh_snapshot()
             if self.state is SystemState.BOOT_SAFE:
                 await self._adopt_boot_configuration()
@@ -245,6 +332,7 @@ class SystemManager:
                 await self._f446.connect()
             elif normalized == "go2":
                 await self._go2.connect()
+                await self._connect_go2_low_level_if_enabled()
             else:
                 return OperationResult.failure("UNKNOWN_DEVICE", f"Unknown device '{name}'")
             await self.refresh_snapshot()
@@ -272,6 +360,12 @@ class SystemManager:
         ready = await self._prepare_disconnect()
         if not ready.ok:
             return ready
+        release = await self._release_go2_low_level_for_shutdown("disconnect all")
+        if not release.ok:
+            return OperationResult.failure(
+                "DISCONNECT_INHIBITED",
+                f"LowCmd ownership was not safely released: {release.message}",
+            )
         failures: List[str] = []
         for name, bridge in (
             ("go2", self._go2),
@@ -302,6 +396,12 @@ class SystemManager:
         ready = await self._prepare_disconnect()
         if not ready.ok:
             return ready
+        release = await self._release_go2_low_level_for_shutdown(f"disconnect device {normalized}")
+        if not release.ok:
+            return OperationResult.failure(
+                "DISCONNECT_INHIBITED",
+                f"LowCmd ownership was not safely released: {release.message}",
+            )
         try:
             if normalized == "pixhawk":
                 await self._pixhawk.disconnect()
@@ -321,10 +421,41 @@ class SystemManager:
         )
 
     async def refresh_snapshot(self) -> SystemSnapshot:
+        if self.state not in {
+            SystemState.BOOT_SAFE,
+            SystemState.FAULT,
+            SystemState.EMERGENCY_STOP,
+        }:
+            self._ever_entered_operational_state = True
         pixhawk = self._pixhawk.get_status()
         f446 = self._f446.get_status()
         go2 = self._go2.get_status()
         now = self._clock.monotonic()
+        low_level = go2.low_level_status
+        if self._go2_low_level is not None and self.config.go2.low_level.observation_enabled:
+            try:
+                low_level = self._go2_low_level.status()
+            except Exception as exc:
+                low_level = Go2LowLevelStatus(
+                    timestamp=now,
+                    connected=False,
+                    ownership_state=LowCmdOwnershipState.FAULT,
+                    healthy=False,
+                    fault_reason=f"low-level status failed: {exc}",
+                )
+        elif self.config.go2.low_level.observation_enabled:
+            low_level = Go2LowLevelStatus(
+                timestamp=now,
+                connected=False,
+                ownership_state=LowCmdOwnershipState.DISCONNECTED,
+                healthy=False,
+                fault_reason="enabled LowState observer was not injected into SystemManager",
+            )
+        if low_level.low_state_timestamp > 0.0:
+            low_level = replace(
+                low_level,
+                low_state_age_s=timestamp_age(now, low_level.low_state_timestamp),
+            )
         if self._rc_monitor is not None:
             self._rc = self._rc_monitor.update_from_channels(
                 pixhawk.rc_channels,
@@ -396,6 +527,7 @@ class SystemManager:
             used_raw=0 if f446.used_current_adc is None else f446.used_current_adc,
             threshold_raw=0 if f446.threshold_adc is None else f446.threshold_adc,
         )
+        authority = self._reconcile_go2_control_authority(go2, low_level, now)
         go2 = replace(
             go2,
             message_age_s=timestamp_age(now, go2.timestamp),
@@ -407,6 +539,8 @@ class SystemManager:
                 )
                 or go2.controller_active
             ),
+            low_level_status=low_level,
+            control_authority=authority,
         )
         stationary = (
             go2.connected
@@ -421,6 +555,30 @@ class SystemManager:
                 self._go2_stationary_since = now
         else:
             self._go2_stationary_since = None
+        lowcmd_owner_stationary = (
+            low_level.ownership_pending and self._lowcmd_motor_feedback_is_stationary(low_level)
+        )
+        lowcmd_ground_stationary = (
+            (lowcmd_owner_stationary if low_level.ownership_pending else stationary)
+            and pixhawk_ground_state_is_current(
+                pixhawk,
+                now,
+                self.config.safety.pixhawk_timeout_s,
+                self.config.safety.touchdown_max_source_age_s,
+            )
+            and not pixhawk.armed
+            and pixhawk.landed
+        )
+        if lowcmd_ground_stationary:
+            if self._lowcmd_ground_stationary_since is None:
+                self._lowcmd_ground_stationary_since = now
+                self._lowcmd_ground_stationary_source_start = (
+                    pixhawk.heartbeat_timestamp,
+                    pixhawk.landed_state_timestamp,
+                )
+        else:
+            self._lowcmd_ground_stationary_since = None
+            self._lowcmd_ground_stationary_source_start = None
         operator = OperatorRequest(
             timestamp=self._rc.timestamp,
             flight_enable=self._rc.flight_enable,
@@ -428,7 +586,13 @@ class SystemManager:
             auto_landing_request=self._rc.auto_landing_request.value,
             manual_override=self._rc.manual_override,
         )
-        bridge_authorized = self._pixhawk.ground_arm_authorization_active()
+        try:
+            bridge_authorized = self._pixhawk.ground_arm_authorization_active()
+        except Exception:
+            # The snapshot must never claim a gate is closed merely because
+            # its status callback failed.  ``tick`` treats this unknown state
+            # as possibly active and executes the acknowledged revoke path.
+            bridge_authorized = True
         if self._ground_arm_authorized and not bridge_authorized:
             self._ground_arm_authorized = False
             self._ground_arm_authorization_expires_at = None
@@ -436,6 +600,22 @@ class SystemManager:
         ground_arm_authorization_expires_at = (
             self._ground_arm_authorization_expires_at if ground_arm_authorized else None
         )
+        if self._impact_recovery_source is not None:
+            try:
+                recovery = self._impact_recovery_source()
+                if not isinstance(recovery, ImpactLandingRecoveryEvidence):
+                    raise TypeError("impact recovery source did not return typed evidence")
+                self._impact_recovery = self._validate_impact_recovery_source_sample(
+                    recovery,
+                    now,
+                )
+            except Exception as exc:
+                self._impact_recovery = ImpactLandingRecoveryEvidence(
+                    timestamp=now,
+                    valid_until=now,
+                    landing_session_id=self._impact_landing_session_id,
+                    reason=f"impact recovery source failed: {type(exc).__name__}: {exc}",
+                )
         if not go2.connected:
             self._operator_joint_lock_confirmed = False
         joint_lock_confirmed = go2.connected and (
@@ -467,6 +647,21 @@ class SystemManager:
             ground_arm_authorized=ground_arm_authorized,
             ground_arm_authorization_expires_at=ground_arm_authorization_expires_at,
             active_fault_codes=tuple(sorted(self._active_violations)),
+            impact_landing_session_id=self._impact_landing_session_id,
+            impact_recovery=self._impact_recovery,
+            impact_recovery_wait_started_at=self._impact_recovery_wait_started_at,
+            impact_recovery_finalization_started_at=(self._impact_recovery_finalization_started_at),
+            post_touchdown_stable_since=self._post_touchdown_stable_since,
+            post_touchdown_last_stability_check_at=(self._post_touchdown_last_stability_check_at),
+            post_touchdown_stable_dwell_complete=(
+                self._post_touchdown_stable_since is not None
+                and self._post_touchdown_last_stability_check_at is not None
+                and now - self._post_touchdown_stable_since
+                >= self.config.safety.post_touchdown_stable_confirm_s
+                and now - self._post_touchdown_last_stability_check_at
+                <= self.config.safety.post_touchdown_stability_max_check_gap_s
+            ),
+            impact_landing_exit_ready=self._impact_landing_exit_ready,
         )
         return self._snapshot
 
@@ -476,19 +671,996 @@ class SystemManager:
         self._rc = status
 
     def accept_landing_estimate(self, estimate: LandingEstimate) -> None:
-        """Accept simulated estimator/ground-sensor output."""
+        """Inject estimator output only into the deterministic dry-run world.
 
+        A future hardware estimator must be constructor-bound and carry its
+        own source identity/generation; a shell or UI must not manufacture a
+        landing observation that can advance the safety state machine.
+        """
+
+        if self._runtime_mode is not RuntimeMode.DRY_RUN:
+            raise RuntimeError("hardware landing estimates must come from a bound source")
+        if not isinstance(estimate, LandingEstimate):
+            raise TypeError("estimate must be a LandingEstimate")
         self._estimate = estimate
+
+    def accept_impact_landing_recovery_evidence(
+        self,
+        evidence: ImpactLandingRecoveryEvidence,
+    ) -> None:
+        """Inject recovery evidence only into the deterministic dry-run world.
+
+        Hardware must use the constructor-injected read-only source so a shell
+        or UI cannot manufacture completion booleans.
+        """
+
+        if self._runtime_mode is not RuntimeMode.DRY_RUN:
+            raise RuntimeError("hardware recovery evidence must come from the bound source")
+        if not isinstance(evidence, ImpactLandingRecoveryEvidence):
+            raise TypeError("evidence must be ImpactLandingRecoveryEvidence")
+        self._impact_recovery = self._validate_impact_recovery_source_sample(
+            evidence,
+            self._clock.monotonic(),
+        )
+
+    def _reset_impact_landing_completion(self, *, new_session: bool) -> None:
+        if new_session:
+            self._impact_landing_session_id += 1
+            self._aborted_impact_touchdown_latched = False
+        self._clear_aborted_impact_airborne_dwell()
+        self._impact_recovery = ImpactLandingRecoveryEvidence()
+        self._last_confirmed_impact_recovery = None
+        self._impact_recovery_wait_started_at = None
+        self._impact_recovery_finalization_started_at = None
+        self._impact_recovery_finalization_completed_at = None
+        self._post_touchdown_stable_since = None
+        self._post_touchdown_last_stability_check_at = None
+        self._impact_landing_exit_ready = False
+        self._impact_recovery_safe_hold_confirmed = False
+        self._impact_recovery_setpoints_stopped = False
+
+    def _clear_aborted_impact_airborne_dwell(self) -> bool:
+        """Discard partial evidence for clearing a post-impact abort latch."""
+
+        changed = bool(
+            self._aborted_impact_airborne_since is not None
+            or self._aborted_impact_airborne_last_check_at is not None
+        )
+        self._aborted_impact_airborne_since = None
+        self._aborted_impact_airborne_last_check_at = None
+        return changed
+
+    def _validate_impact_recovery_source_sample(
+        self,
+        candidate: ImpactLandingRecoveryEvidence,
+        now: float,
+    ) -> ImpactLandingRecoveryEvidence:
+        """Fence replay/re-stamping of normal recovery completion evidence."""
+
+        if not candidate.confirmed:
+            return candidate
+        if candidate.landing_session_id != self._impact_landing_session_id:
+            return ImpactLandingRecoveryEvidence(
+                timestamp=now,
+                valid_until=now,
+                landing_session_id=self._impact_landing_session_id,
+                reason="confirmed recovery evidence belongs to another landing session",
+            )
+        previous = self._last_confirmed_impact_recovery
+        if previous is not None:
+            if candidate.sequence == previous.sequence:
+                if candidate == previous:
+                    return previous
+                return ImpactLandingRecoveryEvidence(
+                    timestamp=now,
+                    valid_until=now,
+                    landing_session_id=self._impact_landing_session_id,
+                    reason="recovery evidence sequence was replayed with changed content",
+                )
+            domain_changed = (
+                candidate.sequence < previous.sequence
+                or candidate.timestamp <= previous.timestamp
+                or candidate.go2_ownership_epoch != previous.go2_ownership_epoch
+                or candidate.contact_epoch != previous.contact_epoch
+                or candidate.fc_session_id != previous.fc_session_id
+                or candidate.fc_control_epoch != previous.fc_control_epoch
+                or candidate.fc_transport_generation != previous.fc_transport_generation
+                or candidate.residual_zero_ack_timestamp != previous.residual_zero_ack_timestamp
+                or candidate.residual_zero_execution_timestamp
+                != previous.residual_zero_execution_timestamp
+                or candidate.residual_zero_status_timestamp
+                <= previous.residual_zero_status_timestamp
+                or (
+                    candidate.clear_through_command_sequence is not None
+                    and previous.clear_through_command_sequence is not None
+                    and candidate.clear_through_command_sequence
+                    < previous.clear_through_command_sequence
+                )
+            )
+            if domain_changed:
+                return ImpactLandingRecoveryEvidence(
+                    timestamp=now,
+                    valid_until=now,
+                    landing_session_id=self._impact_landing_session_id,
+                    reason=(
+                        "recovery evidence sequence, time, identity, contact epoch, "
+                        "or FC clear watermark regressed"
+                    ),
+                )
+        self._last_confirmed_impact_recovery = candidate
+        return candidate
+
+    def _set_go2_control_authority(
+        self,
+        state: Go2ControlAuthorityState,
+        *,
+        now: float,
+        ownership_epoch: int,
+        reason: str,
+        timeout_s: Optional[float] = None,
+        restart_transition: bool = False,
+    ) -> Go2ControlAuthorityStatus:
+        previous = self._go2_control_authority
+        same_identity = (
+            not restart_transition
+            and previous.state is state
+            and previous.ownership_epoch == ownership_epoch
+        )
+        if timeout_s is not None and same_identity and previous.transition_pending:
+            started_at = previous.transition_started_at
+            deadline = previous.transition_deadline
+        elif timeout_s is not None:
+            started_at = now
+            deadline = now + timeout_s
+        else:
+            started_at = None
+            deadline = None
+        self._go2_control_authority = Go2ControlAuthorityStatus(
+            state=state,
+            timestamp=now,
+            transition_started_at=started_at,
+            transition_deadline=deadline,
+            generation=previous.generation + (0 if same_identity else 1),
+            ownership_epoch=ownership_epoch,
+            reason=reason,
+        )
+        return self._go2_control_authority
+
+    def _reconcile_go2_control_authority(
+        self,
+        go2: Go2Status,
+        low_level: Go2LowLevelStatus,
+        now: float,
+    ) -> Go2ControlAuthorityStatus:
+        """Reconcile one explicit authority state without trusting SportMode in LowCmd."""
+
+        owner_state = low_level.ownership_state
+        if owner_state is LowCmdOwnershipState.ACQUIRING:
+            return self._set_go2_control_authority(
+                Go2ControlAuthorityState.LOWCMD_ACQUIRING,
+                now=now,
+                ownership_epoch=low_level.owner_epoch,
+                reason="MotionSwitcher release and first safe-hold write are pending",
+                timeout_s=self.config.go2.low_level.acquire_timeout_s,
+            )
+        if owner_state is LowCmdOwnershipState.MPC_ACTIVE:
+            return self._set_go2_control_authority(
+                Go2ControlAuthorityState.LOWCMD_ACTIVE,
+                now=now,
+                ownership_epoch=low_level.owner_epoch,
+                reason="exclusive LowCmd owner has an active MPC target lease",
+            )
+        if owner_state in {
+            LowCmdOwnershipState.HOLDING,
+            LowCmdOwnershipState.SAFE_HOLD,
+        }:
+            return self._set_go2_control_authority(
+                Go2ControlAuthorityState.LOWCMD_SAFE_HOLD,
+                now=now,
+                ownership_epoch=low_level.owner_epoch,
+                reason="exclusive LowCmd owner is retaining the verified safe hold",
+            )
+        if owner_state is LowCmdOwnershipState.RELEASING:
+            return self._set_go2_control_authority(
+                Go2ControlAuthorityState.HIGH_LEVEL_REACQUIRING,
+                now=now,
+                ownership_epoch=low_level.owner_epoch,
+                reason="LowCmd endpoint is closing and high-level authority is being restored",
+                timeout_s=self.config.go2.low_level.release_timeout_s,
+            )
+        if owner_state is LowCmdOwnershipState.FAULT or low_level.ownership_pending:
+            return self._set_go2_control_authority(
+                Go2ControlAuthorityState.FAULT,
+                now=now,
+                ownership_epoch=low_level.owner_epoch,
+                reason=low_level.fault_reason or "LowCmd ownership facts are inconsistent",
+            )
+
+        previous = self._go2_control_authority
+        if previous.state is Go2ControlAuthorityState.HIGH_LEVEL_REACQUIRING:
+            fence = self._go2_ground_handover_started_at
+            causal_joint_lock = bool(
+                fence is not None
+                and go2.connected
+                and go2.joints_locked
+                and go2.timestamp > fence
+                and timestamp_is_fresh(now, go2.timestamp, self.config.safety.go2_timeout_s)
+            )
+            if causal_joint_lock:
+                return self._set_go2_control_authority(
+                    Go2ControlAuthorityState.HIGH_LEVEL_JOINT_LOCK,
+                    now=now,
+                    ownership_epoch=0,
+                    reason="post-handover SportMode sample confirmed JOINT_LOCK",
+                )
+            deadline = previous.transition_deadline
+            if deadline is not None and now >= deadline:
+                return self._set_go2_control_authority(
+                    Go2ControlAuthorityState.FAULT,
+                    now=now,
+                    ownership_epoch=previous.ownership_epoch,
+                    reason="high-level authority reacquisition timed out",
+                )
+            return self._set_go2_control_authority(
+                Go2ControlAuthorityState.HIGH_LEVEL_REACQUIRING,
+                now=now,
+                ownership_epoch=previous.ownership_epoch,
+                reason="waiting for a causally-new JOINT_LOCK sample",
+                timeout_s=self.config.go2.low_level.release_timeout_s,
+            )
+
+        if (
+            go2.connected
+            and go2.joints_locked
+            and timestamp_is_fresh(now, go2.timestamp, self.config.safety.go2_timeout_s)
+        ):
+            return self._set_go2_control_authority(
+                Go2ControlAuthorityState.HIGH_LEVEL_JOINT_LOCK,
+                now=now,
+                ownership_epoch=0,
+                reason="fresh SportMode sample confirms high-level JOINT_LOCK",
+            )
+        return self._set_go2_control_authority(
+            Go2ControlAuthorityState.UNKNOWN,
+            now=now,
+            ownership_epoch=0,
+            reason="neither high-level JOINT_LOCK nor exclusive LowCmd authority is proven",
+        )
+
+    async def acquire_go2_low_level_control(
+        self,
+        *,
+        operator_confirmed: bool = False,
+        robot_supported: bool = False,
+    ) -> OperationResult:
+        async with self._operation_lock:
+            return await self._acquire_go2_low_level_control_unlocked(
+                operator_confirmed=operator_confirmed,
+                robot_supported=robot_supported,
+            )
+
+    async def _acquire_go2_low_level_control_unlocked(
+        self,
+        *,
+        operator_confirmed: bool,
+        robot_supported: bool,
+    ) -> OperationResult:
+        """Acquire the sole LowCmd writer while still safely on the ground.
+
+        Acquisition is intentionally separate from MPC activation.  The
+        expected flight sequence is JOINT_LOCK -> ground-only acquisition ->
+        operator/Pixhawk arm -> low-rate target submission in AUTO_LANDING.
+        """
+
+        unavailable = self._lowcmd_unavailable_result()
+        if unavailable is not None:
+            return unavailable
+        if not self._control_writes_allowed():
+            return OperationResult.failure(
+                "HARDWARE_WRITE_DISABLED",
+                "LowCmd ownership requires an explicitly unlocked hardware process",
+            )
+        if self.state is not SystemState.FLIGHT_READY:
+            return OperationResult.failure(
+                "INVALID_STATE",
+                "LowCmd may be acquired only from FLIGHT_READY before rotor arming",
+            )
+        if type(operator_confirmed) is not bool or not operator_confirmed:
+            return OperationResult.failure(
+                "OPERATOR_CONFIRMATION_REQUIRED",
+                "An explicit operator confirmation is required for LowCmd ownership transfer",
+            )
+        if type(robot_supported) is not bool or not robot_supported:
+            return OperationResult.failure(
+                "ROBOT_SUPPORT_CONFIRMATION_REQUIRED",
+                "Confirm that the vehicle is mechanically supported before LowCmd acquisition",
+            )
+
+        await self.refresh_snapshot()
+        status = self._snapshot.go2.low_level_status
+        if status.ownership_pending:
+            if (
+                status.ownership_state is LowCmdOwnershipState.HOLDING
+                and self._lowcmd_status_healthy(status)
+            ):
+                rebound = self._bind_impact_lowcmd_executor(status)
+                if not rebound.ok:
+                    return rebound
+                self._emit(
+                    "GO2_LOWCMD_EXECUTOR_REBOUND",
+                    ownership_epoch=status.owner_epoch,
+                )
+                return OperationResult.success(
+                    "Go2 LowCmd ownership is already held; executor binding was reconciled",
+                    {"ownership_epoch": status.owner_epoch},
+                )
+            return OperationResult.failure(
+                "GO2_LOWCMD_OWNER_UNHEALTHY",
+                status.fault_reason or "The existing LowCmd owner is unhealthy",
+            )
+        ground = self._lowcmd_ground_transfer_result(require_joint_lock=True)
+        if not ground.ok:
+            return ground
+        acquiring = self._set_go2_control_authority(
+            Go2ControlAuthorityState.LOWCMD_ACQUIRING,
+            now=self._clock.monotonic(),
+            ownership_epoch=0,
+            reason="operator-authorized MotionSwitcher/LowCmd acquisition started",
+            timeout_s=self.config.go2.low_level.acquire_timeout_s,
+        )
+        self._snapshot = replace(
+            self._snapshot,
+            go2=replace(self._snapshot.go2, control_authority=acquiring),
+        )
+        try:
+            permit = self._build_lowcmd_permit(
+                operator_authorized=operator_confirmed,
+                robot_supported=robot_supported,
+                timeout_s=self.config.go2.low_level.acquire_timeout_s,
+                reason="operator-confirmed ground acquisition before flight",
+            )
+            assert self._go2_low_level is not None
+            result = await self._go2_low_level.acquire(permit)
+        except (AeroGo2Error, OSError, RuntimeError, TypeError, ValueError) as exc:
+            await self.refresh_snapshot()
+            return OperationResult.failure("GO2_LOWCMD_ACQUIRE_FAILED", str(exc))
+        if not result.ok:
+            await self.refresh_snapshot()
+            return result
+        await self.refresh_snapshot()
+        status = self._snapshot.go2.low_level_status
+        if (
+            status.ownership_state is not LowCmdOwnershipState.HOLDING
+            or status.owner_epoch <= 0
+            or not self._lowcmd_status_healthy(status)
+        ):
+            await self._revoke_go2_low_level_internal("acquisition acknowledgement invalid")
+            return OperationResult.failure(
+                "GO2_LOWCMD_ACQUIRE_UNCONFIRMED",
+                "Owner did not confirm a healthy HOLDING stream after acquisition",
+            )
+        bound = self._bind_impact_lowcmd_executor(status)
+        if not bound.ok:
+            await self._revoke_go2_low_level_internal(
+                "executor could not bind incomplete mapping/TTL configuration"
+            )
+            return bound
+        self._emit("GO2_LOWCMD_ACQUIRED", ownership_epoch=status.owner_epoch)
+        return OperationResult.success(
+            "Go2 LowCmd owner acquired and verified in safe-hold",
+            {"ownership_epoch": status.owner_epoch},
+        )
+
+    async def activate_go2_low_level_control(
+        self,
+        command: Go2JointPositionCommand,
+    ) -> OperationResult:
+        async with self._operation_lock:
+            return await self._activate_go2_low_level_control_unlocked(command)
+
+    async def _activate_go2_low_level_control_unlocked(
+        self,
+        command: Go2JointPositionCommand,
+    ) -> OperationResult:
+        """Submit the leg half only after a future atomic committer authorizes it."""
+
+        unavailable = self._lowcmd_unavailable_result()
+        if unavailable is not None:
+            return unavailable
+        if self._runtime_mode is not RuntimeMode.DRY_RUN:
+            return OperationResult.failure(
+                "COORDINATED_ACTUATION_NOT_CONFIGURED",
+                "Hardware leg activation remains locked until matching flight-controller residual firmware/transport and the cross-device committer are implemented",
+            )
+        if self.state is not SystemState.AUTO_LANDING or not self._autoland_active:
+            return OperationResult.failure(
+                "GO2_LOWCMD_ACTIVATION_STATE_INVALID",
+                "MPC LowCmd targets are authorized only during active AUTO_LANDING",
+            )
+        if not isinstance(command, Go2JointPositionCommand):
+            return OperationResult.failure(
+                "GO2_LOWCMD_TARGET_INVALID",
+                "command must be the validated leg half supplied by the atomic committer",
+            )
+        await self.refresh_snapshot()
+        before = self._snapshot.go2.low_level_status
+        if not before.owns_lowcmd or not self._lowcmd_status_healthy(before):
+            return OperationResult.failure(
+                "GO2_LOWCMD_NOT_READY",
+                before.fault_reason or "A healthy LowCmd ownership epoch is required",
+            )
+        executor = self._impact_lowcmd_executor
+        if executor is None:
+            return OperationResult.failure(
+                "GO2_LOWCMD_EXECUTOR_NOT_BOUND",
+                "Acquire a new ownership epoch before activating MPC targets",
+            )
+        try:
+            result = await executor.submit(command)
+        except (AeroGo2Error, OSError, RuntimeError, TypeError, ValueError) as exc:
+            await self._revoke_go2_low_level_internal(f"target submission exception: {exc}")
+            return OperationResult.failure("GO2_LOWCMD_SUBMIT_FAILED", str(exc))
+        if not result.ok:
+            await self._revoke_go2_low_level_internal(f"target submission rejected: {result.code}")
+            return result
+        await self.refresh_snapshot()
+        after = self._snapshot.go2.low_level_status
+        if (
+            after.owner_epoch != before.owner_epoch
+            or after.ownership_state is not LowCmdOwnershipState.MPC_ACTIVE
+            or after.target_sequence != command.sequence
+            or not self._lowcmd_status_healthy(after)
+        ):
+            await self._revoke_go2_low_level_internal("target activation acknowledgement invalid")
+            return OperationResult.failure(
+                "GO2_LOWCMD_ACTIVATION_UNCONFIRMED",
+                "Owner did not confirm the submitted target in the same ownership epoch",
+            )
+        self._emit(
+            "GO2_LOWCMD_TARGET_ACTIVE",
+            ownership_epoch=after.owner_epoch,
+            sequence=command.sequence,
+        )
+        return OperationResult.success(
+            "Go2 LowCmd MPC target activated",
+            {"ownership_epoch": after.owner_epoch, "sequence": command.sequence},
+        )
+
+    async def revoke_go2_low_level_control(
+        self,
+        reason: str = "operator request",
+    ) -> OperationResult:
+        """Revoke the MPC target while preserving the sole safe-hold stream."""
+
+        async with self._operation_lock:
+            return await self._revoke_go2_low_level_internal(reason)
+
+    async def release_go2_low_level_control(
+        self,
+        *,
+        operator_confirmed: bool = False,
+        robot_supported: bool = False,
+        reason: str = "operator-confirmed ground release",
+    ) -> OperationResult:
+        async with self._operation_lock:
+            return await self._release_go2_low_level_control_unlocked(
+                operator_confirmed=operator_confirmed,
+                robot_supported=robot_supported,
+                reason=reason,
+            )
+
+    async def _release_go2_low_level_control_unlocked(
+        self,
+        *,
+        operator_confirmed: bool,
+        robot_supported: bool,
+        reason: str,
+    ) -> OperationResult:
+        """Return Go2 authority only after a second ground-only permit."""
+
+        unavailable = self._lowcmd_unavailable_result()
+        if unavailable is not None:
+            return unavailable
+        if not self._control_writes_allowed():
+            return OperationResult.failure(
+                "HARDWARE_WRITE_DISABLED",
+                "LowCmd release requires the explicitly unlocked hardware process that owns the writer",
+            )
+        if type(operator_confirmed) is not bool or not operator_confirmed:
+            return OperationResult.failure(
+                "OPERATOR_CONFIRMATION_REQUIRED",
+                "An explicit operator confirmation is required to release LowCmd ownership",
+            )
+        if type(robot_supported) is not bool or not robot_supported:
+            return OperationResult.failure(
+                "ROBOT_SUPPORT_CONFIRMATION_REQUIRED",
+                "Confirm mechanical support before releasing the continuous LowCmd stream",
+            )
+        if self.state not in {
+            SystemState.FLIGHT_READY,
+            SystemState.TOUCHDOWN_VERIFY,
+            SystemState.LANDING_COMPLIANT,
+            SystemState.BOOT_SAFE,
+            SystemState.FAULT,
+            SystemState.EMERGENCY_STOP,
+        }:
+            return OperationResult.failure(
+                "GO2_LOWCMD_RELEASE_STATE_INVALID",
+                "LowCmd release is allowed only in a verified ground/fault handover state",
+            )
+        touchdown_handover = self.state is SystemState.TOUCHDOWN_VERIFY
+
+        # The Pixhawk arm gate and the LowCmd handover are one serialized
+        # authority transaction.  Clear and acknowledge the former before a
+        # release permit can stop the sole LowCmd writer.
+        gate_result = await self._revoke_ground_arm_authorization_unlocked(
+            f"before Go2 LowCmd release: {reason}"
+        )
+        if not gate_result.ok:
+            return OperationResult.failure(
+                "GO2_LOWCMD_RELEASE_ARM_GATE_REVOKE_FAILED",
+                "LowCmd release is inhibited because the Pixhawk ground-arm gate "
+                f"could not be revoked: {gate_result.code}: {gate_result.message}",
+                {"gate_code": gate_result.code},
+            )
+        await self.refresh_snapshot()
+        try:
+            gate_still_active = self._pixhawk.ground_arm_authorization_active()
+        except Exception as exc:
+            return OperationResult.failure(
+                "GO2_LOWCMD_RELEASE_ARM_GATE_STATUS_FAILED",
+                f"Cannot prove the Pixhawk ground-arm gate inactive: {type(exc).__name__}: {exc}",
+            )
+        if self._ground_arm_authorized or self._snapshot.ground_arm_authorized or gate_still_active:
+            return OperationResult.failure(
+                "GO2_LOWCMD_RELEASE_ARM_GATE_ACTIVE",
+                "LowCmd release is inhibited until both manager and Pixhawk prove the arm gate inactive",
+            )
+        status = self._snapshot.go2.low_level_status
+        ground = self._lowcmd_ground_transfer_result(require_joint_lock=False)
+        if not ground.ok:
+            return ground
+        already_released = not status.ownership_pending
+        if already_released and not touchdown_handover:
+            return OperationResult.success("No Go2 LowCmd ownership is held")
+        if status.ownership_state is LowCmdOwnershipState.MPC_ACTIVE:
+            revoked = await self._revoke_go2_low_level_internal(
+                f"safe-hold before release: {reason}"
+            )
+            if not revoked.ok:
+                return revoked
+            # Revocation is asynchronous with respect to the physical system;
+            # never reuse the pre-revoke ground observation to stop the writer.
+            await self.refresh_snapshot()
+            ground = self._lowcmd_ground_transfer_result(require_joint_lock=False)
+            if not ground.ok:
+                return ground
+        if not already_released:
+            reacquiring = self._set_go2_control_authority(
+                Go2ControlAuthorityState.HIGH_LEVEL_REACQUIRING,
+                now=self._clock.monotonic(),
+                ownership_epoch=status.owner_epoch,
+                reason="ground-authorized LowCmd-to-high-level handover started",
+                timeout_s=self.config.go2.low_level.release_timeout_s,
+            )
+            self._snapshot = replace(
+                self._snapshot,
+                go2=replace(self._snapshot.go2, control_authority=reacquiring),
+            )
+            try:
+                permit = self._build_lowcmd_permit(
+                    operator_authorized=operator_confirmed,
+                    robot_supported=robot_supported,
+                    timeout_s=self.config.go2.low_level.release_timeout_s,
+                    reason=reason,
+                )
+                assert self._go2_low_level is not None
+                result = await self._go2_low_level.release(
+                    permit,
+                    reason,
+                    ownership_epoch=status.owner_epoch,
+                )
+            except (AeroGo2Error, OSError, RuntimeError, TypeError, ValueError) as exc:
+                await self.refresh_snapshot()
+                return OperationResult.failure("GO2_LOWCMD_RELEASE_FAILED", str(exc))
+            if not result.ok:
+                await self.refresh_snapshot()
+                return result
+        # Fence out any SportModeState cached before the low-level endpoint
+        # closed.  The bridge's MotionSwitcher ACK proves service restoration;
+        # a later JOINT_LOCK sample is still required before normal high-level
+        # locomotion resumes.
+        self._go2_ground_handover_started_at = self._clock.monotonic()
+        self._set_go2_control_authority(
+            Go2ControlAuthorityState.HIGH_LEVEL_REACQUIRING,
+            now=self._go2_ground_handover_started_at,
+            ownership_epoch=0,
+            reason="high-level service restored; waiting for post-handover JOINT_LOCK",
+            timeout_s=self.config.go2.joint_lock_operator_timeout_s,
+            restart_transition=True,
+        )
+        await self.refresh_snapshot()
+        after = self._snapshot.go2.low_level_status
+        if (
+            after.ownership_pending
+            or after.ownership_state is not LowCmdOwnershipState.OBSERVE_ONLY
+        ):
+            return OperationResult.failure(
+                "GO2_LOWCMD_RELEASE_UNCONFIRMED",
+                "Owner did not confirm writer shutdown and high-level handback",
+            )
+        self._impact_lowcmd_executor = None
+        self._emit("GO2_LOWCMD_RELEASED", reason=reason)
+        if touchdown_handover:
+            # Require a strictly later SportModeState sample before accepting
+            # mode=6.  A fresh-by-age sample may still predate the entire
+            # LowCmd ownership interval.
+            try:
+                await self._state_machine.transition_to(
+                    SystemState.GO2_GROUND_HANDOVER,
+                    reason="LowCmd released on verified ground; waiting for mode=6",
+                    snapshot=self._snapshot,
+                )
+            except TransitionRejected as exc:
+                await self._fault("GO2_GROUND_HANDOVER_REJECTED", str(exc))
+                return OperationResult.failure("GO2_GROUND_HANDOVER_REJECTED", str(exc))
+            await self.refresh_snapshot()
+            self._emit("GO2_GROUND_HANDOVER_STARTED")
+            return self._joint_lock_operator_required_result()
+        return OperationResult.success(
+            "Go2 LowCmd endpoint released; high-level JOINT_LOCK confirmation is pending"
+        )
+
+    def _lowcmd_unavailable_result(self) -> Optional[OperationResult]:
+        if not self.config.go2.low_level.enabled:
+            return OperationResult.failure(
+                "GO2_LOWCMD_DISABLED",
+                "Go2 LowCmd is disabled until all hardware-specific parameters are verified",
+            )
+        if self._go2_low_level is None:
+            return OperationResult.failure(
+                "GO2_LOWCMD_NOT_INJECTED",
+                "No exclusive Go2 LowCmd owner was injected into SystemManager",
+            )
+        return None
+
+    def _build_lowcmd_permit(
+        self,
+        *,
+        operator_authorized: bool,
+        robot_supported: bool,
+        timeout_s: Optional[float],
+        reason: str,
+    ) -> Go2OwnershipPermit:
+        config = self.config.go2.low_level
+        if timeout_s is None or config.mapping_version is None or config.mapping_hash is None:
+            raise ValueError("LowCmd permit timeout and mapping identity must be configured")
+        now = self._clock.monotonic()
+        return Go2OwnershipPermit(
+            timestamp_s=now,
+            valid_until_s=now + timeout_s,
+            operator_authorized=operator_authorized,
+            robot_supported=robot_supported,
+            pixhawk_disarmed=not self._snapshot.pixhawk.armed,
+            rotors_stopped=assess_esc_telemetry(
+                self._snapshot,
+                self.config.esc.slots,
+                exact_zero=True,
+            ).safe,
+            mapping_version=config.mapping_version,
+            mapping_hash=config.mapping_hash,
+            reason=reason,
+        )
+
+    def _lowcmd_ground_transfer_result(self, *, require_joint_lock: bool) -> OperationResult:
+        snapshot = self._snapshot
+        now = snapshot.timestamp
+        low_state = snapshot.go2.low_level_status
+        lowcmd_owner_pending = low_state.ownership_pending
+        closed_endpoint_recovery = (
+            low_state.owner_epoch > 0
+            and low_state.ownership_state is LowCmdOwnershipState.FAULT
+            and not low_state.publisher_active
+            and not low_state.writer_alive
+            and not low_state.safe_hold_active
+            and not low_state.watchdog_healthy
+            and low_state.target_sequence is None
+        )
+        pixhawk_ground_current = pixhawk_ground_state_is_current(
+            snapshot.pixhawk,
+            now,
+            self.config.safety.pixhawk_timeout_s,
+            self.config.safety.touchdown_max_source_age_s,
+        )
+        if not pixhawk_ground_current:
+            return OperationResult.failure(
+                "GO2_LOWCMD_PIXHAWK_EVIDENCE_STALE",
+                "Fresh Pixhawk heartbeat and landed-state samples are required for a ground ownership transfer",
+            )
+        if not snapshot.f446.connected or not timestamp_is_fresh(
+            now,
+            snapshot.f446.timestamp,
+            self.config.safety.f446_timeout_s,
+        ):
+            return OperationResult.failure(
+                "GO2_LOWCMD_F446_EVIDENCE_STALE",
+                "Fresh F446 status is required for a ground ownership transfer",
+            )
+        if (require_joint_lock or not lowcmd_owner_pending) and (
+            not snapshot.go2.connected
+            or not timestamp_is_fresh(
+                now,
+                snapshot.go2.timestamp,
+                self.config.safety.go2_timeout_s,
+            )
+        ):
+            return OperationResult.failure(
+                "GO2_LOWCMD_GO2_EVIDENCE_STALE",
+                "Fresh Go2 status is required for a ground ownership transfer",
+            )
+        if not closed_endpoint_recovery:
+            maximum_low_state_age = self.config.go2.low_level.low_state_max_age_s
+            if (
+                maximum_low_state_age is None
+                or not low_state.connected
+                or not timestamp_is_fresh(
+                    now,
+                    low_state.low_state_timestamp,
+                    maximum_low_state_age,
+                )
+            ):
+                return OperationResult.failure(
+                    "GO2_LOWCMD_LOWSTATE_EVIDENCE_STALE",
+                    "Fresh LowState is required while a LowCmd endpoint may still exist",
+                )
+        if snapshot.pixhawk.armed or not snapshot.pixhawk.landed:
+            return OperationResult.failure(
+                "GO2_LOWCMD_GROUND_TRANSFER_REQUIRED",
+                "LowCmd ownership transfer requires Pixhawk disarmed and landed",
+            )
+        if not assess_esc_telemetry(snapshot, self.config.esc.slots, exact_zero=True).safe:
+            return OperationResult.failure(
+                "GO2_LOWCMD_ROTORS_NOT_STOPPED",
+                "Every configured ESC must be fresh, healthy, and exactly zero RPM",
+            )
+        if snapshot.configuration is not Configuration.FLIGHT:
+            return OperationResult.failure(
+                "GO2_LOWCMD_FLIGHT_CONFIGURATION_REQUIRED",
+                "The fixed deployed FLIGHT configuration must be verified",
+            )
+        if snapshot.f446.duty != 0 or snapshot.f446.faulted:
+            return OperationResult.failure(
+                "GO2_LOWCMD_F446_UNSAFE",
+                "The folding mechanism must remain stopped and fault-free",
+            )
+        if require_joint_lock and not snapshot.go2.joints_locked:
+            return OperationResult.failure(
+                "GO2_JOINT_LOCK_REQUIRED",
+                "Initial LowCmd acquisition requires an authoritative mode=6 JOINT_LOCK",
+            )
+        if lowcmd_owner_pending and not closed_endpoint_recovery:
+            if not self._lowcmd_motor_feedback_is_stationary(low_state):
+                return OperationResult.failure(
+                    "GO2_LOWCMD_ROBOT_NOT_STATIONARY",
+                    "All 12 fresh LowState joint velocities must satisfy the commissioned stationary tolerance",
+                )
+        elif not snapshot.go2.stable or snapshot.go2.moving:
+            return OperationResult.failure(
+                "GO2_LOWCMD_ROBOT_NOT_STATIONARY",
+                "Go2 must be stable and stationary during ownership transfer",
+            )
+        if not closed_endpoint_recovery:
+            dwell = self._lowcmd_ground_stationary_dwell_result()
+            if not dwell.ok:
+                return dwell
+        return OperationResult.success("LowCmd ground transfer conditions are satisfied")
+
+    def _lowcmd_motor_feedback_is_stationary(self, status: Go2LowLevelStatus) -> bool:
+        tolerances = self.config.go2.low_level.safe_hold_velocity_tolerance_rad_s
+        if tolerances is None or len(tolerances) != 12 or len(status.motors) != 12:
+            return False
+        return all(
+            not motor.lost
+            and motor.dq_rad_s is not None
+            and math.isfinite(motor.dq_rad_s)
+            and abs(motor.dq_rad_s) <= tolerances[index]
+            for index, motor in enumerate(status.motors)
+        )
+
+    def _lowcmd_status_healthy(self, status: Go2LowLevelStatus) -> bool:
+        config = self.config.go2.low_level
+        now = self._clock.monotonic()
+        if status.ownership_state is LowCmdOwnershipState.MPC_ACTIVE:
+            deadline = status.target_deadline
+            phase_valid = (
+                status.target_sequence is not None
+                and deadline is not None
+                and math.isfinite(deadline)
+                and now < deadline
+                and not status.safe_hold_active
+                and not status.safe_hold_settled
+            )
+        elif status.ownership_state in {
+            LowCmdOwnershipState.HOLDING,
+            LowCmdOwnershipState.SAFE_HOLD,
+        }:
+            phase_valid = (
+                status.safe_hold_active
+                and status.safe_hold_settled
+                and status.target_sequence is None
+                and status.target_deadline is None
+            )
+        else:
+            phase_valid = False
+        return (
+            status.owns_lowcmd
+            and status.connected
+            and status.healthy
+            and status.publisher_active
+            and status.writer_alive
+            and status.watchdog_healthy
+            and status.high_level_released
+            and status.network_exclusivity_verified
+            and status.mapping_hash_verified
+            and config.mapping_hash is not None
+            and status.active_mapping_hash == config.mapping_hash
+            and config.low_state_max_age_s is not None
+            and timestamp_is_fresh(
+                now,
+                status.low_state_timestamp,
+                config.low_state_max_age_s,
+            )
+            and phase_valid
+        )
+
+    def _bind_impact_lowcmd_executor(self, status: Go2LowLevelStatus) -> OperationResult:
+        """Bind/rebind the low-rate executor to one settled HOLDING epoch."""
+
+        config = self.config.go2.low_level
+        if (
+            status.ownership_state is not LowCmdOwnershipState.HOLDING
+            or not self._lowcmd_status_healthy(status)
+        ):
+            return OperationResult.failure(
+                "GO2_LOWCMD_EXECUTOR_BIND_UNSAFE",
+                "Executor binding requires a healthy, settled HOLDING ownership epoch",
+            )
+        mapping_hash = config.mapping_hash
+        maximum_ttl = config.target_ttl_s
+        maximum_low_state_age = config.low_state_max_age_s
+        if mapping_hash is None or maximum_ttl is None or maximum_low_state_age is None:
+            return OperationResult.failure(
+                "GO2_LOWCMD_EXECUTOR_CONFIG_INVALID",
+                "Mapping hash, target TTL and LowState maximum age must be configured",
+            )
+        if self._go2_low_level is None:
+            return OperationResult.failure(
+                "GO2_LOWCMD_NOT_INJECTED",
+                "No exclusive Go2 LowCmd owner was injected into SystemManager",
+            )
+        try:
+            self._impact_lowcmd_executor = ImpactAwareLowCmdExecutor(
+                self._go2_low_level,
+                mapping_hash=mapping_hash,
+                ownership_epoch=status.owner_epoch,
+                maximum_command_ttl_s=maximum_ttl,
+                maximum_low_state_age_s=maximum_low_state_age,
+                monotonic_clock=self._clock.monotonic,
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self._impact_lowcmd_executor = None
+            return OperationResult.failure(
+                "GO2_LOWCMD_EXECUTOR_CONFIG_INVALID",
+                str(exc),
+            )
+        return OperationResult.success(
+            "Impact-aware LowCmd executor bound",
+            {"ownership_epoch": status.owner_epoch},
+        )
+
+    async def _revoke_go2_low_level_internal(self, reason: str) -> OperationResult:
+        if not self.config.go2.low_level.enabled or self._go2_low_level is None:
+            return OperationResult.success("No Go2 LowCmd owner was injected")
+        try:
+            status = self._go2_low_level.status()
+        except (AeroGo2Error, OSError, RuntimeError, TypeError, ValueError) as exc:
+            return OperationResult.failure("GO2_LOWCMD_STATUS_FAILED", str(exc))
+        if not status.ownership_pending:
+            self._impact_lowcmd_executor = None
+            return OperationResult.success("No Go2 LowCmd MPC lease is active")
+        if status.owner_epoch <= 0:
+            return OperationResult.failure(
+                "GO2_LOWCMD_STATUS_INCONSISTENT",
+                "LowCmd handover is pending but no valid ownership epoch is available",
+            )
+        try:
+            result = await self._go2_low_level.revoke(
+                reason,
+                ownership_epoch=status.owner_epoch,
+            )
+        except (AeroGo2Error, OSError, RuntimeError, TypeError, ValueError) as exc:
+            return OperationResult.failure("GO2_LOWCMD_REVOKE_FAILED", str(exc))
+        if not result.ok:
+            return result
+        self._impact_lowcmd_executor = None
+        await self.refresh_snapshot()
+        after = self._snapshot.go2.low_level_status
+        if (
+            after.owner_epoch != status.owner_epoch
+            or after.ownership_state
+            not in {LowCmdOwnershipState.HOLDING, LowCmdOwnershipState.SAFE_HOLD}
+            or not after.safe_hold_active
+            or not self._lowcmd_status_healthy(after)
+        ):
+            return OperationResult.failure(
+                "GO2_LOWCMD_REVOKE_UNCONFIRMED",
+                "The sole writer did not confirm a healthy safe-hold after MPC revocation",
+            )
+        self._emit("GO2_LOWCMD_REVOKED_TO_SAFE_HOLD", reason=reason)
+        return OperationResult.success(
+            "MPC target revoked; the same LowCmd owner remains in safe-hold",
+            {"ownership_epoch": after.owner_epoch},
+        )
+
+    async def _release_go2_low_level_for_shutdown(self, reason: str) -> OperationResult:
+        if not self.config.go2.low_level.enabled or self._go2_low_level is None:
+            return OperationResult.success("No Go2 LowCmd owner was injected")
+        status = self._go2_low_level.status()
+        if not status.ownership_pending:
+            return OperationResult.success("No Go2 LowCmd ownership is held")
+        return OperationResult.failure(
+            "GO2_LOWCMD_EXPLICIT_RELEASE_REQUIRED",
+            "LowCmd remains active. Confirm landed/disarmed/zero-RPM/mechanical support "
+            "and call release_go2_low_level_control explicitly before " + reason,
+        )
 
     async def authorize_ground_arm(self) -> OperationResult:
         """Open a short, one-shot window; this method never arms Pixhawk."""
+
+        async with self._operation_lock:
+            return await self._authorize_ground_arm_unlocked()
+
+    async def _authorize_ground_arm_unlocked(self) -> OperationResult:
+        """Authorize only while one locked authority/readiness transaction remains valid."""
 
         if not self._control_writes_allowed():
             return OperationResult.failure(
                 "HARDWARE_WRITE_DISABLED",
                 "Ground-arm authorization requires an explicitly unlocked hardware process",
             )
+        if self.state is not SystemState.FLIGHT_READY:
+            return OperationResult.failure(
+                "NOT_IN_FLIGHT_READY",
+                "Ground-arm authorization requires FLIGHT_READY",
+            )
         await self.refresh_snapshot()
+        if (
+            not pixhawk_ground_state_is_current(
+                self._snapshot.pixhawk,
+                self._snapshot.timestamp,
+                self.config.safety.pixhawk_timeout_s,
+                self.config.safety.touchdown_max_source_age_s,
+            )
+            or self._snapshot.pixhawk.armed
+            or not self._snapshot.pixhawk.landed
+        ):
+            return OperationResult.failure(
+                "GROUND_ARM_GROUND_PROOF_INVALID",
+                "Ground-arm authorization requires fresh disarmed and landed Pixhawk evidence",
+            )
+        if self.config.go2.low_level.enabled:
+            low_level = self._snapshot.go2.low_level_status
+            authority = self._snapshot.go2.control_authority
+            if (
+                low_level.ownership_state is not LowCmdOwnershipState.HOLDING
+                or not self._lowcmd_status_healthy(low_level)
+                or authority.state is not Go2ControlAuthorityState.LOWCMD_SAFE_HOLD
+                or authority.ownership_epoch != low_level.owner_epoch
+            ):
+                return OperationResult.failure(
+                    "GO2_LOWCMD_NOT_READY_FOR_ARM",
+                    "Acquire and verify the exact sole LowCmd HOLDING/SAFE_HOLD authority before arm authorization",
+                )
         guard = self._flight_readiness_guard(require_flight_enable_low=True)
         if not guard.permitted:
             return OperationResult.failure(
@@ -496,30 +1668,119 @@ class SystemManager:
                 "; ".join(guard.messages) or "Flight readiness checks failed",
                 data=self._flight_readiness_report(require_flight_enable_low=True),
             )
+        requested_at = self._clock.monotonic()
         try:
+            # The bridge owns the protocol ACK deadline.  An outer wait_for
+            # would only cancel this coroutine; it cannot impose a real bound
+            # on a blocking transport or prove that the remote gate is closed.
             result = await self._pixhawk.set_ground_arm_authorization(
                 True,
                 _GROUND_ARM_AUTHORIZATION_TTL_S,
             )
-        except (BridgeError, OSError, RuntimeError, ValueError) as exc:
-            return OperationResult.failure("GROUND_ARM_AUTHORIZATION_FAILED", str(exc))
-        if not result.ok or not self._pixhawk.ground_arm_authorization_active():
-            self._ground_arm_authorized = False
-            self._ground_arm_authorization_expires_at = None
-            return OperationResult.failure(
-                result.code or "GROUND_ARM_AUTHORIZATION_FAILED",
-                result.message or "Pixhawk arm gate did not become active",
+        except (BridgeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            return await self._fail_ground_arm_after_ack(
+                "GROUND_ARM_AUTHORIZATION_FAILED",
+                f"Pixhawk arm-gate transaction raised: {type(exc).__name__}: {exc}",
+            )
+        if not isinstance(result, OperationResult):
+            return await self._fail_ground_arm_after_ack(
+                "GROUND_ARM_AUTHORIZATION_PROTOCOL_ERROR",
+                "Pixhawk arm gate returned an invalid authorization result",
+            )
+        try:
+            bridge_authorized = self._pixhawk.ground_arm_authorization_active()
+        except Exception as exc:
+            bridge_authorized = False
+            bridge_status_error = f"{type(exc).__name__}: {exc}"
+        else:
+            bridge_status_error = ""
+        if not result.ok or not bridge_authorized:
+            return await self._fail_ground_arm_after_ack(
+                (
+                    result.code
+                    if not result.ok and result.code
+                    else "GROUND_ARM_AUTHORIZATION_FAILED"
+                ),
+                (
+                    result.message
+                    if not result.ok and result.message
+                    else "Pixhawk arm gate did not become active"
+                    + (f": {bridge_status_error}" if bridge_status_error else "")
+                ),
                 data=result.data,
             )
-        now = self._clock.monotonic()
+
+        # Treat the bridge ACK as provisional.  Publish the local half, refresh
+        # every authority/readiness input, and revoke the physical gate on any
+        # post-ACK disagreement.
         self._ground_arm_authorized = True
-        self._ground_arm_authorization_expires_at = now + _GROUND_ARM_AUTHORIZATION_TTL_S
+        self._ground_arm_authorization_expires_at = requested_at + _GROUND_ARM_AUTHORIZATION_TTL_S
+        try:
+            await self.refresh_snapshot()
+        except Exception as exc:
+            return await self._fail_ground_arm_after_ack(
+                "GROUND_ARM_POST_ACK_REFRESH_FAILED",
+                f"Post-ACK system snapshot failed: {type(exc).__name__}: {exc}",
+            )
+
+        if self._clock.monotonic() >= self._ground_arm_authorization_expires_at:
+            return await self._fail_ground_arm_after_ack(
+                "GROUND_ARM_AUTHORIZATION_EXPIRED",
+                "Ground-arm authorization expired before its ACK transaction could be committed",
+            )
+        if self.state is not SystemState.FLIGHT_READY:
+            return await self._fail_ground_arm_after_ack(
+                "NOT_IN_FLIGHT_READY",
+                "System left FLIGHT_READY while the Pixhawk arm gate ACK was pending",
+            )
+        if self._snapshot.pixhawk.armed:
+            return await self._fail_ground_arm_after_ack(
+                "PIXHAWK_ALREADY_ARMED",
+                "Pixhawk became armed before ground-arm authorization was committed",
+            )
+        if (
+            not pixhawk_ground_state_is_current(
+                self._snapshot.pixhawk,
+                self._snapshot.timestamp,
+                self.config.safety.pixhawk_timeout_s,
+                self.config.safety.touchdown_max_source_age_s,
+            )
+            or not self._snapshot.pixhawk.landed
+        ):
+            return await self._fail_ground_arm_after_ack(
+                "GROUND_ARM_GROUND_PROOF_INVALID",
+                "Fresh landed Pixhawk evidence was lost while the arm-gate ACK was pending",
+            )
+        if self.config.go2.low_level.enabled:
+            low_level = self._snapshot.go2.low_level_status
+            authority = self._snapshot.go2.control_authority
+            if (
+                low_level.ownership_state is not LowCmdOwnershipState.HOLDING
+                or not self._lowcmd_status_healthy(low_level)
+                or authority.state is not Go2ControlAuthorityState.LOWCMD_SAFE_HOLD
+                or authority.ownership_epoch != low_level.owner_epoch
+            ):
+                return await self._fail_ground_arm_after_ack(
+                    "GO2_LOWCMD_NOT_READY_FOR_ARM",
+                    "LowCmd HOLDING/SAFE_HOLD authority changed while the Pixhawk arm gate ACK was pending",
+                )
+        guard = self._flight_readiness_guard(require_flight_enable_low=True)
+        if not guard.permitted:
+            return await self._fail_ground_arm_after_ack(
+                guard.codes[0] if guard.codes else "FLIGHT_NOT_READY",
+                "; ".join(guard.messages) or "Post-ACK flight readiness checks failed",
+                data=self._flight_readiness_report(require_flight_enable_low=True),
+            )
+        if not self._snapshot.ground_arm_authorized:
+            return await self._fail_ground_arm_after_ack(
+                "GROUND_ARM_AUTHORIZATION_FAILED",
+                "Manager/Pixhawk authorization state was not jointly active after refresh",
+            )
         self._emit(
             "GROUND_ARM_AUTHORIZED",
             ttl_s=_GROUND_ARM_AUTHORIZATION_TTL_S,
             rc_channel=self.config.rc.flight_enable_channel,
         )
-        await self.refresh_snapshot()
         return OperationResult.success(
             "Ground authorization active; move RadioMaster CH5 from LOW to HIGH within 30s",
             data={
@@ -531,20 +1792,109 @@ class SystemManager:
         )
 
     async def revoke_ground_arm(self) -> OperationResult:
-        return await self._revoke_ground_arm_authorization("operator request")
+        async with self._operation_lock:
+            result = await self._revoke_ground_arm_authorization_unlocked("operator request")
+            try:
+                await self.refresh_snapshot()
+            except Exception as exc:
+                return OperationResult.failure(
+                    "GROUND_ARM_AUTH_REVOKE_REFRESH_FAILED",
+                    f"Ground-arm gate was addressed but the inactive snapshot could not be refreshed: {type(exc).__name__}: {exc}",
+                    {"revoke_code": result.code},
+                )
+            return result
 
-    async def _revoke_ground_arm_authorization(self, reason: str) -> OperationResult:
+    async def _fail_ground_arm_after_ack(
+        self,
+        code: str,
+        message: str,
+        *,
+        data: Optional[Mapping[str, Any]] = None,
+    ) -> OperationResult:
+        """Roll back a provisional ACK before exposing its validation failure."""
+
+        rollback = await self._revoke_ground_arm_authorization_unlocked(
+            f"post-ACK validation failed: {code}"
+        )
+        refresh_error = ""
+        try:
+            await self.refresh_snapshot()
+        except Exception as exc:
+            refresh_error = f"{type(exc).__name__}: {exc}"
+        try:
+            bridge_active = self._pixhawk.ground_arm_authorization_active()
+        except Exception as exc:
+            bridge_active = True
+            if not refresh_error:
+                refresh_error = f"{type(exc).__name__}: {exc}"
+        rollback_confirmed = bool(
+            rollback.ok
+            and not bridge_active
+            and not self._ground_arm_authorized
+            and not self._snapshot.ground_arm_authorized
+            and not refresh_error
+        )
+        detail = dict(data or {})
+        detail.update(
+            {
+                "post_ack_failure_code": code,
+                "gate_revoke_code": rollback.code,
+                "gate_revoke_confirmed": rollback_confirmed,
+            }
+        )
+        if not rollback_confirmed:
+            suffix = f"; refresh/status error: {refresh_error}" if refresh_error else ""
+            return OperationResult.failure(
+                "GROUND_ARM_AUTH_REVOKE_FAILED",
+                f"{message}; provisional Pixhawk gate revocation was not confirmed: "
+                f"{rollback.code}: {rollback.message}{suffix}",
+                detail,
+            )
+        return OperationResult.failure(code, message, detail)
+
+    async def _revoke_ground_arm_authorization_unlocked(self, reason: str) -> OperationResult:
         was_active = self._ground_arm_authorized
         self._ground_arm_authorized = False
         self._ground_arm_authorization_expires_at = None
         try:
+            # The concrete bridge must implement its own bounded ACK exchange.
+            # Cancelling an arbitrary bridge await here cannot prove remote
+            # revocation and would create a misleading safety guarantee.
             result = await self._pixhawk.set_ground_arm_authorization(False, 0.0)
-        except (BridgeError, OSError, RuntimeError, ValueError) as exc:
+        except (BridgeError, OSError, RuntimeError, TypeError, ValueError) as exc:
             self._emit("GROUND_ARM_AUTH_REVOKE_FAILED", reason=reason, error=str(exc))
             return OperationResult.failure("GROUND_ARM_AUTH_REVOKE_FAILED", str(exc))
-        self._emit("GROUND_ARM_AUTH_REVOKED", reason=reason, was_active=was_active)
+        if not isinstance(result, OperationResult):
+            self._emit(
+                "GROUND_ARM_AUTH_REVOKE_FAILED",
+                reason=reason,
+                error="invalid Pixhawk gate result",
+            )
+            return OperationResult.failure(
+                "GROUND_ARM_AUTH_REVOKE_PROTOCOL_ERROR",
+                "Pixhawk arm gate returned an invalid revoke result",
+            )
         if not result.ok:
             return result
+        try:
+            bridge_active = self._pixhawk.ground_arm_authorization_active()
+        except Exception as exc:
+            self._emit("GROUND_ARM_AUTH_REVOKE_FAILED", reason=reason, error=str(exc))
+            return OperationResult.failure(
+                "GROUND_ARM_AUTH_REVOKE_STATUS_FAILED",
+                f"Cannot confirm the Pixhawk arm gate inactive: {type(exc).__name__}: {exc}",
+            )
+        if bridge_active:
+            self._emit(
+                "GROUND_ARM_AUTH_REVOKE_FAILED",
+                reason=reason,
+                error="Pixhawk gate remained active after revoke ACK",
+            )
+            return OperationResult.failure(
+                "GROUND_ARM_AUTH_REVOKE_UNCONFIRMED",
+                "Pixhawk arm gate remained active after its revoke acknowledgement",
+            )
+        self._emit("GROUND_ARM_AUTH_REVOKED", reason=reason, was_active=was_active)
         return OperationResult.success(
             "Ground authorization revoked; Pixhawk arm/disarm state was not changed",
             data={
@@ -1613,6 +2963,10 @@ class SystemManager:
             return OperationResult.failure(code, message)
 
     async def prepare_autoland(self) -> OperationResult:
+        async with self._operation_lock:
+            return await self._prepare_autoland_unlocked()
+
+    async def _prepare_autoland_unlocked(self) -> OperationResult:
         if self._runtime_mode is not RuntimeMode.DRY_RUN:
             return OperationResult.failure(
                 "PHASE_NOT_AVAILABLE",
@@ -1634,11 +2988,16 @@ class SystemManager:
             )
         except TransitionRejected as exc:
             return OperationResult.failure("AUTOLAND_PRECHECK_FAILED", str(exc))
+        self._reset_impact_landing_completion(new_session=True)
         self._emit("AUTOLAND_READY")
         await self.refresh_snapshot()
         return OperationResult.success("Automatic landing ready; setpoints remain stopped")
 
     async def start_autoland(self) -> OperationResult:
+        async with self._operation_lock:
+            return await self._start_autoland_unlocked()
+
+    async def _start_autoland_unlocked(self) -> OperationResult:
         if self._runtime_mode is not RuntimeMode.DRY_RUN:
             return OperationResult.failure(
                 "PHASE_NOT_AVAILABLE",
@@ -1647,6 +3006,11 @@ class SystemManager:
         if self.state is not SystemState.AUTO_LANDING_READY:
             return OperationResult.failure(
                 "INVALID_STATE", "autoland start requires AUTO_LANDING_READY"
+            )
+        if self.config.go2.low_level.enabled:
+            return OperationResult.failure(
+                "COORDINATED_ACTUATION_NOT_CONFIGURED",
+                "LowCmd-enabled automatic landing requires an injected, bounded first-policy activation transaction; the legacy velocity-setpoint starter is intentionally blocked",
             )
         await self.refresh_snapshot()
         try:
@@ -1661,12 +3025,31 @@ class SystemManager:
         self._last_landing_update = None
         self._next_landing_update_at = None
         await self.refresh_snapshot()
-        first = await self.update_autoland()
-        if first.ok:
+        first = await self._update_autoland_unlocked()
+        resulting_state = self._state_machine.state
+        if (
+            first.ok
+            and resulting_state is SystemState.AUTO_LANDING
+            and self._autoland_active
+            and self._setpoint_active
+        ):
             self._emit("AUTOLAND_STARTED")
-        return first
+            return first
+        return OperationResult.failure(
+            "AUTOLAND_START_FAILED",
+            "The first automatic-landing command was not activated; the manager returned to its fail-safe state",
+            {
+                "first_result_code": first.code,
+                "first_result_message": first.message,
+                "state": resulting_state.name,
+            },
+        )
 
     async def update_autoland(self) -> OperationResult:
+        async with self._operation_lock:
+            return await self._update_autoland_unlocked()
+
+    async def _update_autoland_unlocked(self) -> OperationResult:
         if self._runtime_mode is not RuntimeMode.DRY_RUN:
             return OperationResult.failure(
                 "PHASE_NOT_AVAILABLE",
@@ -1681,7 +3064,44 @@ class SystemManager:
             or self._snapshot.rc.auto_landing_request is not AutoLandingRequest.AUTO_EXECUTE
             or self._snapshot.pixhawk.failsafe
         ):
-            return await self.abort_autoland("manual override or flight failsafe")
+            return await self._abort_autoland_unlocked("manual override or flight failsafe")
+
+        # Revalidate every independently timed landing input before honoring a
+        # not-yet-due controller period.  A previous descent setpoint must not
+        # remain supervised merely because this invocation would send no new
+        # packet.
+        interlock = self._landing_interlocks.can_send_landing_setpoint(self._snapshot)
+        if not interlock.permitted:
+            reason = "; ".join(interlock.messages) or "landing setpoint interlock rejected"
+            self._last_landing_command = self._landing_safety_filter.invalid(
+                self._snapshot.timestamp,
+                reason,
+            )
+            return await self._abort_autoland_unlocked(reason)
+
+        if self._impact_recovery_setpoints_stopped or self._impact_recovery.confirmed:
+            if self._impact_recovery_wait_started_at is None:
+                self._impact_recovery_wait_started_at = self._clock.monotonic()
+                self._emit(
+                    "IMPACT_RECOVERY_COMPLETION_WAIT_STARTED",
+                    landing_session_id=self._impact_landing_session_id,
+                )
+            if self._setpoint_active or self._snapshot.external_setpoint_active:
+                try:
+                    await self._stop_setpoints()
+                except (BridgeError, OSError, RuntimeError) as exc:
+                    await self._fault("AUTOLAND_SETPOINT_STOP_FAILED", str(exc))
+                    return OperationResult.failure(
+                        "AUTOLAND_FINALIZATION_STOP_FAILED",
+                        str(exc),
+                    )
+            self._impact_recovery_setpoints_stopped = True
+            self._next_landing_update_at = None
+            await self.refresh_snapshot()
+            return OperationResult.failure(
+                "AUTOLAND_FINALIZATION_FENCED",
+                "Post-touchdown recovery has fenced this landing session; external setpoints cannot restart",
+            )
 
         now = self._clock.monotonic()
         period_s = 1.0 / self.config.landing.controller_hz
@@ -1701,7 +3121,7 @@ class SystemManager:
                 "AUTOLAND_CONTROLLER_TIMEOUT",
                 safety_violations=(violation,),
             )
-            return await self.abort_autoland("automatic landing controller timeout")
+            return await self._abort_autoland_unlocked("automatic landing controller timeout")
 
         self._last_landing_update = now
         if due_at is None:
@@ -1713,14 +3133,6 @@ class SystemManager:
         candidate = self._landing_controller.update(self._snapshot, dt)
         command = self._landing_safety_filter.apply(candidate, self._snapshot, dt)
         self._last_landing_command = command
-        interlock = self._landing_interlocks.can_send_landing_setpoint(self._snapshot)
-        if not interlock.permitted:
-            reason = "; ".join(interlock.messages) or "landing setpoint interlock rejected"
-            self._last_landing_command = self._landing_safety_filter.invalid(
-                self._snapshot.timestamp,
-                reason,
-            )
-            return await self.abort_autoland(reason)
         if not command.valid:
             if "timeout" in command.reason.lower():
                 violation = self._safety_monitor.controller_timeout_violation(self._snapshot)
@@ -1729,7 +3141,7 @@ class SystemManager:
                     "AUTOLAND_CONTROLLER_TIMEOUT",
                     safety_violations=(violation,),
                 )
-            return await self.abort_autoland(command.reason)
+            return await self._abort_autoland_unlocked(command.reason)
         try:
             if self._runtime_mode is not RuntimeMode.DRY_RUN:
                 return OperationResult.failure(
@@ -1745,13 +3157,47 @@ class SystemManager:
             if not setpoint_result.ok:
                 raise BridgeError(setpoint_result.message)
         except (BridgeError, OSError, RuntimeError) as exc:
-            return await self.abort_autoland(f"setpoint rejected: {exc}")
+            return await self._abort_autoland_unlocked(f"setpoint rejected: {exc}")
         self._setpoint_active = True
         self._emit("LANDING_COMMAND", landing_command=command)
         await self.refresh_snapshot()
         return OperationResult.success("Simulated landing setpoint recorded")
 
     async def abort_autoland(self, reason: str = "operator request") -> OperationResult:
+        async with self._operation_lock:
+            return await self._abort_autoland_unlocked(reason)
+
+    def _prepare_autoland_abort(self, reason: str) -> None:
+        """Invalidate touchdown timing before any abort-side await can yield.
+
+        Once the impact-recovery wait has begun, the same continuously landed
+        episode must not be reclassified by FLIGHT_MANUAL's simpler touchdown
+        path.  Keep that fail-closed latch separate from recovery bookkeeping:
+        the latter may be reset after a successful stop, while the latch is
+        cleared only by an independently observed airborne cycle (or a fully
+        guarded touchdown completion).
+        """
+
+        post_impact_abort = self._impact_recovery_wait_started_at is not None
+        self._touchdown_since = None
+        self._touchdown_height_reference = None
+        self._clear_aborted_impact_airborne_dwell()
+        if post_impact_abort and not self._aborted_impact_touchdown_latched:
+            self._aborted_impact_touchdown_latched = True
+            self._emit(
+                "ABORTED_IMPACT_TOUCHDOWN_LATCHED",
+                landing_session_id=self._impact_landing_session_id,
+                reason=reason,
+            )
+
+    async def _abort_autoland_unlocked(
+        self,
+        reason: str = "operator request",
+    ) -> OperationResult:
+        self._prepare_autoland_abort(reason)
+        revoke_result = await self._revoke_go2_low_level_internal(
+            f"automatic landing aborted: {reason}"
+        )
         try:
             await self._stop_setpoints()
         except (BridgeError, OSError, RuntimeError) as exc:
@@ -1759,8 +3205,17 @@ class SystemManager:
             self._next_landing_update_at = None
             await self._fault("AUTOLAND_SETPOINT_STOP_FAILED", str(exc))
             return OperationResult.failure("AUTOLAND_ABORT_FAILED", str(exc))
+        if not revoke_result.ok:
+            self._autoland_active = False
+            self._next_landing_update_at = None
+            await self._fault(
+                "GO2_LOWCMD_REVOKE_FAILED",
+                revoke_result.message,
+            )
+            return OperationResult.failure("AUTOLAND_ABORT_FAILED", revoke_result.message)
         self._autoland_active = False
         self._next_landing_update_at = None
+        self._reset_impact_landing_completion(new_session=False)
         self._last_landing_command = LandingCommand(
             valid=False, reason=reason, timestamp=self._clock.monotonic()
         )
@@ -1774,6 +3229,10 @@ class SystemManager:
         )
 
     async def tick(self) -> Tuple[SafetyViolation, ...]:
+        async with self._operation_lock:
+            return await self._tick_unlocked()
+
+    async def _tick_unlocked(self) -> Tuple[SafetyViolation, ...]:
         """Refresh telemetry, evaluate safety, and advance passive state changes."""
 
         previously_armed = self._snapshot.pixhawk.armed
@@ -1781,9 +3240,64 @@ class SystemManager:
         if previously_armed and not self._snapshot.pixhawk.armed:
             self._emit("PIXHAWK_DISARMED")
 
-        if self._ground_arm_authorized and not self._pixhawk.ground_arm_authorization_active():
+        try:
+            bridge_ground_arm_authorized = self._pixhawk.ground_arm_authorization_active()
+            bridge_ground_arm_status_error = ""
+        except Exception as exc:
+            # Unknown is possibly active.  Continue through the same bounded
+            # revoke/FAULT path instead of allowing an exception to escape and
+            # terminate the safety loop.
+            bridge_ground_arm_authorized = True
+            bridge_ground_arm_status_error = f"{type(exc).__name__}: {exc}"
+        if self._ground_arm_authorized and not bridge_ground_arm_authorized:
             self._ground_arm_authorized = False
             self._ground_arm_authorization_expires_at = None
+
+        # The bridge keepalive can only maintain the remote lease; it cannot
+        # validate the changing system snapshot.  Until a strict armed rising
+        # edge consumes the one-shot gate, the manager therefore re-proves the
+        # ground conditions on every serialized safety tick.  A bridge/local
+        # disagreement is also unsafe: an independently live remote gate must
+        # be closed even if the local half has already been lost.
+        gate_may_be_active = bool(self._ground_arm_authorized or bridge_ground_arm_authorized)
+        pixhawk_has_consumed_gate = self._snapshot.pixhawk.armed is True
+        if gate_may_be_active and not pixhawk_has_consumed_gate:
+            authorization_expires_at = self._ground_arm_authorization_expires_at
+            ground_proof_valid = bool(
+                self._ground_arm_authorized
+                and bridge_ground_arm_authorized
+                and not bridge_ground_arm_status_error
+                and authorization_expires_at is not None
+                and self._clock.monotonic() < authorization_expires_at
+                and pixhawk_ground_state_is_current(
+                    self._snapshot.pixhawk,
+                    self._snapshot.timestamp,
+                    self.config.safety.pixhawk_timeout_s,
+                    self.config.safety.touchdown_max_source_age_s,
+                )
+                and self._snapshot.pixhawk.armed is False
+                and self._snapshot.pixhawk.landed is True
+            )
+            if not ground_proof_valid:
+                watchdog_reason = "ground proof lost before Pixhawk armed rising edge"
+                if bridge_ground_arm_status_error:
+                    watchdog_reason = (
+                        "ground-arm gate status is unknown before Pixhawk armed rising "
+                        f"edge: {bridge_ground_arm_status_error}"
+                    )
+                gate_result = await self._revoke_ground_arm_authorization_unlocked(watchdog_reason)
+                if not gate_result.ok:
+                    await self._fault(
+                        "GROUND_ARM_AUTH_WATCHDOG_REVOKE_FAILED",
+                        "Ground-arm proof was lost and the physical gate revoke was not "
+                        f"confirmed: {gate_result.code}: {gate_result.message}",
+                    )
+                    return tuple(self._safety_monitor.evaluate(self._snapshot))
+                self._emit(
+                    "GROUND_ARM_AUTH_WATCHDOG_REVOKED",
+                    reason=watchdog_reason,
+                )
+                await self.refresh_snapshot()
 
         deadline = self._manual_motion_deadline
         if (
@@ -1820,6 +3334,9 @@ class SystemManager:
             takeover_codes = {
                 "AUTOLAND_ESTIMATOR_INVALID",
                 "PIXHAWK_TIMEOUT",
+                "PIXHAWK_TOUCHDOWN_SOURCE_INCOHERENT",
+                "PIXHAWK_TOUCHDOWN_SOURCE_STALE",
+                "PIXHAWK_TOUCHDOWN_PAYLOAD_INVALID",
                 "RC_FAILSAFE",
                 "RC_TIMEOUT",
             }
@@ -1831,7 +3348,9 @@ class SystemManager:
                 or any(item.code in takeover_codes for item in violations)
             )
             if takeover:
-                await self.abort_autoland("manual takeover or automatic-landing input failure")
+                await self._abort_autoland_unlocked(
+                    "manual takeover or automatic-landing input failure"
+                )
                 return violations
 
         if self.state in TRANSFORM_STATES and blocking:
@@ -1842,7 +3361,30 @@ class SystemManager:
             await self._fault(blocking[0].code, message, stop_attempted=True)
             return violations
 
-        if self.state is SystemState.GO2_JOINT_LOCK_WAIT:
+        post_handover_go2_sample = self._post_handover_go2_sample_is_fresh()
+        expected_handover_wait_codes = {"RC_TIMEOUT", "RC_FAILSAFE"}
+        if self.state is SystemState.GO2_GROUND_HANDOVER and not post_handover_go2_sample:
+            # SportModeState can be absent while the high-level service is
+            # released.  The bounded joint-lock handover below owns this wait;
+            # stale pre-handover Go2 data must neither pass nor fault it early.
+            expected_handover_wait_codes.update(
+                {"GO2_TIMEOUT", "GO2_UNSAFE_DURING_GROUND_HANDOVER"}
+            )
+        ground_handover_blocking = [
+            item for item in blocking if item.code not in expected_handover_wait_codes
+        ]
+        if self.state is SystemState.GO2_GROUND_HANDOVER and ground_handover_blocking:
+            stop_result = await self._stop_transform_outputs()
+            message = ground_handover_blocking[0].message
+            if not stop_result.ok:
+                message += f"; F446/setpoint stop incomplete: {stop_result.message}"
+            await self._fault(ground_handover_blocking[0].code, message, stop_attempted=True)
+            return violations
+
+        if self.state in {
+            SystemState.GO2_JOINT_LOCK_WAIT,
+            SystemState.GO2_GROUND_HANDOVER,
+        }:
             await self._advance_go2_joint_lock_wait()
             return violations
 
@@ -1851,6 +3393,9 @@ class SystemManager:
             "AUTOLAND_ESTIMATOR_INVALID",
             "MANUAL_OVERRIDE_REQUESTED",
             "PIXHAWK_TIMEOUT",
+            "PIXHAWK_TOUCHDOWN_SOURCE_INCOHERENT",
+            "PIXHAWK_TOUCHDOWN_SOURCE_STALE",
+            "PIXHAWK_TOUCHDOWN_PAYLOAD_INVALID",
             "RC_FAILSAFE",
             "RC_TIMEOUT",
         }
@@ -1860,7 +3405,7 @@ class SystemManager:
             SystemState.FAULT,
             SystemState.EMERGENCY_STOP,
         ):
-            stop_result = await self.stop_supervised()
+            stop_result = await self._stop_supervised_unlocked()
             message = escalating[0].message
             if not stop_result.ok:
                 message += f"; supervised stop incomplete: {stop_result.message}"
@@ -1881,10 +3426,20 @@ class SystemManager:
             await self.refresh_snapshot()
 
         if self.state is SystemState.AUTO_LANDING:
-            await self.update_autoland()
-        if self.state in (SystemState.FLIGHT_MANUAL, SystemState.AUTO_LANDING):
+            # Evaluate touchdown/recovery before producing another setpoint.
+            # Once finalization has fenced the controller, this landing session
+            # may never restart it merely because completion evidence expires.
             await self._check_touchdown()
-        if self.state is SystemState.TOUCHDOWN_VERIFY:
+            if (
+                self.state is SystemState.AUTO_LANDING
+                and not self._impact_recovery_setpoints_stopped
+            ):
+                await self._update_autoland_unlocked()
+        elif self.state is SystemState.FLIGHT_MANUAL:
+            await self._check_touchdown()
+        if self.state is SystemState.TOUCHDOWN_VERIFY or (
+            self.state is SystemState.FLIGHT_READY and self._touchdown_confirmed
+        ):
             await self._check_landing_compliance()
         return violations
 
@@ -1937,14 +3492,62 @@ class SystemManager:
         return result
 
     async def stop_supervised(self) -> OperationResult:
+        async with self._operation_lock:
+            return await self._stop_supervised_unlocked()
+
+    async def _stop_supervised_unlocked(self) -> OperationResult:
         """Stop F446, Go2 and external setpoints, but never arm/disarm rotors."""
 
         initial_state = self.state
-        transform_result = await self._stop_transform_outputs()
+        aborting_autoland = initial_state in {
+            SystemState.AUTO_LANDING,
+            SystemState.AUTO_LANDING_READY,
+        }
+        if aborting_autoland:
+            # Do this before the first bridge await.  Even a partial/failed
+            # supervised stop must not leave an old AUTO_LANDING touchdown
+            # timer available to FLIGHT_MANUAL on the same landed episode.
+            self._prepare_autoland_abort("supervised stop")
         failures: List[str] = []
+        # This gate is an independent arm authority and therefore the first
+        # stop action.  Every later actuator stop is attempted even when its
+        # acknowledgement is missing.
+        try:
+            gate_result = await self._revoke_ground_arm_authorization_unlocked("supervised stop")
+        except Exception as exc:
+            gate_result = OperationResult.failure(
+                "GROUND_ARM_AUTH_REVOKE_EXCEPTION",
+                f"{type(exc).__name__}: {exc}",
+            )
+        gate_revoke_failed = not gate_result.ok
+        if gate_revoke_failed:
+            failures.append(f"Pixhawk arm gate: {gate_result.code}: {gate_result.message}")
+        transform_result = await self._stop_transform_outputs()
         if not transform_result.ok:
             failures.append(transform_result.message)
-        if self._control_writes_allowed() and self._snapshot.go2.connected:
+        lowcmd_result = await self._revoke_go2_low_level_internal("supervised stop")
+        if not lowcmd_result.ok:
+            failures.append(f"Go2 LowCmd: {lowcmd_result.message}")
+        # Re-read the owner directly.  A revoke failure or an ambiguous
+        # transitional/fault state must never be followed by a competing
+        # SportClient RPC.
+        await self.refresh_snapshot()
+        low_level = self._snapshot.go2.low_level_status
+        sport_handover_confirmed = (
+            lowcmd_result.ok
+            and not low_level.ownership_pending
+            and low_level.ownership_state
+            in {
+                LowCmdOwnershipState.DISABLED,
+                LowCmdOwnershipState.DISCONNECTED,
+                LowCmdOwnershipState.OBSERVE_ONLY,
+            }
+        )
+        if (
+            self._control_writes_allowed()
+            and self._snapshot.go2.connected
+            and sport_handover_confirmed
+        ):
             try:
                 if initial_state is SystemState.LANDING_COMPLIANT:
                     if self._runtime_mode is RuntimeMode.DRY_RUN:
@@ -1964,11 +3567,17 @@ class SystemManager:
             message = "; ".join(failures)
             if self.state not in (SystemState.FAULT, SystemState.EMERGENCY_STOP):
                 await self._fault("SUPERVISED_STOP_FAILED", message, stop_attempted=True)
-            return OperationResult.failure("SUPERVISED_STOP_PARTIAL", message)
+            return OperationResult.failure(
+                (
+                    "GROUND_ARM_AUTH_REVOKE_FAILED"
+                    if gate_revoke_failed
+                    else "SUPERVISED_STOP_PARTIAL"
+                ),
+                message,
+            )
 
-        if self._ground_arm_authorized:
-            await self._revoke_ground_arm_authorization("supervised stop")
-        if initial_state in (SystemState.AUTO_LANDING, SystemState.AUTO_LANDING_READY):
+        if aborting_autoland:
+            self._reset_impact_landing_completion(new_session=False)
             self._last_landing_command = LandingCommand(
                 timestamp=self._clock.monotonic(),
                 valid=False,
@@ -2039,6 +3648,11 @@ class SystemManager:
         """Clear manager faults only; never sends the F446 `clear` command."""
 
         await self.refresh_snapshot()
+        if self._snapshot.go2.low_level_status.ownership_pending:
+            return OperationResult.failure(
+                "GO2_LOWCMD_EXPLICIT_RELEASE_REQUIRED",
+                "LowCmd ownership/handoff is still pending; complete the explicit supported-ground release before clearing FAULT",
+            )
         current = tuple(self._safety_monitor.evaluate(self._snapshot))
         blocking = [
             item
@@ -2080,6 +3694,12 @@ class SystemManager:
                 "Devices remain connected because supervised stop was incomplete: "
                 + stop_result.message,
             )
+        if not result.ok:
+            # Keep monitoring/logging alive.  In particular, a rejected
+            # ground handover must not make the non-daemon LowCmd writer an
+            # orphan with no manager watchdog.
+            self._emit("SYSTEM_EXIT_INHIBITED", command_result=result)
+            return result
         self._emit("SYSTEM_EXITED", command_result=result)
         if self._event_logger is not None:
             self._event_logger.stop()
@@ -2113,7 +3733,7 @@ class SystemManager:
 
     def _legacy_query(self, name: str) -> Mapping[str, Any]:
         if name in ("status", "state"):
-            return snapshot_to_dict(self._snapshot)
+            return cast(Mapping[str, Any], snapshot_to_dict(self._snapshot))
         if name == "transitions":
             return {
                 "transitions": [
@@ -2384,9 +4004,7 @@ class SystemManager:
             joint_lock_deadline = self._go2_joint_lock_deadline
             now = self._clock.monotonic()
             joint_lock_remaining_s = (
-                0.0
-                if joint_lock_deadline is None
-                else max(0.0, joint_lock_deadline - now)
+                0.0 if joint_lock_deadline is None else max(0.0, joint_lock_deadline - now)
             )
             joint_lock_grace_remaining_s = (
                 0.0
@@ -2528,20 +4146,36 @@ class SystemManager:
         self._reset_touchdown_candidate()
 
     def _esc_telemetry_confirms_touchdown(self) -> bool:
-        return assess_esc_telemetry(
-            self._snapshot,
-            self.config.esc.slots,
-            maximum_abs_rpm=self.config.safety.touchdown_max_esc_rpm,
-        ).safe
+        return bool(
+            assess_esc_telemetry(
+                self._snapshot,
+                self.config.esc.slots,
+                maximum_abs_rpm=self.config.safety.touchdown_max_esc_rpm,
+            ).safe
+        )
+
+    async def _clear_post_touchdown_stability(self) -> None:
+        """Clear the published dwell result when any stability premise is lost."""
+
+        changed = bool(
+            self._post_touchdown_stable_since is not None or self._impact_landing_exit_ready
+        )
+        self._post_touchdown_stable_since = None
+        self._post_touchdown_last_stability_check_at = None
+        self._impact_landing_exit_ready = False
+        if changed:
+            await self.refresh_snapshot()
 
     def _airborne_sample_is_valid(self) -> bool:
         status = self._snapshot.pixhawk
+        now = self._clock.monotonic()
         return (
-            status.connected
-            and timestamp_is_fresh(
-                self._clock.monotonic(),
-                status.heartbeat_timestamp,
+            pixhawk_touchdown_sources_are_current(
+                status,
+                now,
                 self.config.safety.pixhawk_timeout_s,
+                self.config.safety.touchdown_max_source_age_s,
+                self.config.safety.touchdown_max_source_skew_s,
             )
             and status.armed
             and not status.landed
@@ -2574,7 +4208,41 @@ class SystemManager:
 
     def _touchdown_conditions(self, height: float) -> Mapping[str, bool]:
         status = self._snapshot.pixhawk
+        estimate = self._snapshot.landing_estimate
+        now = self._clock.monotonic()
+        automatic_landing = self.state is SystemState.AUTO_LANDING
+        source_timestamps = [
+            status.attitude_timestamp,
+            status.kinematics_timestamp,
+            status.landed_state_timestamp,
+        ]
+        estimate_current = True
+        if automatic_landing:
+            source_timestamps.append(estimate.timestamp)
+            estimate_current = bool(
+                estimate.valid
+                and estimate.ground_detected
+                and estimate.height_m is not None
+                and math.isfinite(estimate.height_m)
+                and timestamp_is_fresh(
+                    now,
+                    estimate.timestamp,
+                    self.config.safety.controller_timeout_s,
+                )
+            )
         return {
+            "pixhawk_sources_current": pixhawk_touchdown_sources_are_current(
+                status,
+                now,
+                self.config.safety.pixhawk_timeout_s,
+                self.config.safety.touchdown_max_source_age_s,
+                self.config.safety.touchdown_max_source_skew_s,
+            ),
+            "landing_estimate_current": estimate_current,
+            "source_timestamps_coherent": timestamps_are_coherent(
+                source_timestamps,
+                self.config.safety.touchdown_max_source_skew_s,
+            ),
             "pixhawk_landed": status.landed,
             "height_finite": math.isfinite(height),
             "vertical_velocity_finite": math.isfinite(status.vertical_velocity_mps),
@@ -2634,10 +4302,102 @@ class SystemManager:
         if not self._airborne_confirmed:
             return
 
+        status = self._snapshot.pixhawk
         height = self._touchdown_height()
+        source_timestamps = (
+            status.attitude_timestamp,
+            status.kinematics_timestamp,
+            status.landed_state_timestamp,
+        )
+        if (
+            self.config.go2.low_level.enabled
+            and self.state is SystemState.FLIGHT_MANUAL
+            and self._aborted_impact_touchdown_latched
+        ):
+            independent_airborne_evidence = bool(
+                pixhawk_touchdown_sources_are_current(
+                    status,
+                    now,
+                    self.config.safety.pixhawk_timeout_s,
+                    self.config.safety.touchdown_max_source_age_s,
+                    self.config.safety.touchdown_max_source_skew_s,
+                )
+                and timestamps_are_coherent(
+                    source_timestamps,
+                    self.config.safety.touchdown_max_source_skew_s,
+                )
+                and type(status.landed) is bool
+                and not status.landed
+                and math.isfinite(height)
+                and math.isfinite(status.vertical_velocity_mps)
+                and math.isfinite(status.maximum_esc_rpm)
+                and (
+                    height > self.config.safety.touchdown_max_height_delta_m
+                    or abs(status.vertical_velocity_mps)
+                    > self.config.safety.touchdown_max_vertical_speed_mps
+                    or status.maximum_esc_rpm > self.config.safety.touchdown_max_esc_rpm
+                )
+            )
+            self._reset_touchdown_candidate()
+            if not independent_airborne_evidence:
+                if self._clear_aborted_impact_airborne_dwell():
+                    self._emit(
+                        "ABORTED_IMPACT_AIRBORNE_DWELL_INTERRUPTED",
+                        reason="airborne evidence became invalid, stale, incoherent, or absent",
+                    )
+                return
+            last_check = self._aborted_impact_airborne_last_check_at
+            if self._aborted_impact_airborne_since is not None and (
+                last_check is None
+                or now < last_check
+                or now - last_check > self.config.safety.post_touchdown_stability_max_check_gap_s
+            ):
+                self._clear_aborted_impact_airborne_dwell()
+                self._emit(
+                    "ABORTED_IMPACT_AIRBORNE_OBSERVATION_GAP",
+                    reason="airborne evidence was not checked continuously",
+                )
+            if self._aborted_impact_airborne_since is None:
+                self._aborted_impact_airborne_since = now
+                self._aborted_impact_airborne_last_check_at = now
+                self._emit(
+                    "ABORTED_IMPACT_AIRBORNE_DWELL_STARTED",
+                    required_dwell_s=self.config.safety.aborted_impact_airborne_confirm_s,
+                )
+                return
+            self._aborted_impact_airborne_last_check_at = now
+            if (
+                now - self._aborted_impact_airborne_since
+                < self.config.safety.aborted_impact_airborne_confirm_s
+            ):
+                return
+            self._aborted_impact_touchdown_latched = False
+            self._clear_aborted_impact_airborne_dwell()
+            self._emit(
+                "ABORTED_IMPACT_TOUCHDOWN_LATCH_CLEARED",
+                reason="independent airborne evidence held continuously",
+                confirmed_dwell_s=self.config.safety.aborted_impact_airborne_confirm_s,
+            )
+            return
+        if (
+            self.config.go2.low_level.enabled
+            and self.state is SystemState.AUTO_LANDING
+            and self._impact_recovery_wait_started_at is not None
+            and now - self._impact_recovery_wait_started_at
+            >= self.config.safety.impact_recovery_completion_timeout_s
+        ):
+            self._emit(
+                "IMPACT_RECOVERY_COMPLETION_TIMEOUT",
+                landing_session_id=self._impact_landing_session_id,
+                reason="normal recovery did not reach the guarded exit before its total deadline",
+            )
+            await self._abort_autoland_unlocked("post-touchdown recovery completion timed out")
+            return
         touchdown = all(self._touchdown_conditions(height).values())
         if not touchdown:
             self._reset_touchdown_candidate()
+            if self.state is SystemState.AUTO_LANDING and self.config.go2.low_level.enabled:
+                await self._clear_post_touchdown_stability()
             return
         if self._touchdown_height_reference is None:
             self._touchdown_height_reference = height
@@ -2649,23 +4409,393 @@ class SystemManager:
         ):
             self._touchdown_height_reference = height
             self._touchdown_since = now
+            if self.state is SystemState.AUTO_LANDING and self.config.go2.low_level.enabled:
+                await self._clear_post_touchdown_stability()
             return
         if self._touchdown_since is None:
             self._touchdown_since = now
             return
         if now - self._touchdown_since < self.config.safety.touchdown_confirm_s:
             return
-        self._touchdown_confirmed = True
-        await self._stop_setpoints()
-        self._autoland_active = False
+        if self.state is SystemState.AUTO_LANDING and self.config.go2.low_level.enabled:
+            await self._advance_impact_recovery_exit(now)
+            return
+        await self._complete_touchdown_transition(
+            "manual landing touchdown conditions held for configured duration"
+        )
+
+    def _impact_recovery_evidence_failure(self, now: float) -> Optional[str]:
+        evidence = self._impact_recovery
+        if evidence.landing_session_id != self._impact_landing_session_id:
+            return "recovery evidence belongs to another automatic-landing session"
+        if not evidence.confirmed:
+            return evidence.reason or "post-touchdown recovery evidence is incomplete"
+        maximum_age = self.config.safety.impact_recovery_status_max_age_s
+        if (
+            not timestamp_is_fresh(now, evidence.timestamp, maximum_age)
+            or not timestamp_is_fresh(
+                now,
+                evidence.residual_zero_status_timestamp,
+                maximum_age,
+            )
+            or now >= evidence.valid_until
+        ):
+            return "post-touchdown recovery or persistent-zero FC status is stale or expired"
+        low_level = self._snapshot.go2.low_level_status
+        expected_epoch = low_level.owner_epoch if self.config.go2.low_level.enabled else 0
+        if evidence.go2_ownership_epoch != expected_epoch:
+            return "recovery evidence does not match the active Go2 ownership epoch"
+        return None
+
+    def _post_touchdown_stability_is_valid(self, now: float) -> bool:
+        if self._impact_recovery_evidence_failure(now) is not None:
+            return False
+        pixhawk = self._snapshot.pixhawk
+        estimate = self._snapshot.landing_estimate
+        pixhawk_sources_current = pixhawk_touchdown_sources_are_current(
+            pixhawk,
+            now,
+            self.config.safety.pixhawk_timeout_s,
+            self.config.safety.touchdown_max_source_age_s,
+            self.config.safety.touchdown_max_source_skew_s,
+        )
+        if (
+            not pixhawk_sources_current
+            or not timestamps_are_coherent(
+                (
+                    pixhawk.attitude_timestamp,
+                    pixhawk.kinematics_timestamp,
+                    pixhawk.landed_state_timestamp,
+                    estimate.timestamp,
+                ),
+                self.config.safety.touchdown_max_source_skew_s,
+            )
+            or not pixhawk.landed
+            or not math.isfinite(pixhawk.vertical_velocity_mps)
+            or abs(pixhawk.vertical_velocity_mps)
+            > self.config.safety.touchdown_max_vertical_speed_mps
+            or not math.isfinite(pixhawk.roll_rad)
+            or not math.isfinite(pixhawk.pitch_rad)
+            or abs(pixhawk.roll_rad) > self.config.safety.touchdown_max_tilt_rad
+            or abs(pixhawk.pitch_rad) > self.config.safety.touchdown_max_tilt_rad
+            or not estimate.valid
+            or not estimate.ground_detected
+            or not timestamp_is_fresh(
+                now,
+                estimate.timestamp,
+                self.config.safety.controller_timeout_s,
+            )
+            or estimate.horizontal_velocity_mps is None
+            or not math.isfinite(estimate.horizontal_velocity_mps)
+            or abs(estimate.horizontal_velocity_mps)
+            > self.config.landing.maximum_horizontal_speed_mps
+            or not self._esc_telemetry_confirms_touchdown()
+            or not self._impact_recovery_setpoints_stopped
+            or self._snapshot.external_setpoint_active
+        ):
+            return False
+        if self.config.go2.low_level.enabled:
+            low_level = self._snapshot.go2.low_level_status
+            tracking_unsafe = any(
+                violation.code == "GO2_JOINT_TRACKING_ERROR"
+                for violation in self._safety_monitor.evaluate(self._snapshot)
+            )
+            return bool(
+                self._impact_recovery_safe_hold_confirmed
+                and low_level.ownership_state
+                in {LowCmdOwnershipState.HOLDING, LowCmdOwnershipState.SAFE_HOLD}
+                and self._lowcmd_status_healthy(low_level)
+                and self._lowcmd_motor_feedback_is_stationary(low_level)
+                and not tracking_unsafe
+            )
+        return bool(
+            self._snapshot.go2.control_authority.state
+            is Go2ControlAuthorityState.HIGH_LEVEL_JOINT_LOCK
+            and self._snapshot.go2.joints_locked
+            and self._snapshot.go2.stable
+            and not self._snapshot.go2.moving
+        )
+
+    async def _advance_impact_recovery_exit(self, now: float) -> None:
+        if self._impact_recovery_wait_started_at is None:
+            self._impact_recovery_wait_started_at = now
+            self._emit(
+                "IMPACT_RECOVERY_COMPLETION_WAIT_STARTED",
+                landing_session_id=self._impact_landing_session_id,
+            )
+        failure = self._impact_recovery_evidence_failure(now)
+        if failure is not None:
+            await self._clear_post_touchdown_stability()
+            if (
+                self._impact_recovery_wait_started_at is not None
+                and now - self._impact_recovery_wait_started_at
+                >= self.config.safety.impact_recovery_completion_timeout_s
+            ):
+                self._emit(
+                    "IMPACT_RECOVERY_COMPLETION_TIMEOUT",
+                    landing_session_id=self._impact_landing_session_id,
+                    reason=failure,
+                )
+                await self._abort_autoland_unlocked("post-touchdown recovery completion timed out")
+                return
+            self._emit(
+                "IMPACT_RECOVERY_COMPLETION_REQUIRED",
+                landing_session_id=self._impact_landing_session_id,
+                reason=failure,
+            )
+            return
+
+        if self._impact_recovery_finalization_started_at is None:
+            self._impact_recovery_finalization_started_at = now
+            self._emit(
+                "IMPACT_RECOVERY_FINALIZATION_STARTED",
+                landing_session_id=self._impact_landing_session_id,
+            )
+
+        if not self._impact_recovery_setpoints_stopped:
+            try:
+                await self._stop_setpoints()
+            except (BridgeError, OSError, RuntimeError) as exc:
+                await self._fault("AUTOLAND_SETPOINT_STOP_FAILED", str(exc))
+                return
+            self._impact_recovery_setpoints_stopped = True
+            self._next_landing_update_at = None
+            self._emit(
+                "IMPACT_RECOVERY_SETPOINTS_QUIESCED",
+                landing_session_id=self._impact_landing_session_id,
+            )
+            await self.refresh_snapshot()
+            now = self._clock.monotonic()
+            if (
+                self._impact_recovery_finalization_started_at is not None
+                and now - self._impact_recovery_finalization_started_at
+                >= self.config.safety.impact_recovery_finalization_timeout_s
+            ):
+                self._emit(
+                    "IMPACT_RECOVERY_FINALIZATION_TIMEOUT",
+                    landing_session_id=self._impact_landing_session_id,
+                    stage="setpoint_quiesce",
+                )
+                await self._abort_autoland_unlocked(
+                    "post-touchdown setpoint finalization timed out"
+                )
+                return
+
+        if not self._impact_recovery_safe_hold_confirmed:
+            revoked = await self._revoke_go2_low_level_internal(
+                "post-touchdown recovery complete and FC residual zero confirmed"
+            )
+            if not revoked.ok:
+                await self._fault("GO2_LOWCMD_REVOKE_FAILED", revoked.message)
+                return
+            self._impact_recovery_safe_hold_confirmed = True
+            self._emit(
+                "IMPACT_RECOVERY_GO2_SAFE_HOLD_CONFIRMED",
+                landing_session_id=self._impact_landing_session_id,
+                ownership_epoch=self._impact_recovery.go2_ownership_epoch,
+            )
+            await self.refresh_snapshot()
+            now = self._clock.monotonic()
+            if (
+                self._impact_recovery_finalization_started_at is not None
+                and now - self._impact_recovery_finalization_started_at
+                >= self.config.safety.impact_recovery_finalization_timeout_s
+            ):
+                self._emit(
+                    "IMPACT_RECOVERY_FINALIZATION_TIMEOUT",
+                    landing_session_id=self._impact_landing_session_id,
+                    stage="go2_safe_hold",
+                )
+                await self._abort_autoland_unlocked(
+                    "post-touchdown Go2 safe-hold finalization timed out"
+                )
+                return
+
+        if self._impact_recovery_finalization_completed_at is None:
+            # The finalization budget covers only the two quiescing actions
+            # above (FC/setpoint stop and Go2 safe-hold), including their
+            # acknowledgement refreshes.  Once both have completed inside the
+            # budget, the independent stable-dwell observation must not keep
+            # aging this action timer.
+            completed_at = self._clock.monotonic()
+            started_at = self._impact_recovery_finalization_started_at
+            if (
+                started_at is None
+                or not self._impact_recovery_setpoints_stopped
+                or not self._impact_recovery_safe_hold_confirmed
+            ):
+                await self._clear_post_touchdown_stability()
+                return
+            if (
+                completed_at - started_at
+                >= self.config.safety.impact_recovery_finalization_timeout_s
+            ):
+                self._emit(
+                    "IMPACT_RECOVERY_FINALIZATION_TIMEOUT",
+                    landing_session_id=self._impact_landing_session_id,
+                    stage="action_completion",
+                )
+                await self._abort_autoland_unlocked(
+                    "post-touchdown actuator finalization timed out"
+                )
+                return
+            self._impact_recovery_finalization_completed_at = completed_at
+            self._emit(
+                "IMPACT_RECOVERY_FINALIZATION_COMPLETED",
+                landing_session_id=self._impact_landing_session_id,
+                elapsed_s=completed_at - started_at,
+            )
+
+        if not self._post_touchdown_stability_is_valid(now):
+            await self._clear_post_touchdown_stability()
+            return
+        last_check = self._post_touchdown_last_stability_check_at
+        if self._post_touchdown_stable_since is not None and (
+            last_check is None
+            or now < last_check
+            or now - last_check > self.config.safety.post_touchdown_stability_max_check_gap_s
+        ):
+            await self._clear_post_touchdown_stability()
+            self._emit(
+                "POST_TOUCHDOWN_STABILITY_OBSERVATION_GAP",
+                landing_session_id=self._impact_landing_session_id,
+            )
+            now = self._clock.monotonic()
+            if not self._post_touchdown_stability_is_valid(now):
+                return
+        if self._post_touchdown_stable_since is None:
+            self._post_touchdown_stable_since = now
+            self._post_touchdown_last_stability_check_at = now
+            self._emit(
+                "POST_TOUCHDOWN_STABLE_DWELL_STARTED",
+                landing_session_id=self._impact_landing_session_id,
+            )
+            await self.refresh_snapshot()
+            return
+        self._post_touchdown_last_stability_check_at = now
+        if (
+            now - self._post_touchdown_stable_since
+            < self.config.safety.post_touchdown_stable_confirm_s
+        ):
+            return
+
+        self._impact_landing_exit_ready = True
+        await self.refresh_snapshot()
+        final_now = self._clock.monotonic()
+        if (
+            not self._snapshot.post_touchdown_stable_dwell_complete
+            or not self._post_touchdown_stability_is_valid(final_now)
+        ):
+            await self._clear_post_touchdown_stability()
+            return
+        await self._complete_touchdown_transition(
+            "post-touchdown recovery, FC CLEAR/execution plus persistent-zero status, Go2 safe-hold, and stable dwell confirmed"
+        )
+
+    async def _complete_touchdown_transition(self, reason: str) -> None:
+        automatic_landing = self.state is SystemState.AUTO_LANDING
+        impact_aware_landing = automatic_landing and self.config.go2.low_level.enabled
+        if not automatic_landing and self._aborted_impact_touchdown_latched:
+            self._touchdown_since = None
+            self._touchdown_height_reference = None
+            self._emit(
+                "ABORTED_IMPACT_TOUCHDOWN_RECLASSIFICATION_BLOCKED",
+                reason="the same landed episode still requires recovery or a new airborne cycle",
+            )
+            return
+        if not automatic_landing and self.config.go2.low_level.enabled:
+            revoked = await self._revoke_go2_low_level_internal(
+                "manual touchdown confirmed; retain safe-hold through handover"
+            )
+            if not revoked.ok:
+                await self._fault("GO2_LOWCMD_REVOKE_FAILED", revoked.message)
+                return
+        try:
+            await self._stop_setpoints()
+        except (BridgeError, OSError, RuntimeError) as exc:
+            await self._fault("AUTOLAND_SETPOINT_STOP_FAILED", str(exc))
+            return
         self._next_landing_update_at = None
         await self.refresh_snapshot()
-        await self._state_machine.transition_to(
-            SystemState.TOUCHDOWN_VERIFY,
-            reason="touchdown conditions held after confirmed airborne phase",
-            snapshot=self._snapshot,
-        )
-        self._emit("TOUCHDOWN_CONFIRMED")
+        if impact_aware_landing:
+            final_now = self._clock.monotonic()
+            completion_started = self._impact_recovery_wait_started_at
+            finalization_started = self._impact_recovery_finalization_started_at
+            completion_timed_out = bool(
+                completion_started is not None
+                and final_now - completion_started
+                >= self.config.safety.impact_recovery_completion_timeout_s
+            )
+            finalization_timed_out = bool(
+                self._impact_recovery_finalization_completed_at is None
+                and finalization_started is not None
+                and final_now - finalization_started
+                >= self.config.safety.impact_recovery_finalization_timeout_s
+            )
+            if completion_timed_out or finalization_timed_out:
+                if completion_timed_out:
+                    self._emit(
+                        "IMPACT_RECOVERY_COMPLETION_TIMEOUT",
+                        landing_session_id=self._impact_landing_session_id,
+                        reason="deadline crossed during final touchdown transaction",
+                        stage="final_stop_recheck",
+                    )
+                if finalization_timed_out:
+                    self._emit(
+                        "IMPACT_RECOVERY_FINALIZATION_TIMEOUT",
+                        landing_session_id=self._impact_landing_session_id,
+                        stage="final_stop_recheck",
+                    )
+                await self._abort_autoland_unlocked(
+                    "post-touchdown recovery deadline crossed during finalization"
+                )
+                return
+            dwell_start = self._post_touchdown_stable_since
+            last_stability_check = self._post_touchdown_last_stability_check_at
+            if (
+                self.state is not SystemState.AUTO_LANDING
+                or not self._impact_landing_exit_ready
+                or dwell_start is None
+                or last_stability_check is None
+                or final_now - dwell_start < self.config.safety.post_touchdown_stable_confirm_s
+                or final_now < last_stability_check
+                or final_now - last_stability_check
+                > self.config.safety.post_touchdown_stability_max_check_gap_s
+                or not self._post_touchdown_stability_is_valid(final_now)
+            ):
+                await self._clear_post_touchdown_stability()
+                self._emit(
+                    "POST_TOUCHDOWN_FINAL_RECHECK_FAILED",
+                    landing_session_id=self._impact_landing_session_id,
+                )
+                return
+        try:
+            await self._state_machine.transition_to(
+                SystemState.TOUCHDOWN_VERIFY,
+                reason=reason,
+                snapshot=self._snapshot,
+            )
+        except TransitionRejected as exc:
+            await self._fault("TOUCHDOWN_EXIT_REJECTED", str(exc))
+            return
+        if self.state is not SystemState.TOUCHDOWN_VERIFY:
+            # StateMachine converts subscriber/entry-action failures to FAULT
+            # and returns the original permitted record.  Never publish local
+            # touchdown completion flags unless the actual committed state is
+            # still exactly TOUCHDOWN_VERIFY.
+            await self._fault(
+                "TOUCHDOWN_EXIT_ENTRY_FAILED",
+                "TOUCHDOWN_VERIFY publish/entry failed; actual state is " + self.state.name,
+            )
+            return
+        # Publish completion flags only after every preceding action and the
+        # guarded state transition succeeded.  A partial transaction can no
+        # longer masquerade as a confirmed touchdown.
+        self._touchdown_confirmed = True
+        self._aborted_impact_touchdown_latched = False
+        self._clear_aborted_impact_airborne_dwell()
+        self._autoland_active = False
+        self._emit("TOUCHDOWN_CONFIRMED", landing_session_id=self._impact_landing_session_id)
         await self.refresh_snapshot()
 
     def _landing_compliance_entry_result(self) -> OperationResult:
@@ -2674,13 +4804,28 @@ class SystemManager:
                 "LANDING_COMPLIANCE_DISABLED",
                 "Calibrate all four foot-force thresholds before enabling landing compliance",
             )
-        if self.state is not SystemState.TOUCHDOWN_VERIFY:
+        lowcmd_handover_complete = (
+            self.config.go2.low_level.enabled
+            and self.state is SystemState.FLIGHT_READY
+            and self._touchdown_confirmed
+        )
+        if self.state is not SystemState.TOUCHDOWN_VERIFY and not lowcmd_handover_complete:
             return OperationResult.failure(
                 "INVALID_STATE",
-                "Landing compliance entry requires TOUCHDOWN_VERIFY",
+                "Landing compliance entry requires TOUCHDOWN_VERIFY or a completed LowCmd ground handover",
             )
         snapshot = self._snapshot
         contact = assess_foot_contact(snapshot.go2, self.config.go2)
+        if not pixhawk_ground_state_is_current(
+            snapshot.pixhawk,
+            snapshot.timestamp,
+            self.config.safety.pixhawk_timeout_s,
+            self.config.safety.touchdown_max_source_age_s,
+        ):
+            return OperationResult.failure(
+                "PIXHAWK_GROUND_STATE_STALE",
+                "Fresh Pixhawk heartbeat and landed-state samples are required",
+            )
         if not snapshot.pixhawk.landed:
             return OperationResult.failure("TOUCHDOWN_NOT_CONFIRMED", "Pixhawk is not landed")
         if snapshot.pixhawk.armed:
@@ -2701,10 +4846,17 @@ class SystemManager:
             )
         if snapshot.f446.duty != 0 or snapshot.f446.faulted:
             return OperationResult.failure("F446_NOT_SAFE", "F446 must be stopped and fault-free")
+        low_level = snapshot.go2.low_level_status
+        if low_level.ownership_pending:
+            return OperationResult.failure(
+                "GO2_LOWCMD_EXPLICIT_RELEASE_REQUIRED",
+                "Explicitly release LowCmd after verified ground/disarm/zero-RPM/support "
+                "before entering BalanceStand landing compliance",
+            )
         if not snapshot.joint_lock_confirmed:
             return OperationResult.failure(
                 "GO2_JOINT_LOCK_REQUIRED",
-                "Go2 joint lock must remain confirmed until compliance entry",
+                "Go2 joint lock must remain confirmed after any LowCmd-to-high-level handover",
             )
         if not snapshot.go2.stable or snapshot.go2.moving or snapshot.go2.controller_active:
             return OperationResult.failure(
@@ -2737,6 +4889,16 @@ class SystemManager:
             )
         snapshot = self._snapshot
         contact = assess_foot_contact(snapshot.go2, self.config.go2)
+        if not pixhawk_ground_state_is_current(
+            snapshot.pixhawk,
+            snapshot.timestamp,
+            self.config.safety.pixhawk_timeout_s,
+            self.config.safety.touchdown_max_source_age_s,
+        ):
+            return OperationResult.failure(
+                "PIXHAWK_GROUND_STATE_STALE",
+                "Fresh Pixhawk heartbeat and landed-state samples must remain available",
+            )
         if snapshot.pixhawk.armed:
             return OperationResult.failure(
                 "PIXHAWK_ARMED_DURING_LANDING_COMPLIANCE",
@@ -3034,6 +5196,10 @@ class SystemManager:
                 "remaining_s": remaining,
                 "f446_duty": self._snapshot.f446.duty,
                 "automatic_transition": "FLIGHT_READY",
+                "post_handover_sport_sample_received": (
+                    self.state is not SystemState.GO2_GROUND_HANDOVER
+                    or self._post_handover_go2_sample_is_fresh()
+                ),
             },
         )
 
@@ -3155,11 +5321,29 @@ class SystemManager:
         *,
         simulate_operator: bool = False,
     ) -> OperationResult:
-        if self.state is not SystemState.GO2_JOINT_LOCK_WAIT:
+        if self.state not in {
+            SystemState.GO2_JOINT_LOCK_WAIT,
+            SystemState.GO2_GROUND_HANDOVER,
+        }:
             return OperationResult.failure(
                 "INVALID_STATE",
-                "Go2 joint-lock completion requires GO2_JOINT_LOCK_WAIT",
+                "Go2 joint-lock completion requires a JOINT_LOCK_WAIT/GROUND_HANDOVER state",
             )
+        if self.state is SystemState.GO2_GROUND_HANDOVER:
+            if self._go2_ground_handover_started_at is None:
+                message = "Ground handover has no causal SportModeState timestamp barrier"
+                await self._fault("GO2_HANDOVER_BARRIER_MISSING", message)
+                return OperationResult.failure("GO2_HANDOVER_BARRIER_MISSING", message)
+            if not self._post_handover_go2_sample_is_fresh():
+                deadline = self._go2_joint_lock_deadline
+                if deadline is not None and self._clock.monotonic() >= deadline:
+                    message = (
+                        "No fresh SportModeState sample arrived after the LowCmd handover "
+                        f"within {self.config.go2.joint_lock_operator_timeout_s:.1f}s"
+                    )
+                    await self._fault("GO2_POST_HANDOVER_STATE_TIMEOUT", message)
+                    return OperationResult.failure("GO2_POST_HANDOVER_STATE_TIMEOUT", message)
+                return self._joint_lock_operator_required_result()
         if simulate_operator and not self._snapshot.go2.joints_locked:
             try:
                 if not await self._go2.request_flight_pose():
@@ -3211,6 +5395,7 @@ class SystemManager:
                 snapshot=self._snapshot,
             )
             self._go2_joint_lock_deadline = None
+            self._go2_ground_handover_started_at = None
             self._emit("FLIGHT_CONFIGURATION_VERIFIED")
             self._emit("FLIGHT_READY")
             await self.refresh_snapshot()
@@ -3229,6 +5414,68 @@ class SystemManager:
             return OperationResult.failure(code, message)
 
     async def _prepare_disconnect(self) -> OperationResult:
+        # State names alone are not proof of physical safety: FAULT and
+        # EMERGENCY_STOP can be entered while airborne.  Refresh and enforce
+        # the same observable ground facts before any transport disappears.
+        await self.refresh_snapshot()
+        low_level = self._snapshot.go2.low_level_status
+        if low_level.ownership_pending:
+            return OperationResult.failure(
+                "GO2_LOWCMD_EXPLICIT_RELEASE_REQUIRED",
+                "Release the continuous LowCmd owner through the explicit ground handover before disconnecting",
+            )
+        all_required_disconnected = (
+            not self._snapshot.pixhawk.connected
+            and not self._snapshot.f446.connected
+            and (not self.config.go2.enabled or not self._snapshot.go2.connected)
+        )
+        if self.state is SystemState.BOOT_SAFE and all_required_disconnected:
+            return OperationResult.success("No connected hardware transport remains")
+        missing_authority = []
+        if not self._snapshot.pixhawk.connected:
+            missing_authority.append("Pixhawk")
+        if not self._snapshot.f446.connected:
+            missing_authority.append("F446")
+        if self.config.go2.enabled and not self._snapshot.go2.connected:
+            missing_authority.append("Go2")
+        if missing_authority and self._ever_entered_operational_state:
+            return OperationResult.failure(
+                "GROUND_PROOF_UNAVAILABLE",
+                "Cannot prove a safe ground disconnect after operational telemetry was lost: "
+                + ", ".join(missing_authority),
+            )
+        if self._snapshot.pixhawk.connected:
+            if not pixhawk_ground_state_is_current(
+                self._snapshot.pixhawk,
+                self._snapshot.timestamp,
+                self.config.safety.pixhawk_timeout_s,
+                self.config.safety.touchdown_max_source_age_s,
+            ):
+                return OperationResult.failure(
+                    "GROUND_PROOF_UNAVAILABLE",
+                    "Fresh Pixhawk heartbeat and landed-state samples are required before disconnect",
+                )
+            if self._snapshot.pixhawk.armed or not self._snapshot.pixhawk.landed:
+                return OperationResult.failure(
+                    "UNSAFE_DISCONNECT",
+                    "Pixhawk must be disarmed and report landed before disconnect",
+                )
+            if not assess_esc_telemetry(
+                self._snapshot,
+                self.config.esc.slots,
+                exact_zero=True,
+            ).safe:
+                return OperationResult.failure(
+                    "UNSAFE_DISCONNECT",
+                    "Every configured rotor must have fresh, healthy, finite, exactly-zero RPM before disconnect",
+                )
+        if self._snapshot.f446.connected and (
+            self._snapshot.f446.duty != 0 or self._snapshot.f446.faulted
+        ):
+            return OperationResult.failure(
+                "UNSAFE_DISCONNECT",
+                "F446 must be stopped and fault-free before disconnect",
+            )
         if self.state in (
             SystemState.BOOT_SAFE,
             SystemState.FAULT,
@@ -3240,7 +5487,6 @@ class SystemManager:
                 "UNSAFE_DISCONNECT",
                 "Disconnect requires BOOT_SAFE, FAULT, or a disarmed safe idle state",
             )
-        await self.refresh_snapshot()
         try:
             await self._state_machine.transition_to(
                 SystemState.BOOT_SAFE,
@@ -3274,6 +5520,56 @@ class SystemManager:
                 f"({max(0.0, elapsed):.3f}s observed)",
             )
         return OperationResult.success("Go2 stationary dwell confirmed")
+
+    def _lowcmd_ground_stationary_dwell_result(self) -> OperationResult:
+        now = self._clock.monotonic()
+        since = self._lowcmd_ground_stationary_since
+        source_start = self._lowcmd_ground_stationary_source_start
+        if (
+            since is None
+            or source_start is None
+            or not math.isfinite(now)
+            or not math.isfinite(since)
+        ):
+            return OperationResult.failure(
+                "GO2_GROUND_STATIONARY_DWELL_REQUIRED",
+                "Disarmed, landed, stationary Go2 confirmation has not started",
+            )
+        elapsed = now - since
+        required = self.config.safety.stationary_confirm_s
+        if elapsed < required:
+            return OperationResult.failure(
+                "GO2_GROUND_STATIONARY_DWELL_REQUIRED",
+                "Go2 must remain disarmed, landed, stable, and stationary for "
+                f"{required:.3f}s ({max(0.0, elapsed):.3f}s observed)",
+            )
+        heartbeat_start, landed_start = source_start
+        if (
+            self._snapshot.pixhawk.heartbeat_timestamp <= heartbeat_start
+            or self._snapshot.pixhawk.landed_state_timestamp <= landed_start
+        ):
+            return OperationResult.failure(
+                "GO2_GROUND_STATIONARY_DWELL_REQUIRED",
+                "Ground dwell requires causally newer heartbeat and landed-state samples",
+            )
+        return OperationResult.success("LowCmd ground stationary dwell confirmed")
+
+    def _post_handover_go2_sample_is_fresh(self) -> bool:
+        barrier = self._go2_ground_handover_started_at
+        status = self._snapshot.go2
+        timestamp = status.timestamp
+        return (
+            barrier is not None
+            and math.isfinite(barrier)
+            and status.connected
+            and math.isfinite(timestamp)
+            and timestamp > barrier
+            and timestamp_is_fresh(
+                self._snapshot.timestamp,
+                timestamp,
+                self.config.safety.go2_timeout_s,
+            )
+        )
 
     def _go2_joint_lock_is_settled(self) -> bool:
         status = self._snapshot.go2
@@ -3325,10 +5621,7 @@ class SystemManager:
             self._go2_joint_lock_unsafe_since = now
             return tuple(item for item in violations if item.code != unsafe_code)
 
-        if (
-            now - self._go2_joint_lock_unsafe_since
-            < self.config.go2.joint_lock_unsafe_confirm_s
-        ):
+        if now - self._go2_joint_lock_unsafe_since < self.config.go2.joint_lock_unsafe_confirm_s:
             return tuple(item for item in violations if item.code != unsafe_code)
         return violations
 
@@ -3445,6 +5738,7 @@ class SystemManager:
         self._manual_last_direction = None
         self._manual_motion_started = False
         self._go2_joint_lock_deadline = None
+        self._go2_ground_handover_started_at = None
         self._go2_joint_lock_entered_at = None
         self._go2_joint_lock_unsafe_since = None
 
@@ -3463,6 +5757,8 @@ class SystemManager:
         self._manual_motion_started = False
         now = self._clock.monotonic()
         self._go2_joint_lock_deadline = now + self.config.go2.joint_lock_operator_timeout_s
+        if snapshot.state is not SystemState.GO2_GROUND_HANDOVER:
+            self._go2_ground_handover_started_at = None
         self._go2_joint_lock_entered_at = now
         self._go2_joint_lock_unsafe_since = None
 
@@ -3473,6 +5769,7 @@ class SystemManager:
         self._manual_last_direction = None
         self._manual_motion_started = False
         self._go2_joint_lock_deadline = None
+        self._go2_ground_handover_started_at = None
         self._go2_joint_lock_entered_at = None
         self._go2_joint_lock_unsafe_since = None
 
@@ -3481,6 +5778,13 @@ class SystemManager:
             raise BridgeError("Go2 landing compliance requires unlocked hardware writes")
         failure: Optional[Exception] = None
         try:
+            await self.refresh_snapshot()
+            low_level = self._snapshot.go2.low_level_status
+            if low_level.ownership_pending:
+                raise BridgeError(
+                    "GO2_LOWCMD_EXPLICIT_RELEASE_REQUIRED: complete the explicit "
+                    "ground/support handover before requesting BalanceStand"
+                )
             if not await self._go2.request_landing_pose():
                 raise BridgeError("Go2 rejected the BalanceStand landing posture")
             await self.refresh_snapshot()
@@ -3554,21 +5858,59 @@ class SystemManager:
         self._manual_last_direction = None
         self._manual_motion_started = False
         self._go2_joint_lock_deadline = None
+        self._go2_ground_handover_started_at = None
         self._go2_joint_lock_entered_at = None
         self._go2_joint_lock_unsafe_since = None
-        if self._suppress_fault_entry_stop:
+        if self._suppress_fault_entry_stop and not self.config.go2.low_level.enabled:
             return
-        await self._stop_setpoints()
-        stop_result = await self._safe_f446_stop()
-        if not stop_result.ok:
-            raise BridgeError(f"{stop_result.code}: {stop_result.message}")
+        # Every action is idempotent and independently safety-relevant.  A
+        # failed LowCmd revoke must not prevent setpoint/F446 stop attempts,
+        # and a caller's earlier partial stop must not suppress the revoke that
+        # keeps the same sole writer in conservative safe-hold.
+        failures: List[str] = []
+        try:
+            gate = await self._revoke_ground_arm_authorization_unlocked("FAULT entered")
+            if not gate.ok:
+                failures.append(f"{gate.code}: {gate.message}")
+        except Exception as exc:
+            failures.append(f"GROUND_ARM_AUTH_REVOKE_EXCEPTION: {exc}")
+        try:
+            revoke = await self._revoke_go2_low_level_internal(
+                "FAULT entered; retain sole-writer safe-hold"
+            )
+            if not revoke.ok:
+                failures.append(f"{revoke.code}: {revoke.message}")
+        except (AeroGo2Error, OSError, RuntimeError, TypeError, ValueError) as exc:
+            failures.append(f"GO2_LOWCMD_REVOKE_EXCEPTION: {exc}")
+        try:
+            await self._stop_setpoints()
+        except (AeroGo2Error, OSError, RuntimeError, TypeError, ValueError) as exc:
+            failures.append(f"SETPOINT_STOP_FAILED: {exc}")
+        try:
+            stop_result = await self._safe_f446_stop()
+            if not stop_result.ok:
+                failures.append(f"{stop_result.code}: {stop_result.message}")
+        except (AeroGo2Error, OSError, RuntimeError, TypeError, ValueError) as exc:
+            failures.append(f"F446_STOP_EXCEPTION: {exc}")
+        if failures:
+            raise BridgeError("; ".join(failures))
 
     async def _enter_emergency_stop(self, snapshot: SystemSnapshot) -> None:
         self._manual_marked_configuration = None
         self._go2_joint_lock_deadline = None
+        self._go2_ground_handover_started_at = None
         self._go2_joint_lock_entered_at = None
         self._go2_joint_lock_unsafe_since = None
-        result = await self.stop_supervised()
+        try:
+            gate = await self._revoke_ground_arm_authorization_unlocked("EMERGENCY_STOP entered")
+        except Exception as exc:
+            gate = OperationResult.failure(
+                "GROUND_ARM_AUTH_REVOKE_EXCEPTION",
+                f"{type(exc).__name__}: {exc}",
+            )
+        result = await self._stop_supervised_unlocked()
+        if not gate.ok:
+            raise BridgeError(f"{gate.code}: {gate.message}; stop={result.code}: {result.message}")
         if not result.ok:
             raise BridgeError(f"{result.code}: {result.message}")
 

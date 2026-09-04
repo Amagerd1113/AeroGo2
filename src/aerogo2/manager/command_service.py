@@ -26,6 +26,22 @@ class CommandService:
         if not decision.allowed:
             return CommandResult(CommandStatus.UNAVAILABLE, decision.reason)
 
+        lowcmd_actions = {
+            "go2_lowcmd_status",
+            "go2_lowcmd_acquire",
+            "go2_lowcmd_release",
+        }
+        if action in lowcmd_actions:
+            result = await self._run_go2_lowcmd_action(action, args)
+            data = dict(result.data)
+            if not result.ok:
+                data.setdefault("code", result.code)
+            return CommandResult(
+                CommandStatus.SUCCESS if result.ok else CommandStatus.REJECTED,
+                result.message,
+                data,
+            )
+
         f446_actions = {
             "manual_enter",
             "manual_exit",
@@ -103,6 +119,56 @@ class CommandService:
             CommandStatus.SUCCESS if result.ok else CommandStatus.REJECTED,
             result.message,
             result.data,
+        )
+
+    async def _run_go2_lowcmd_action(
+        self,
+        action: str,
+        args: Sequence[str],
+    ) -> OperationResult:
+        if args:
+            return OperationResult.failure(
+                "INVALID_ARGUMENTS",
+                f"{action} accepts no arguments",
+            )
+        if action == "go2_lowcmd_status":
+            view = self.query("go2 status")
+            go2 = view.get("go2")
+            if not isinstance(go2, Mapping):
+                return OperationResult.failure(
+                    "GO2_LOWCMD_STATUS_UNAVAILABLE",
+                    "The Go2 status view does not contain LowCmd telemetry",
+                )
+            low_level = go2.get("low_level_status")
+            if not isinstance(low_level, Mapping):
+                return OperationResult.failure(
+                    "GO2_LOWCMD_STATUS_UNAVAILABLE",
+                    "The Go2 status view does not contain LowCmd telemetry",
+                )
+            return OperationResult.success(
+                "Go2 LowCmd status",
+                {"low_level_status": dict(low_level)},
+            )
+        if action == "go2_lowcmd_acquire":
+            return cast(
+                OperationResult,
+                await self._manager.acquire_go2_low_level_control(
+                    operator_confirmed=True,
+                    robot_supported=True,
+                ),
+            )
+        if action == "go2_lowcmd_release":
+            return cast(
+                OperationResult,
+                await self._manager.release_go2_low_level_control(
+                    operator_confirmed=True,
+                    robot_supported=True,
+                    reason="operator-confirmed CLI ground release",
+                ),
+            )
+        return OperationResult.failure(
+            "UNKNOWN_GO2_LOWCMD_ACTION",
+            f"Unsupported action {action}",
         )
 
     async def _run_f446_action(

@@ -10,17 +10,19 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from aerogo2.app import AeroGo2Application
+from aerogo2.cli.signal_shutdown import SupervisedSignalRouter
 from aerogo2.common.config import load_config
 from aerogo2.common.enums import RuntimeMode
 from aerogo2.common.exceptions import ConfigurationError
 from aerogo2.hardware.runtime import HardwareWorld
 from aerogo2.simulation.world import SimulationWorld
 from aerogo2.x8_bench import (
+    X8_SPIN_CONFIRMATION,
     X8BenchError,
-    build_x8_spin_args,
     check_x8_alignment,
     print_alignment_report,
     run_x8_bench,
+    run_x8_spin,
 )
 
 _DEFAULT_CONFIG = Path("configs/system.yaml")
@@ -55,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     bench = subparsers.add_parser(
         "x8-bench",
-        help="Run the canonical Pixhawk/Hobbywing X8 bench diagnostic",
+        help="Run an allowlisted read-only Pixhawk/Hobbywing X8 diagnostic",
     )
     bench.add_argument("--config", type=Path, default=_default_config_path())
     bench.add_argument(
@@ -71,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument(
         "diag_args",
         nargs=argparse.REMAINDER,
-        help="Arguments for cli_diag; place them after --",
+        help="Allowlisted read-only cli_diag arguments; place them after --",
     )
 
     spin = subparsers.add_parser(
@@ -87,8 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
     spin.add_argument(
         "--target",
         required=True,
-        choices=("rr", "lf", "lr", "rf", "all"),
-        help="AeroGo2 arm target (rr/lf/lr/rf) or all",
+        choices=("rr", "lf", "lr", "rf"),
+        help="One AeroGo2 arm target (rr/lf/lr/rf); simultaneous all-arm spin is blocked",
     )
     spin.add_argument("--percent", required=True, type=float, help="5..20 percent")
     spin.add_argument(
@@ -115,10 +117,14 @@ async def async_main(args: argparse.Namespace) -> int:
         return 2
 
     if args.command == "x8-spin":
-        confirmation = "X8_PROPS_REMOVED_AND_AIRFRAME_SECURED"
-        if not args.props_removed or not args.airframe_secured or args.confirm_x8 != confirmation:
+        if (
+            not args.props_removed
+            or not args.airframe_secured
+            or args.confirm_x8 != X8_SPIN_CONFIRMATION
+        ):
             print(
-                f"X8 spin requires --props-removed --airframe-secured --confirm-x8 {confirmation}"
+                "X8 spin requires --props-removed --airframe-secured "
+                f"--confirm-x8 {X8_SPIN_CONFIRMATION}"
             )
             return 2
         try:
@@ -126,17 +132,27 @@ async def async_main(args: argparse.Namespace) -> int:
             print_alignment_report(report)
             if not report.ok:
                 return 2
-            diag_args = build_x8_spin_args(args.target, args.percent, args.duration)
             print(
                 f"X8 bounded motor test: target={args.target.upper()} "
                 f"power={args.percent:.1f}% duration={args.duration:.2f}s; Pixhawk must be DISARMED"
             )
-            return run_x8_bench(config, report, diag_args)
+            return run_x8_spin(
+                config,
+                report,
+                args.target,
+                args.percent,
+                args.duration,
+                props_removed=args.props_removed,
+                airframe_secured=args.airframe_secured,
+                confirmation=args.confirm_x8,
+            )
         except X8BenchError as exc:
             print(f"X8 spin error: {exc}")
             return 2
     if args.command == "x8-bench":
         try:
+            if args.check and args.diag_args:
+                raise X8BenchError("--check cannot be combined with diagnostic arguments")
             report = check_x8_alignment(config, args.diag_script)
             print_alignment_report(report)
             if not report.ok:
@@ -173,7 +189,32 @@ async def async_main(args: argparse.Namespace) -> int:
             ),
         )
         app = AeroGo2Application(config, runtime_mode=runtime_mode)
-        return await app.shell.run()
+        stopped = None
+        signal_router = None
+        if isinstance(app.world, HardwareWorld):
+            signal_router = SupervisedSignalRouter(app.shell.request_supervised_shutdown)
+            signal_router.install()
+        try:
+            try:
+                shell_result = int(await app.shell.run())
+            finally:
+                # InteractiveShell owns the supervised manager handoff. HardwareWorld
+                # additionally owns the LowState/LowCmd bridge, so its idempotent
+                # cleanup must not be abandoned if the prompt raises or is cancelled.
+                if isinstance(app.world, HardwareWorld):
+                    stopped = await app.world.shutdown_until_safe()
+                else:
+                    await app.world.shutdown()
+        finally:
+            if signal_router is not None:
+                signal_router.close()
+        if stopped is not None and not stopped.ok:
+            print(
+                "Hardware shutdown failed after ownership cleared: "
+                f"{stopped.code}: {stopped.message}"
+            )
+            return 1
+        return shell_result
 
     if args.command == "monitor":
         if args.confirm_hardware != "I_UNDERSTAND_HARDWARE_RISK":

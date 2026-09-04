@@ -28,6 +28,7 @@ READ_ONLY_ACTIONS: Final[FrozenSet[str]] = frozenset(
         "pixhawk_status",
         "f446_status",
         "go2_status",
+        "go2_lowcmd_status",
         "esc_status",
         "audit",
         "preflight",
@@ -78,11 +79,20 @@ STATE_ACTIONS: Final[Mapping[str, FrozenSet[SystemState]]] = MappingProxyType(
             }
         ),
         "walk_permit": frozenset({SystemState.WALK}),
-        "go2_confirm_lock": frozenset(
-            {SystemState.GO2_JOINT_LOCK_WAIT, SystemState.FLIGHT_READY}
-        ),
+        "go2_confirm_lock": frozenset({SystemState.GO2_JOINT_LOCK_WAIT, SystemState.FLIGHT_READY}),
         "ground_arm_authorize": frozenset({SystemState.FLIGHT_READY}),
         "ground_arm_revoke": frozenset({SystemState.FLIGHT_READY}),
+        "go2_lowcmd_acquire": frozenset({SystemState.FLIGHT_READY}),
+        "go2_lowcmd_release": frozenset(
+            {
+                SystemState.BOOT_SAFE,
+                SystemState.FLIGHT_READY,
+                SystemState.TOUCHDOWN_VERIFY,
+                SystemState.LANDING_COMPLIANT,
+                SystemState.FAULT,
+                SystemState.EMERGENCY_STOP,
+            }
+        ),
     }
 )
 

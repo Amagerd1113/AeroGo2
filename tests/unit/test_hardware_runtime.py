@@ -449,3 +449,170 @@ async def test_hardware_cli_refuses_missing_unlocks(
     args = build_parser().parse_args(arguments)
 
     assert await async_main(args) == 2
+
+
+def test_pixhawk_touchdown_sources_keep_independent_receive_timestamps(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    bridge = MavlinkPixhawkBridge(app_config.pixhawk, app_config.esc.slots, clock=clock)
+    bridge._connected = True
+    bridge._mavlink = SimpleNamespace(mavlink=SimpleNamespace(MAV_LANDED_STATE_ON_GROUND=1))
+
+    bridge._handle_message(
+        SimpleNamespace(
+            get_type=lambda: "ATTITUDE",
+            roll=0.01,
+            pitch=-0.02,
+            yaw=0.03,
+            rollspeed=0.0,
+            pitchspeed=0.0,
+            yawspeed=0.0,
+        )
+    )
+    attitude_at = clock.monotonic()
+    first = bridge.get_status()
+    assert first.attitude_timestamp == attitude_at
+    assert first.kinematics_timestamp == 0.0
+    assert first.landed_state_timestamp == 0.0
+
+    clock.advance(0.05)
+    bridge._handle_message(
+        SimpleNamespace(
+            get_type=lambda: "GLOBAL_POSITION_INT",
+            relative_alt=125,
+            vx=0,
+            vy=0,
+            vz=1,
+        )
+    )
+    kinematics_at = clock.monotonic()
+    second = bridge.get_status()
+    assert second.attitude_timestamp == attitude_at
+    assert second.kinematics_timestamp == kinematics_at
+    assert second.landed_state_timestamp == 0.0
+
+    clock.advance(0.05)
+    bridge._handle_message(SimpleNamespace(get_type=lambda: "EXTENDED_SYS_STATE", landed_state=1))
+    landed_at = clock.monotonic()
+    final = bridge.get_status()
+    assert final.attitude_timestamp == attitude_at
+    assert final.kinematics_timestamp == kinematics_at
+    assert final.landed_state_timestamp == landed_at
+
+    clock.advance(0.05)
+    bridge._handle_message(
+        SimpleNamespace(
+            get_type=lambda: "ATTITUDE",
+            roll=float("nan"),
+            pitch=0.0,
+            yaw=0.0,
+            rollspeed=0.0,
+            pitchspeed=0.0,
+            yawspeed=0.0,
+        )
+    )
+    bridge._handle_message(
+        SimpleNamespace(
+            get_type=lambda: "GLOBAL_POSITION_INT",
+            relative_alt=0,
+            vx=0,
+            vy=0,
+            vz=float("inf"),
+        )
+    )
+    for malformed_landed_state in (99, 1.5, "1", True):
+        bridge._handle_message(
+            SimpleNamespace(
+                get_type=lambda: "EXTENDED_SYS_STATE",
+                landed_state=malformed_landed_state,
+            )
+        )
+    rejected = bridge.get_status()
+    assert rejected.attitude_timestamp == attitude_at
+    assert rejected.kinematics_timestamp == kinematics_at
+    assert rejected.landed_state_timestamp == landed_at
+
+
+@pytest.mark.asyncio
+async def test_pixhawk_ground_arm_authorization_sequence_stays_exact_in_float32(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    bridge = MavlinkPixhawkBridge(app_config.pixhawk, app_config.esc.slots, clock=clock)
+    sent: list[tuple[object, ...]] = []
+
+    def command_long_send(*args: object) -> None:
+        sent.append(args)
+        bridge._handle_message(
+            SimpleNamespace(
+                get_type=lambda: "COMMAND_ACK",
+                command=31000,
+                result=0,
+                result_param2=int(args[7]),
+            )
+        )
+
+    bridge._connection = SimpleNamespace(mav=SimpleNamespace(command_long_send=command_long_send))
+    bridge._mavlink = SimpleNamespace(mavlink=SimpleNamespace(MAV_RESULT_ACCEPTED=0))
+    bridge._connected = True
+    bridge._ground_arm_authorization_sequence = (1 << 24) - 1
+
+    result = await bridge.set_ground_arm_authorization(True, 30.0)
+
+    assert result.ok
+    assert sent[0][7] == 1.0
+    assert (await bridge.set_ground_arm_authorization(False, 0.0)).ok
+
+
+@pytest.mark.asyncio
+async def test_pixhawk_arm_edge_closes_live_gate_but_retains_one_shot_receipt(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    bridge = MavlinkPixhawkBridge(app_config.pixhawk, app_config.esc.slots, clock=clock)
+    sent: list[tuple[object, ...]] = []
+
+    def command_long_send(*args: object) -> None:
+        sent.append(args)
+        if int(args[7]) != 0:
+            bridge._handle_message(
+                SimpleNamespace(
+                    get_type=lambda: "COMMAND_ACK",
+                    command=31000,
+                    result=0,
+                    result_param2=int(args[7]),
+                )
+            )
+
+    mavlink = SimpleNamespace(
+        MAV_RESULT_ACCEPTED=0,
+        MAV_MODE_FLAG_SAFETY_ARMED=128,
+        MAV_STATE_CRITICAL=5,
+    )
+    bridge._connection = SimpleNamespace(mav=SimpleNamespace(command_long_send=command_long_send))
+    bridge._mavlink = SimpleNamespace(
+        mavlink=mavlink,
+        mode_string_v10=lambda message: "STABILIZE",
+    )
+    bridge._connected = True
+    assert (await bridge.set_ground_arm_authorization(True, 30.0)).ok
+
+    bridge._handle_message(
+        SimpleNamespace(get_type=lambda: "HEARTBEAT", base_mode=128, system_status=3)
+    )
+
+    assert bridge.get_status().armed
+    assert bridge._ground_arm_authorization_task is None
+    assert not bridge._ground_arm_authorized
+    assert bridge.ground_arm_authorization_active()
+    assert sent[-1][4] == 0.0
+
+    bridge._handle_message(
+        SimpleNamespace(get_type=lambda: "HEARTBEAT", base_mode=0, system_status=3)
+    )
+    bridge._handle_message(
+        SimpleNamespace(get_type=lambda: "HEARTBEAT", base_mode=128, system_status=3)
+    )
+
+    assert not bridge.ground_arm_authorization_active()

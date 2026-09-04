@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="1900" viewBox="0 0 2200 1900" role="img" aria-labelledby="title desc">
+  <title id="title">AeroGo2 当前工程节点与控制流图</title>
+  <desc id="desc">按当前源代码绘制的系统运行时、主状态机、Go2 LowCmd 控制权、多速率 Impact-aware 着陆和安全故障路径。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f87171"/>
+    </marker>
+    <style>
+      .bg{fill:#0f172a}.panel{fill:#111c30;stroke:#334155;stroke-width:2}.panel-title{fill:#e2e8f0;font:bold 23px 'Microsoft YaHei','Noto Sans CJK SC',sans-serif}.node{fill:#1e293b;stroke:#64748b;stroke-width:1.6}.bridge{fill:#172554;stroke:#3b82f6}.core{fill:#312e81;stroke:#818cf8;stroke-width:2.4}.ok{fill:#14532d;stroke:#4ade80}.landing{fill:#713f12;stroke:#f59e0b}.landing2{fill:#7c2d12;stroke:#fb923c}.bad{fill:#7f1d1d;stroke:#f87171;stroke-width:2.2}.info{fill:#164e63;stroke:#22d3ee}.note{fill:#27272a;stroke:#71717a}.t{fill:#f8fafc;font:16px 'Microsoft YaHei','Noto Sans CJK SC',sans-serif;text-anchor:middle}.s{fill:#cbd5e1;font:13px 'Microsoft YaHei','Noto Sans CJK SC',sans-serif;text-anchor:middle}.edge{fill:none;stroke:#94a3b8;stroke-width:2;marker-end:url(#arrow)}.thin{fill:none;stroke:#64748b;stroke-width:1.2;marker-end:url(#arrow)}.dash{fill:none;stroke:#f87171;stroke-width:2;stroke-dasharray:9 7;marker-end:url(#arrowRed)}.dot{fill:none;stroke:#94a3b8;stroke-width:1.6;stroke-dasharray:2 7;marker-end:url(#arrow)}.elabel{fill:#cbd5e1;font:12px 'Microsoft YaHei','Noto Sans CJK SC',sans-serif;text-anchor:middle}.warn{fill:#fdba74;font:bold 13px 'Microsoft YaHei','Noto Sans CJK SC',sans-serif;text-anchor:middle}.legend{fill:#cbd5e1;font:14px 'Microsoft YaHei','Noto Sans CJK SC',sans-serif}
+    </style>
+  </defs>
+  <rect class="bg" width="2200" height="1900"/>
+  <text x="1100" y="40" class="panel-title" text-anchor="middle">AeroGo2 当前工程：状态机、控制权与 Impact-aware 多速率控制流</text>
+  <text x="1100" y="66" class="s">依据当前源代码绘制；红色虚线表示硬件门禁或尚未接通的链路</text>
+
+  <!-- A. runtime -->
+  <rect class="panel" x="30" y="88" width="2140" height="300" rx="18"/>
+  <text x="55" y="120" class="panel-title">A. 运行时与外部设备</text>
+  <g>
+    <rect class="node" x="70" y="150" width="190" height="70" rx="12"/><text class="t" x="165" y="180">操作员 / CLI</text><text class="s" x="165" y="204">确认、接管、急停</text>
+    <rect class="node" x="70" y="270" width="190" height="70" rx="12"/><text class="t" x="165" y="300">RadioMaster / RC</text><text class="s" x="165" y="324">CH5 / CH9 / CH10</text>
+    <rect class="node" x="330" y="150" width="220" height="80" rx="12"/><text class="t" x="440" y="180">Pixhawk 6X</text><text class="s" x="440" y="204">姿态、速度、landed、ESC</text><text class="s" x="440" y="221">飞控原生基线环</text>
+    <rect class="node" x="330" y="270" width="220" height="70" rx="12"/><text class="t" x="440" y="300">F446 折展控制器</text><text class="s" x="440" y="324">着陆阶段保持停止</text>
+    <rect class="node" x="620" y="190" width="220" height="100" rx="12"/><text class="t" x="730" y="222">Go2 EDU</text><text class="s" x="730" y="247">SportModeState</text><text class="s" x="730" y="268">LowState / 12 关节</text>
+
+    <rect class="bridge" x="930" y="140" width="250" height="80" rx="12"/><text class="t" x="1055" y="172">MavlinkPixhawkBridge</text><text class="s" x="1055" y="198">遥测、受限命令</text>
+    <rect class="bridge" x="930" y="245" width="250" height="60" rx="12"/><text class="t" x="1055" y="281">TextF446Bridge</text>
+    <rect class="bridge" x="1240" y="130" width="250" height="75" rx="12"/><text class="t" x="1365" y="160">UnitreeGo2Bridge</text><text class="s" x="1365" y="185">高层 SportClient</text>
+    <rect class="bridge" x="1240" y="225" width="250" height="105" rx="12"/><text class="t" x="1365" y="255">LowLevelSdkBridge</text><text class="s" x="1365" y="279">rt/lowstate + 唯一写线程</text><text class="s" x="1365" y="302">CRC、限幅、TTL、watchdog</text>
+    <rect class="bridge" x="930" y="325" width="250" height="45" rx="12"/><text class="t" x="1055" y="354">RCMonitor</text>
+    <rect class="core" x="1640" y="185" width="270" height="95" rx="14"/><text class="t" x="1775" y="220">SystemManager</text><text class="s" x="1775" y="246">唯一业务编排入口</text><text class="s" x="1775" y="265">StateMachine + Guards</text>
+    <rect class="bad" x="1960" y="185" width="170" height="95" rx="14"/><text class="t" x="2045" y="220">SafetyMonitor</text><text class="s" x="2045" y="246">独立安全监测</text><text class="s" x="2045" y="265">违规→FAULT</text>
+
+    <path class="edge" d="M260 185 H1640"/><path class="edge" d="M260 305 H930"/>
+    <path class="edge" d="M550 185 H930"/><path class="edge" d="M550 305 H930"/>
+    <path class="edge" d="M840 220 H1240 V168"/><path class="edge" d="M840 260 H1240 V278"/>
+    <path class="edge" d="M1180 180 H1640"/><path class="edge" d="M1180 275 H1640"/><path class="edge" d="M1490 168 H1640"/><path class="edge" d="M1490 278 H1640"/>
+    <path class="edge" d="M1910 232 H1960"/>
+  </g>
+
+  <!-- B. system FSM -->
+  <rect class="panel" x="30" y="410" width="2140" height="520" rx="18"/>
+  <text x="55" y="443" class="panel-title">B. SystemState 主状态机</text>
+  <text x="1810" y="442" class="s">细灰线：合法返回/维护边；为清晰起见故障汇总到右侧</text>
+  <g>
+    <rect class="info" x="70" y="490" width="145" height="54" rx="10"/><text class="t" x="142" y="523">BOOT_SAFE</text>
+    <rect class="node" x="265" y="470" width="190" height="54" rx="10"/><text class="t" x="360" y="503">HOMING_TO_WALK</text>
+    <rect class="ok" x="500" y="490" width="120" height="54" rx="10"/><text class="t" x="560" y="523">WALK</text>
+    <rect class="node" x="670" y="470" width="245" height="74" rx="10"/><text class="t" x="792" y="500">WALK_TO_FLIGHT</text><text class="s" x="792" y="524">PRECHECK</text>
+    <rect class="node" x="965" y="470" width="220" height="74" rx="10"/><text class="t" x="1075" y="500">TRANSFORM_TO</text><text class="s" x="1075" y="524">FLIGHT</text>
+    <rect class="node" x="1235" y="470" width="235" height="74" rx="10"/><text class="t" x="1352" y="500">GO2_JOINT_LOCK</text><text class="s" x="1352" y="524">WAIT</text>
+    <rect class="bridge" x="1520" y="490" width="170" height="54" rx="10"/><text class="t" x="1605" y="523">FLIGHT_READY</text>
+    <rect class="bridge" x="1740" y="490" width="175" height="54" rx="10"/><text class="t" x="1827" y="523">FLIGHT_MANUAL</text>
+
+    <path class="edge" d="M215 517 H265"/><path class="edge" d="M455 497 H500"/><path class="edge" d="M620 517 H670"/><path class="edge" d="M915 507 H965"/><path class="edge" d="M1185 507 H1235"/><path class="edge" d="M1470 517 H1520"/><path class="edge" d="M1690 517 H1740"/>
+
+    <rect class="landing" x="1670" y="610" width="245" height="72" rx="10"/><text class="t" x="1792" y="640">AUTO_LANDING_READY</text><text class="warn" x="1792" y="663">当前仅 DRY-RUN</text>
+    <rect class="landing2" x="1370" y="610" width="220" height="72" rx="10"/><text class="t" x="1480" y="640">AUTO_LANDING</text><text class="warn" x="1480" y="663">当前仅 DRY-RUN</text>
+    <rect class="node" x="1070" y="610" width="220" height="72" rx="10"/><text class="t" x="1180" y="640">TOUCHDOWN_VERIFY</text><text class="s" x="1180" y="663">完成恢复后才进入</text>
+    <path class="edge" d="M1827 544 V610"/><path class="edge" d="M1670 646 H1590"/><path class="edge" d="M1370 646 H1290"/>
+    <path class="thin" d="M1792 610 V575 H1827 V544"/><text class="elabel" x="1740" y="573">取消</text>
+    <path class="thin" d="M1480 610 V570 H1827 V544"/><text class="elabel" x="1600" y="566">人工接管/中止</text>
+
+    <rect class="node" x="720" y="605" width="245" height="82" rx="10"/><text class="t" x="842" y="635">GO2_GROUND_HANDOVER</text><text class="s" x="842" y="659">LowCmd 已关闭</text><text class="s" x="842" y="678">等待交还后新鲜 mode=6</text>
+    <path class="edge" d="M1070 646 H965"/><path class="edge" d="M842 605 V575 H1605 V544"/>
+
+    <rect class="node" x="720" y="750" width="245" height="72" rx="10"/><text class="t" x="842" y="780">LANDING_COMPLIANT</text><text class="s" x="842" y="803">默认关闭；须标定足力</text>
+    <rect class="node" x="1070" y="750" width="245" height="72" rx="10"/><text class="t" x="1192" y="780">FLIGHT_TO_WALK</text><text class="s" x="1192" y="803">PRECHECK</text>
+    <rect class="node" x="1400" y="750" width="225" height="72" rx="10"/><text class="t" x="1512" y="780">TRANSFORM_TO</text><text class="s" x="1512" y="803">WALK</text>
+    <path class="thin" d="M1180 682 V716 H842 V750"/><path class="edge" d="M1180 682 V750"/><path class="edge" d="M1315 786 H1400"/>
+    <path class="edge" d="M1512 822 V866 H560 V544"/>
+    <path class="thin" d="M842 822 V865 H1352 V544"/>
+
+    <rect class="node" x="70" y="625" width="215" height="64" rx="10"/><text class="t" x="177" y="653">MANUAL_POSITIONING</text><text class="s" x="177" y="676">维护后门</text>
+    <path class="thin" d="M142 544 V625"/><path class="thin" d="M285 657 H500 V544"/>
+
+    <rect class="bad" x="1800" y="750" width="150" height="64" rx="10"/><text class="t" x="1875" y="789">FAULT</text>
+    <rect class="bad" x="1980" y="750" width="150" height="64" rx="10"/><text class="t" x="2055" y="780">EMERGENCY</text><text class="s" x="2055" y="801">STOP</text>
+    <path class="dash" d="M1760 700 C1840 690 1875 715 1875 750"/><text class="warn" x="1830" y="700">所有正常状态异常</text>
+    <path class="dash" d="M1950 782 H1980"/><path class="dash" d="M2055 750 V720 H1875 V750"/>
+    <path class="thin" d="M1875 814 V880 H142 V544"/><text class="elabel" x="930" y="898">根因清除、Disarm、ESC=0 → BOOT_SAFE</text>
+  </g>
+
+  <!-- C. authority -->
+  <rect class="panel" x="30" y="950" width="2140" height="300" rx="18"/>
+  <text x="55" y="983" class="panel-title">C. Go2 控制权与唯一 LowCmd 所有者（与 SystemState 独立）</text>
+  <g>
+    <rect class="info" x="70" y="1020" width="190" height="76" rx="12"/><text class="t" x="165" y="1052">OBSERVE_ONLY</text><text class="s" x="165" y="1077">只订阅，不建 publisher</text>
+    <rect class="ok" x="310" y="1020" width="220" height="76" rx="12"/><text class="t" x="420" y="1052">HIGH_LEVEL</text><text class="s" x="420" y="1077">JOINT_LOCK / Sport</text>
+    <rect class="node" x="580" y="1010" width="270" height="96" rx="12"/><text class="t" x="715" y="1040">LOWCMD_ACQUIRING</text><text class="s" x="715" y="1064">地面、支撑、Disarm、ESC=0</text><text class="s" x="715" y="1085">本机锁 + 网络排他证明</text>
+    <rect class="landing" x="900" y="1020" width="240" height="76" rx="12"/><text class="t" x="1020" y="1052">LOWCMD_SAFE_HOLD</text><text class="s" x="1020" y="1077">唯一发送者连续持姿</text>
+    <rect class="landing2" x="1190" y="1020" width="210" height="76" rx="12"/><text class="t" x="1295" y="1052">LOWCMD_ACTIVE</text><text class="s" x="1295" y="1077">MPC_ACTIVE</text>
+    <rect class="node" x="1450" y="1010" width="285" height="96" rx="12"/><text class="t" x="1592" y="1040">HIGH_LEVEL_REACQUIRING</text><text class="s" x="1592" y="1064">停止写线程、恢复服务</text><text class="s" x="1592" y="1085">等待新鲜 JOINT_LOCK</text>
+    <rect class="bad" x="1815" y="1020" width="260" height="76" rx="12"/><text class="t" x="1945" y="1052">控制权 FAULT</text><text class="s" x="1945" y="1077">进程驻留，不假定已释放</text>
+
+    <path class="dot" d="M260 1058 H310"/><path class="edge" d="M530 1058 H580"/><path class="edge" d="M850 1058 H900"/><path class="edge" d="M1140 1058 H1190"/><path class="edge" d="M1400 1058 H1450"/><path class="edge" d="M1592 1010 V995 H420 V1020"/>
+    <path class="edge" d="M1295 1096 V1150 H1020 V1096"/><text class="elabel" x="1160" y="1144">revoke / TTL / watchdog</text>
+    <path class="dash" d="M715 1106 V1200 H1945 V1096"/><path class="dash" d="M1295 1096 V1180 H1945 V1096"/>
+    <rect class="core" x="680" y="1165" width="590" height="58" rx="12"/><text class="t" x="975" y="1190">Go2ControlArbiter：SportClient 与 LowCmd 互斥</text><text class="s" x="975" y="1212">ownership epoch、主机跨进程锁；网络排他 verifier 未注入时拒绝获取</text>
+  </g>
+
+  <!-- D. impact-aware -->
+  <rect class="panel" x="30" y="1270" width="2140" height="550" rx="18"/>
+  <text x="55" y="1303" class="panel-title">D. Impact-aware 多速率着陆流水线（当前为参考 / 仿真实现）</text>
+  <g>
+    <rect class="landing" x="90" y="1340" width="210" height="62" rx="11"/><text class="t" x="195" y="1368">PRE_TOUCHDOWN</text><text class="s" x="195" y="1390">AUTO_LANDING 内</text>
+    <rect class="landing2" x="350" y="1340" width="190" height="62" rx="11"/><text class="t" x="445" y="1378">TOUCHDOWN</text>
+    <rect class="ok" x="590" y="1330" width="270" height="82" rx="11"/><text class="t" x="725" y="1360">POST_TOUCHDOWN</text><text class="t" x="725" y="1383">RECOVERY</text><text class="s" x="725" y="1403">持续接触与恢复</text>
+    <rect class="node" x="920" y="1325" width="350" height="92" rx="11"/><text class="t" x="1095" y="1354">退出屏障</text><text class="s" x="1095" y="1378">恢复证据 + residual 持续为零</text><text class="s" x="1095" y="1398">停止 setpoint + safe-hold + 稳定驻留</text>
+    <rect class="node" x="1320" y="1340" width="230" height="62" rx="11"/><text class="t" x="1435" y="1378">TOUCHDOWN_VERIFY</text>
+    <path class="edge" d="M300 1371 H350"/><path class="edge" d="M540 1371 H590"/><path class="edge" d="M860 1371 H920"/><path class="edge" d="M1270 1371 H1320"/>
+
+    <rect class="node" x="80" y="1480" width="230" height="78" rx="11"/><text class="t" x="195" y="1510">异步低频状态快照</text><text class="s" x="195" y="1534">状态、接触域、FC 基线</text>
+    <rect class="node" x="360" y="1470" width="280" height="98" rx="11"/><text class="t" x="500" y="1500">AsyncLatestMPCWorker</text><text class="s" x="500" y="1524">NLP / SLSQP 参考求解</text><text class="s" x="500" y="1546">解审计、超时、generation fence</text>
+    <rect class="core" x="690" y="1470" width="280" height="98" rx="11"/><text class="t" x="830" y="1500">LatestPolicyMailbox</text><text class="s" x="830" y="1524">最新未过期策略</text><text class="s" x="830" y="1546">期望足力 + 已乘 κ 的 Δu</text>
+    <path class="edge" d="M310 1519 H360"/><path class="edge" d="M640 1519 H690"/>
+
+    <rect class="node" x="80" y="1650" width="235" height="92" rx="11"/><text class="t" x="197" y="1680">高频相干 LowState</text><text class="s" x="197" y="1704">关节、姿态、法向足力</text><text class="s" x="197" y="1725">同 tick 序号与时间戳</text>
+    <rect class="node" x="360" y="1650" width="220" height="92" rx="11"/><text class="t" x="470" y="1680">接触检测</text><text class="s" x="470" y="1704">迟滞、触地/脱离事件</text><text class="s" x="470" y="1725">推进 contact epoch</text>
+    <rect class="node" x="625" y="1650" width="230" height="92" rx="11"/><text class="t" x="740" y="1680">每腿导纳</text><text class="s" x="740" y="1704">IK、位置/变化率限幅</text><text class="s" x="740" y="1725">生成 12 关节目标</text>
+    <rect class="node" x="900" y="1650" width="250" height="92" rx="11"/><text class="t" x="1025" y="1680">LowCmdExecutor</text><text class="s" x="1025" y="1704">epoch、mapping、TTL</text><text class="s" x="1025" y="1725">提交 ACK 校验</text>
+    <rect class="landing" x="1195" y="1650" width="255" height="92" rx="11"/><text class="t" x="1322" y="1680">固定周期唯一写线程</text><text class="s" x="1322" y="1704">q/dq/Kp/Kd/tau + CRC</text><text class="s" x="1322" y="1725">过期→safe-hold</text>
+    <path class="edge" d="M315 1696 H360"/><path class="edge" d="M580 1696 H625"/><path class="edge" d="M855 1696 H900"/><path class="edge" d="M1150 1696 H1195"/>
+    <path class="edge" d="M830 1568 V1618 H740 V1650"/><text class="elabel" x="790" y="1610">足力策略</text>
+    <path class="edge" d="M470 1650 V1605 H830 V1568"/><text class="elabel" x="600" y="1597">接触变化：旧策略失效</text>
+
+    <rect class="node" x="1040" y="1480" width="300" height="78" rx="11"/><text class="t" x="1190" y="1510">FlightControllerResidualSink</text><text class="s" x="1190" y="1534">reserve / stage / ACK / 执行回读</text>
+    <rect class="bridge" x="1390" y="1475" width="295" height="88" rx="11"/><text class="t" x="1537" y="1505">飞控原生高速环</text><text class="s" x="1537" y="1529">u_final = u_fc + Δu_applied</text><text class="s" x="1537" y="1550">过期仅 Δu→0，保留基线</text>
+    <path class="edge" d="M970 1519 H1040"/><path class="edge" d="M1340 1519 H1390"/>
+    <path class="edge" d="M470 1650 V1585 H1190 V1558"/><text class="elabel" x="910" y="1578">接触变化：先清零 residual</text>
+
+    <rect class="bad" x="1510" y="1650" width="275" height="92" rx="11"/><text class="t" x="1647" y="1680">独立安全环</text><text class="s" x="1647" y="1704">ACK、年龄、抖动、owner</text><text class="s" x="1647" y="1725">异常：失效、清零、safe-hold</text>
+    <path class="dash" d="M1510 1696 H1450"/><path class="dash" d="M1647 1650 V1595 H1190 V1558"/><path class="dash" d="M1647 1742 V1780 H830 V1568"/>
+
+    <rect class="bad" x="1805" y="1450" width="300" height="115" rx="13"/><text class="t" x="1955" y="1482">跨 Go2 / 飞控原子提交器</text><text class="warn" x="1955" y="1507">尚未实现并验证</text><text class="s" x="1955" y="1532">因此真机目标提交被拒绝</text><text class="s" x="1955" y="1552">COORDINATED_ACTUATION...</text>
+    <path class="dash" d="M1785 1696 H1955 V1565"/>
+    <path class="dash" d="M1685 1519 H1805"/>
+    <rect class="note" x="1805" y="1655" width="300" height="82" rx="11"/><text class="t" x="1955" y="1686">串行 Coordinator</text><text class="s" x="1955" y="1710">仅离线 / 单周期参考</text><text class="s" x="1955" y="1730">不是硬件调度器</text>
+  </g>
+
+  <!-- legend -->
+  <rect class="panel" x="30" y="1840" width="2140" height="45" rx="12"/>
+  <rect class="ok" x="65" y="1852" width="25" height="20" rx="4"/><text class="legend" x="100" y="1868">正常/已实现</text>
+  <rect class="landing" x="245" y="1852" width="25" height="20" rx="4"/><text class="legend" x="280" y="1868">着陆或保守持姿</text>
+  <rect class="bad" x="475" y="1852" width="25" height="20" rx="4"/><text class="legend" x="510" y="1868">故障、门禁或缺失链路</text>
+  <line x1="760" y1="1862" x2="825" y2="1862" class="edge"/><text class="legend" x="840" y="1868">当前数据流/状态边</text>
+  <line x1="1085" y1="1862" x2="1150" y2="1862" class="dash"/><text class="legend" x="1165" y="1868">异常或未接通</text>
+  <text class="legend" x="1430" y="1868">关键语义：LowCmd 激活后检查 owner/LowState/跟踪误差，不再要求 Sport mode=6</text>
+</svg>

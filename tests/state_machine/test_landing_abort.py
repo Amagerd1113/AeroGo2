@@ -46,6 +46,9 @@ def landing_snapshot(
             landed=False,
             failsafe=False,
             heartbeat_timestamp=timestamp,
+            attitude_timestamp=timestamp,
+            kinematics_timestamp=timestamp,
+            landed_state_timestamp=timestamp,
         ),
         f446=F446Status(
             connected=True,
@@ -86,7 +89,13 @@ def snapshot_at(snapshot: SystemSnapshot, timestamp: float) -> SystemSnapshot:
     return replace(
         snapshot,
         timestamp=timestamp,
-        pixhawk=replace(snapshot.pixhawk, heartbeat_timestamp=timestamp),
+        pixhawk=replace(
+            snapshot.pixhawk,
+            heartbeat_timestamp=timestamp,
+            attitude_timestamp=timestamp,
+            kinematics_timestamp=timestamp,
+            landed_state_timestamp=timestamp,
+        ),
         f446=replace(snapshot.f446, timestamp=timestamp),
         go2=replace(snapshot.go2, timestamp=timestamp),
         rc=replace(snapshot.rc, timestamp=timestamp),
@@ -369,7 +378,7 @@ async def manager_in_autoland(
     )
     await manager.refresh_snapshot()
     clock.advance(app_config.safety.stationary_confirm_s)
-    pixhawk.inject_heartbeat()
+    pixhawk.inject_telemetry_cycle()
     f446.inject_status()
     go2.inject_status()
     manager.accept_rc_status(
@@ -447,7 +456,7 @@ async def test_manual_override_aborts_setpoints_without_disarming(
 ) -> None:
     manager, pixhawk, _, _ = await manager_in_autoland(app_config, clock)
     clock.advance(0.02)
-    pixhawk.inject_heartbeat()
+    pixhawk.inject_telemetry_cycle()
     manager.accept_landing_estimate(
         replace(manager.snapshot.landing_estimate, timestamp=clock.monotonic())
     )
@@ -473,7 +482,7 @@ async def test_controller_timeout_aborts_and_stops_existing_setpoint(
 ) -> None:
     manager, pixhawk, f446, go2 = await manager_in_autoland(app_config, clock)
     clock.advance(app_config.landing.controller_timeout_s + 0.001)
-    pixhawk.inject_heartbeat()
+    pixhawk.inject_telemetry_cycle()
     f446.inject_status()
     go2.inject_status()
     manager.accept_rc_status(replace(manager.snapshot.rc, timestamp=clock.monotonic()))
@@ -508,7 +517,7 @@ def _refresh_autoland_inputs(
     go2: FakeGo2,
     clock: ManualClock,
 ) -> None:
-    pixhawk.inject_heartbeat()
+    pixhawk.inject_telemetry_cycle()
     f446.inject_status()
     go2.inject_status()
     manager.accept_rc_status(replace(manager.snapshot.rc, timestamp=clock.monotonic()))

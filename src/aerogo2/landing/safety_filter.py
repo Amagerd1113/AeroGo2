@@ -8,6 +8,11 @@ from typing import Optional
 from aerogo2.common.config import AppConfig
 from aerogo2.common.enums import AutoLandingRequest, Configuration, SystemState
 from aerogo2.common.models import LandingCommand, SystemSnapshot
+from aerogo2.common.numeric import finite_real
+from aerogo2.safety.pixhawk_freshness import (
+    pixhawk_touchdown_sources_are_current,
+    timestamps_are_coherent,
+)
 from aerogo2.safety.watchdog import timestamp_is_fresh
 
 
@@ -90,6 +95,14 @@ class LandingSafetyFilter:
             self._config.safety.pixhawk_timeout_s,
         ):
             return "Pixhawk status is unavailable or stale"
+        if not pixhawk_touchdown_sources_are_current(
+            snapshot.pixhawk,
+            snapshot.timestamp,
+            self._config.safety.pixhawk_timeout_s,
+            self._config.safety.touchdown_max_source_age_s,
+            self._config.safety.touchdown_max_source_skew_s,
+        ):
+            return "Pixhawk touchdown sources are stale, incoherent, or invalid"
         if not snapshot.pixhawk.armed:
             return "Pixhawk is not armed"
         if snapshot.pixhawk.failsafe:
@@ -107,7 +120,12 @@ class LandingSafetyFilter:
         if snapshot.rc.auto_landing_request is not AutoLandingRequest.AUTO_EXECUTE:
             return "CH10 is not AUTO_EXECUTE"
         estimate = snapshot.landing_estimate
-        if not estimate.valid or not estimate.ground_detected:
+        if (
+            type(estimate.valid) is not bool
+            or estimate.valid is not True
+            or type(estimate.ground_detected) is not bool
+            or estimate.ground_detected is not True
+        ):
             return "landing estimate or ground observation is invalid"
         if not timestamp_is_fresh(
             snapshot.timestamp,
@@ -120,8 +138,18 @@ class LandingSafetyFilter:
             estimate.vertical_velocity_mps,
             estimate.horizontal_velocity_mps,
         )
-        if any(value is None or not math.isfinite(value) for value in estimate_values):
+        if any(finite_real(value) is None for value in estimate_values):
             return "landing estimate contains a non-finite value"
+        if not timestamps_are_coherent(
+            (
+                snapshot.pixhawk.attitude_timestamp,
+                snapshot.pixhawk.kinematics_timestamp,
+                snapshot.pixhawk.landed_state_timestamp,
+                estimate.timestamp,
+            ),
+            self._config.safety.touchdown_max_source_skew_s,
+        ):
+            return "Pixhawk and landing-estimator sources are incoherent"
         if snapshot.active_fault_codes:
             return "active safety faults inhibit automatic landing"
         if not candidate.valid:
