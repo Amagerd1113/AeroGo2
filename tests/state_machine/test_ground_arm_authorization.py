@@ -106,6 +106,60 @@ async def test_authorized_radio_arm_consumes_one_shot_gate(app_config: AppConfig
 
 
 @pytest.mark.asyncio
+async def test_pre_takeoff_disarm_returns_to_ready_and_requires_new_authorization(
+    app_config: AppConfig,
+) -> None:
+    world = SimulationWorld(app_config)
+    try:
+        await _reach_flight_ready(world)
+        assert (await world.manager.authorize_ground_arm()).ok
+        world._set_switches(morphology=1900, autoland=1000, flight_enable=1900)
+        world.pixhawk.inject_armed_state(True)
+        world.pixhawk.inject_landed_state(True)
+        await world.manager.tick()
+        assert world.manager.state is SystemState.FLIGHT_MANUAL
+
+        world.pixhawk.inject_armed_state(False)
+        await world.manager.tick()
+
+        assert world.manager.state is SystemState.FLIGHT_READY
+        assert not world.manager.snapshot.ground_arm_authorized
+        touchdown = world.manager.query("touchdown status")
+        assert touchdown["airborne_confirmed"] is False
+        assert touchdown["touchdown_detection_enabled"] is False
+
+        rejected = await world.manager.authorize_ground_arm()
+        assert not rejected.ok
+        assert rejected.code == "FLIGHT_ENABLE_NOT_LOW"
+
+        world._set_switches(morphology=1900, autoland=1000, flight_enable=1000)
+        assert (await world.manager.authorize_ground_arm()).ok
+    finally:
+        await world.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_disarm_after_airborne_confirmation_does_not_return_to_flight_ready(
+    app_config: AppConfig,
+) -> None:
+    world = SimulationWorld(app_config)
+    try:
+        states = []
+        assert (await world.start()).ok
+        assert (await world._reach_flight_manual(states)).ok
+        assert world.manager.state is SystemState.FLIGHT_MANUAL
+        assert world.manager.query("touchdown status")["airborne_confirmed"] is True
+
+        world.pixhawk.inject_armed_state(False)
+        world.pixhawk.inject_landed_state(False)
+        await world.manager.tick()
+
+        assert world.manager.state is SystemState.FLIGHT_MANUAL
+    finally:
+        await world.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_unauthorized_radio_arm_fails_closed_without_auto_disarm(
     app_config: AppConfig,
 ) -> None:

@@ -266,6 +266,7 @@ PARAM_EXPECT_STANDARD: List[Tuple[str, Optional[float], str]] = [
 PARAM_EXTRA_BENCH: List[str] = [
     "BRD_SAFETY_DEFLT",
     "ARMING_CHECK",
+    "DISARM_DELAY",
     "BATT_MONITOR",
     "MOT_SAFE_DISARM",
     "MOT_SPIN_ARM",

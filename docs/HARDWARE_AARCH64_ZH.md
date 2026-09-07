@@ -119,7 +119,7 @@ TRANSFORM_TO_WALK
 
 Unitree 高层接口没有可证明进入 mode=6 的公开 JointLock 方法，`StandUp` 也不等于锁关节。0.3.13 根据这台 Go2 的前后对照实测，把配置项 `joint_lock_state_codes: [1002]` 作为 Lock On 遥测证据；普通站立的 100 不会被识别为锁定。识别后软件调用 `SwitchJoystick(false)`，并持续监测连接、状态码和速度；若 1002 消失，关节锁确认也会丢失并触发既有保护。
 
-主状态机没有直接 arm/disarm API；`flight authorize` 只在完整互锁通过后开启 30 秒一次性许可，随后必须由 RadioMaster CH5 LOW->HIGH 触发 Pixhawk Lua 的普通受检 Arm。Lua 阻断 MAVLink Arm/force-arm 绕过，但保留正常 Disarm。完整条件见 `STATE_TRANSITIONS_ZH.md`。
+主状态机没有直接 arm/disarm API；`flight authorize` 只在完整互锁通过后开启 30 秒一次性许可，随后必须由 RadioMaster CH5 LOW->HIGH 触发 Pixhawk Lua 的普通受检 Arm。Lua 阻断 MAVLink Arm/force-arm 绕过，但保留正常 Disarm，并要求 `DISARM_DELAY=20`。若 Arm 后尚未确认离地且 Pixhawk 在 landed 状态自动 Disarm，上层自动回到 `FLIGHT_READY`；CH5 拉回 LOW 后才能重新授权。完整条件见 `STATE_TRANSITIONS_ZH.md`。
 
 X8 motor-test 与飞行 Arm 隔离；仅可在全部拆桨、限流供电并固定机体后使用台架入口。
 

@@ -24,6 +24,7 @@ def test_ardupilot_arm_gate_is_fail_closed_and_has_no_force_arm(
     assert '{"RC5_OPTION", 153}' in script
     assert '{"ARMING_RUDDER", 0}' in script
     assert '{"ARMING_CHECK", 1}' in script
+    assert '{"DISARM_DELAY", 20}' in script
     assert 'param:get("ARMING_SKIPCHK")' in script
 
 

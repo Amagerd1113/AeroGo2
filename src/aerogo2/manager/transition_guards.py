@@ -75,6 +75,7 @@ _MUTABLE_ALLOWED_TRANSITIONS: Dict[SystemState, Set[SystemState]] = {
         SystemState.EMERGENCY_STOP,
     },
     SystemState.FLIGHT_MANUAL: {
+        SystemState.FLIGHT_READY,
         SystemState.AUTO_LANDING_READY,
         SystemState.TOUCHDOWN_VERIFY,
         SystemState.FLIGHT_TO_WALK_PRECHECK,

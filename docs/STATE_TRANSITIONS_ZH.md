@@ -29,7 +29,7 @@
 | `TRANSFORM_TO_FLIGHT` | `GO2_JOINT_LOCK_WAIT`, `FAULT`, `EMERGENCY_STOP` | 第二次检查全部共同前提，特别是四 ESC 精确 0 RPM；F446 到达 FLIGHT 限位且 duty=0 后再次请求 `StopMove`，随后进入人工锁关节等待态。不会再把 `StandUp()` 当作 mode=6。 |
 | `GO2_JOINT_LOCK_WAIT` | `FLIGHT_READY`, `FAULT`, `EMERGENCY_STOP` | F446 已在已验证 FLIGHT 端点且 duty=0。手机端选择 Lock On 后，原始 mode=6 或配置的 `error_code=1002` 都会自动确认。切换产生的运动先经过 2.0 秒初始宽限和 0.5 秒连续越界确认；锁定信号出现但尚未静止时保持等待，稳定后才调用 `SwitchJoystick(false)` 并进入 `FLIGHT_READY`。真正持续进入 `LOCOMOTION`/超速、未知状态码、设备/RC/ESC/F446 异常或 60 秒超时仍进入 `FAULT`。其他固件才使用 `go2 confirm-lock` 人工后备。 |
 | `FLIGHT_READY` | `MANUAL_POSITIONING`, `BOOT_SAFE`, `FLIGHT_MANUAL`, `FLIGHT_TO_WALK_PRECHECK`, `FAULT`, `EMERGENCY_STOP` | 构型必须为 FLIGHT、F446 为期望 FLIGHT 限位且 duty=0、关节锁来源为原始 mode 6 或本次等待阶段的守卫式人工确认、Pixhawk Disarm。进入 `FLIGHT_MANUAL` 还必须先执行一次 `flight authorize`，Pixhawk Lua 返回 ACK 后在 30 秒内把 RadioMaster CH5 从 LOW 切到 HIGH，并通过 ArduPilot 全部正常 PreArm 检查。 |
-| `FLIGHT_MANUAL` | `AUTO_LANDING_READY`, `TOUCHDOWN_VERIFY`, `FLIGHT_TO_WALK_PRECHECK`, `FAULT`, `EMERGENCY_STOP` | 从 `FLIGHT_READY` 进入时必须同时观察到未过期的一次性 Shell 授权、Go2 `JOINT_LOCK` 和 Pixhawk armed。授权进入后立即消费。进入后必须由新鲜 Pixhawk 遥测连续证明 `armed=true` 且 `landed=false` 达 `safety.airborne_confirm_s`（默认 1.0 秒），才锁存本架次的 `AIRBORNE_CONFIRMED` 并启用触地检测；地面等待不会直接进入 `TOUCHDOWN_VERIFY`。飞行中丢失关节锁触发 `GO2_JOINT_LOCK_LOST`，但不会自动 Disarm。`AUTO_LANDING_READY` 当前仅 DRY-RUN。 |
+| `FLIGHT_MANUAL` | `FLIGHT_READY`, `AUTO_LANDING_READY`, `TOUCHDOWN_VERIFY`, `FLIGHT_TO_WALK_PRECHECK`, `FAULT`, `EMERGENCY_STOP` | 从 `FLIGHT_READY` 进入时必须同时观察到未过期的一次性 Shell 授权、Go2 `JOINT_LOCK` 和 Pixhawk armed。授权进入后立即消费。进入后必须由新鲜 Pixhawk 遥测连续证明 `armed=true` 且 `landed=false` 达 `safety.airborne_confirm_s`（默认 1.0 秒），才锁存本架次的 `AIRBORNE_CONFIRMED` 并启用触地检测。锁存前若收到新鲜的 `armed: true -> false` 边沿且 `landed=true`，自动回 `FLIGHT_READY`，必须把 CH5 拉回 LOW 并重新 `flight authorize`；锁存离地后禁用这条回退，避免空中 Disarm 被当成地面重试。地面等待不会直接进入 `TOUCHDOWN_VERIFY`。飞行中丢失关节锁触发 `GO2_JOINT_LOCK_LOST`，但不会自动 Disarm。`AUTO_LANDING_READY` 当前仅 DRY-RUN。 |
 | `AUTO_LANDING_READY` | `AUTO_LANDING`, `FLIGHT_MANUAL`, `FAULT`, `EMERGENCY_STOP` | 当前只允许 DRY-RUN。要求 Pixhawk armed、CH10 为 AUTO_READY/AUTO_EXECUTE、落地估计有效。任何人工接管/中止返回 `FLIGHT_MANUAL`，且停止外部 setpoint。 |
 | `AUTO_LANDING` | `TOUCHDOWN_VERIFY`, `FLIGHT_MANUAL`, `FAULT`, `EMERGENCY_STOP` | 当前只允许 DRY-RUN。要求 CH10=AUTO_EXECUTE、Pixhawk armed 且无 failsafe、RC 新鲜无 failsafe/人工接管、落地估计有效且新鲜、检测到地面、所有数值有限、无活动故障。任一条件丢失立即中止到 `FLIGHT_MANUAL`。 |
 | `TOUCHDOWN_VERIFY` | `MANUAL_POSITIONING`, `FLIGHT_MANUAL`, `LANDING_COMPLIANT`, `FLIGHT_TO_WALK_PRECHECK`, `FAULT`, `EMERGENCY_STOP` | 只有本架次已经锁存 `AIRBORNE_CONFIRMED` 才会自动触发。随后要求 Pixhawk `landed=true`，垂直速度绝对值不大于 0.1 m/s，roll/pitch 绝对值不大于 0.2 rad，ESC RPM 不大于 50，参考高度变化不大于 0.02 m，并连续保持 2.0 秒。可用 `touchdown status` 查看离地锁存、各计时器和判据。RadioMaster Disarm、四 ESC 精确 0 RPM、CH5 LOW、Go2 静止及电流保持通过后，可以选择 `transform walk` 自动回 WALK，也可以用 `motor maintenance enter` 进入落地后人工定位后门。启用落地适应时，自动变形仍等待适应流程；人工后门是显式双重确认的恢复路径。 |
@@ -56,7 +56,7 @@
 
 ## 两把钥匙 Arm 流程
 
-Pixhawk 必需配置：脚本位于 `/APM/scripts/aerogo2_arm_gate.lua`，`SCR_ENABLE=1`、`RC5_OPTION=153`、`ARMING_RUDDER=0`、`ARMING_CHECK=1`、`ARMING_SKIPCHK=0`（若该参数存在），修改后重启。Lua 会在每次授权时再次验证除 `SCR_ENABLE` 外的这些参数，不匹配即拒绝。
+Pixhawk 必需配置：脚本位于 `/APM/scripts/aerogo2_arm_gate.lua`，`SCR_ENABLE=1`、`RC5_OPTION=153`、`ARMING_RUDDER=0`、`ARMING_CHECK=1`、`ARMING_SKIPCHK=0`（若该参数存在）、`DISARM_DELAY=20`，修改后重启。Lua 会在每次授权时再次验证除 `SCR_ENABLE` 外的这些参数，不匹配即拒绝。
 
 1. Pixhawk 脚本启动即让 AuxAuth 失败，未经授权无法通过正常 Arm 检查。
 2. `flight authorize` 在 `FLIGHT_READY` 重新检查四 ESC、Go2、F446、RC、failsafe、构型和活动故障；只有 CH5 LOW 时才发送自定义 MAVLink 授权。

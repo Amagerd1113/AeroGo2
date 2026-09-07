@@ -93,6 +93,7 @@ local function valid_gate_parameters()
         {"RC5_OPTION", 153},
         {"ARMING_RUDDER", 0},
         {"ARMING_CHECK", 1},
+        {"DISARM_DELAY", 20},
     }
     for i = 1, #required do
         local name = required[i][1]

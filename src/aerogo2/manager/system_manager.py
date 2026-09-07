@@ -1778,8 +1778,21 @@ class SystemManager:
 
         previously_armed = self._snapshot.pixhawk.armed
         await self.refresh_snapshot()
-        if previously_armed and not self._snapshot.pixhawk.armed:
+        pixhawk_disarmed = previously_armed and not self._snapshot.pixhawk.armed
+        if pixhawk_disarmed:
             self._emit("PIXHAWK_DISARMED")
+        pre_takeoff_disarm = (
+            self.state is SystemState.FLIGHT_MANUAL
+            and pixhawk_disarmed
+            and self._snapshot.pixhawk.connected
+            and timestamp_is_fresh(
+                self._clock.monotonic(),
+                self._snapshot.pixhawk.heartbeat_timestamp,
+                self.config.safety.pixhawk_timeout_s,
+            )
+            and self._snapshot.pixhawk.landed
+            and not self._airborne_confirmed
+        )
 
         if self._ground_arm_authorized and not self._pixhawk.ground_arm_authorization_active():
             self._ground_arm_authorized = False
@@ -1865,6 +1878,19 @@ class SystemManager:
             if not stop_result.ok:
                 message += f"; supervised stop incomplete: {stop_result.message}"
             await self._fault(escalating[0].code, message, stop_attempted=True)
+            return violations
+
+        if pre_takeoff_disarm and self.state is SystemState.FLIGHT_MANUAL:
+            await self._state_machine.transition_to(
+                SystemState.FLIGHT_READY,
+                reason=(
+                    "Pixhawk disarmed before airborne confirmation; "
+                    "a new ground authorization is required"
+                ),
+                snapshot=self._snapshot,
+            )
+            self._emit("PIXHAWK_PRE_TAKEOFF_DISARMED")
+            await self.refresh_snapshot()
             return violations
 
         if (

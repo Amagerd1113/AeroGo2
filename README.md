@@ -154,7 +154,7 @@ await state_machine.transition_to(
 
 完整状态、所有合法下一状态、每条激活条件和真机/DRY-RUN 边界见
 [`docs/STATE_TRANSITIONS_ZH.md`](docs/STATE_TRANSITIONS_ZH.md)。`FLIGHT_READY -> FLIGHT_MANUAL`
-采用一次性两把钥匙：AeroGo2 Shell `flight authorize` 成功后，30 秒内再由 RadioMaster CH5 LOW->HIGH 请求正常 Arm。进入 `FLIGHT_MANUAL` 后，触地检测仍保持禁用，直到 Pixhawk 新鲜遥测连续 1.0 秒证明 `armed=true` 且 `landed=false`；用 `touchdown status` 查看本架次的离地锁存和触地确认进度。Go2 原始 `mode=6` 或本机实测的 `mode=0,error_code=1002` 都会自动确认关节锁。手机切换 Lock On 的瞬时姿态扰动使用可调的 2.0 秒初始宽限和 0.5 秒持续越界确认滤波；必须重新静止后才进入 `FLIGHT_READY`。若固件两种锁定信号都不回报，仍可在 `GO2_JOINT_LOCK_WAIT` 中使用守卫式 `go2 confirm-lock`。
+采用一次性两把钥匙：AeroGo2 Shell `flight authorize` 成功后，30 秒内再由 RadioMaster CH5 LOW->HIGH 请求正常 Arm。Pixhawk 必须设置 `DISARM_DELAY=20`；Lua 授权门会在每次授权时校验。进入 `FLIGHT_MANUAL` 后，如果还未确认离地、Pixhawk 仍报告 landed 且自动 Disarm，上层会回到 `FLIGHT_READY`，必须先把 CH5 拉回 LOW 再重新执行 `flight authorize`。离地锁存后不会走这条地面回退。触地检测仍保持禁用，直到 Pixhawk 新鲜遥测连续 1.0 秒证明 `armed=true` 且 `landed=false`；用 `touchdown status` 查看本架次的离地锁存和触地确认进度。Go2 原始 `mode=6` 或本机实测的 `mode=0,error_code=1002` 都会自动确认关节锁。手机切换 Lock On 的瞬时姿态扰动使用可调的 2.0 秒初始宽限和 0.5 秒持续越界确认滤波；必须重新静止后才进入 `FLIGHT_READY`。若固件两种锁定信号都不回报，仍可在 `GO2_JOINT_LOCK_WAIT` 中使用守卫式 `go2 confirm-lock`。
 
 0.3.12 允许在确认触地后从 `TOUCHDOWN_VERIFY` 进入受保护的 `MANUAL_POSITIONING`，由操作者手动把 F446 调到 WALK 端点，再通过 `motor endpoint walk` 与 `motor confirm walk` 完成验证。若已经进入腿部柔顺的 `LANDING_COMPLIANT`，系统会先恢复关节锁定，绝不在柔顺姿态下直接移动变形机构。
 
