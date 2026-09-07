@@ -1,0 +1,221 @@
+// AeroGo2 当前工程节点与控制流图
+// 依据：common/enums.py、manager/transition_guards.py、manager/system_manager.py、
+//       bridges/go2_control_arbiter.py、bridges/go2_lowlevel_sdk_bridge.py、
+//       landing/impact_aware/{integration,coordinator,multirate,executor}.py、
+//       safety/safety_monitor.py、hardware/runtime.py。
+//
+// 渲染示例：dot -Tsvg AEROGO2_CURRENT_PROJECT_GRAPH_ZH.dot \
+//                 -o AEROGO2_CURRENT_PROJECT_GRAPH_ZH.svg
+digraph AeroGo2CurrentProject {
+  graph [
+    rankdir=TB,
+    bgcolor="#0f172a",
+    fontname="Microsoft YaHei",
+    fontcolor="#e2e8f0",
+    fontsize=22,
+    label="AeroGo2 当前工程：状态机、控制权与 Impact-aware 多速率控制流",
+    labelloc=t,
+    pad=0.25,
+    nodesep=0.28,
+    ranksep=0.55,
+    compound=true,
+    newrank=true
+  ];
+  node [
+    shape=box,
+    style="rounded,filled",
+    fillcolor="#1e293b",
+    color="#64748b",
+    fontcolor="#f8fafc",
+    fontname="Microsoft YaHei",
+    fontsize=11,
+    margin="0.10,0.07"
+  ];
+  edge [
+    color="#94a3b8",
+    fontcolor="#cbd5e1",
+    fontname="Microsoft YaHei",
+    fontsize=9,
+    arrowsize=0.7
+  ];
+
+  subgraph cluster_runtime {
+    label="A. 运行时与外部设备";
+    color="#334155";
+    style="rounded";
+
+    operator [label="操作员 / CLI\n确认、接管、急停", fillcolor="#334155"];
+    rc [label="RadioMaster / RC\nCH5/CH9/CH10、failsafe"];
+    pixhawk [label="Pixhawk 6X\n姿态/速度/landed/ESC\n飞控原生高速基线环"];
+    f446 [label="F446 折展控制器\n限位、电流、duty\n当前着陆期间保持停止"];
+    go2 [label="Go2 EDU\nSportModeState + LowState\n12 关节执行器"];
+
+    pxbridge [label="MavlinkPixhawkBridge\n只允许既有遥测/受限命令", fillcolor="#172554", color="#3b82f6"];
+    fbridge [label="TextF446Bridge", fillcolor="#172554", color="#3b82f6"];
+    sportbridge [label="UnitreeGo2Bridge\n高层 SportClient", fillcolor="#172554", color="#3b82f6"];
+    lowbridge [label="UnitreeGo2LowLevelSdkBridge\nrt/lowstate + 唯一 rt/lowcmd 写线程\nCRC / 限幅 / TTL / watchdog", fillcolor="#172554", color="#3b82f6"];
+    rcmon [label="RCMonitor", fillcolor="#172554", color="#3b82f6"];
+    manager [label="SystemManager\n唯一业务编排入口", fillcolor="#312e81", color="#818cf8", penwidth=2];
+
+    rc -> rcmon;
+    rcmon -> manager [label="去抖后的请求"];
+    pixhawk -> pxbridge [dir=both];
+    f446 -> fbridge [dir=both];
+    go2 -> sportbridge [dir=both, label="高层"];
+    go2 -> lowbridge [dir=both, label="LowState / LowCmd"];
+    pxbridge -> manager [dir=both];
+    fbridge -> manager [dir=both];
+    sportbridge -> manager [dir=both];
+    lowbridge -> manager [dir=both, label="状态 / ownership"];
+    operator -> manager [label="显式授权"];
+  }
+
+  subgraph cluster_fsm {
+    label="B. SystemState 主状态机（实线为主要正常流程，细线为合法返回/维护流程）";
+    color="#334155";
+    style="rounded";
+
+    boot [label="BOOT_SAFE", fillcolor="#164e63"];
+    manual [label="MANUAL_POSITIONING"];
+    home [label="HOMING_TO_WALK"];
+    walk [label="WALK", fillcolor="#14532d"];
+    wfpre [label="WALK_TO_FLIGHT_PRECHECK"];
+    tf [label="TRANSFORM_TO_FLIGHT"];
+    lockwait [label="GO2_JOINT_LOCK_WAIT"];
+    flightready [label="FLIGHT_READY", fillcolor="#1e3a8a"];
+    flightmanual [label="FLIGHT_MANUAL", fillcolor="#1e3a8a"];
+    already [label="AUTO_LANDING_READY\n仅 DRY-RUN", fillcolor="#713f12", color="#f59e0b"];
+    al [label="AUTO_LANDING\n仅 DRY-RUN", fillcolor="#7c2d12", color="#f97316", penwidth=2];
+    tdverify [label="TOUCHDOWN_VERIFY"];
+    handover [label="GO2_GROUND_HANDOVER\n等待新鲜 JOINT_LOCK"];
+    compliant [label="LANDING_COMPLIANT\n默认关闭，须标定足力"];
+    fwpre [label="FLIGHT_TO_WALK_PRECHECK"];
+    tw [label="TRANSFORM_TO_WALK"];
+    fault [label="FAULT", fillcolor="#7f1d1d", color="#ef4444", penwidth=2];
+    estop [label="EMERGENCY_STOP", fillcolor="#7f1d1d", color="#ef4444", penwidth=2];
+    anyrun [shape=ellipse, label="所有非故障状态\n（汇总边）", fillcolor="#3f3f46"];
+
+    boot -> home -> walk -> wfpre -> tf -> lockwait -> flightready -> flightmanual -> already -> al -> tdverify [penwidth=2];
+    tdverify -> handover -> flightready [penwidth=2, label="LowCmd 落地交还"];
+    tdverify -> fwpre -> tw -> walk [penwidth=2];
+    tdverify -> compliant -> lockwait;
+    boot -> manual;
+    boot -> walk;
+    boot -> lockwait;
+    boot -> flightready;
+    manual -> boot;
+    manual -> walk;
+    manual -> lockwait;
+    manual -> flightready;
+    walk -> manual;
+    walk -> boot;
+    wfpre -> walk [label="预检取消/失败"];
+    flightready -> manual;
+    flightready -> boot;
+    flightready -> fwpre;
+    flightready -> compliant;
+    flightmanual -> fwpre;
+    flightmanual -> tdverify [label="人工着陆确认"];
+    already -> flightmanual [label="取消"];
+    al -> flightmanual [label="人工接管/中止"];
+    tdverify -> manual;
+    tdverify -> flightmanual;
+    tdverify -> compliant;
+    compliant -> manual;
+    compliant -> flightready;
+    fwpre -> flightready [label="预检取消/失败"];
+    anyrun -> fault [color="#ef4444", penwidth=2, label="安全违规 / 入口动作失败"];
+    anyrun -> estop [color="#ef4444", style=dashed, label="非 BOOT 状态的紧急边"];
+    fault -> boot [label="根因清除 + Disarm + ESC=0"];
+    fault -> estop;
+    estop -> fault;
+    estop -> boot;
+  }
+
+  subgraph cluster_authority {
+    label="C. Go2 控制权与唯一 LowCmd 所有者（独立于 SystemState）";
+    color="#334155";
+    style="rounded";
+
+    hl [label="HIGH_LEVEL_JOINT_LOCK\nSportClient / mode=6", fillcolor="#14532d"];
+    acq [label="LOWCMD_ACQUIRING\n地面、Disarm、ESC=0、机械支撑\n本机锁 + 运行时网络排他证明"];
+    hold [label="LOWCMD_SAFE_HOLD\n桥内部 HOLDING/SAFE_HOLD\n同一发送者连续保守持姿", fillcolor="#713f12"];
+    active [label="LOWCMD_ACTIVE\n桥内部 MPC_ACTIVE", fillcolor="#7c2d12"];
+    reacq [label="HIGH_LEVEL_REACQUIRING\n停止写线程 + CheckMode/SelectMode\n等待交还后的新鲜 JOINT_LOCK"];
+    authfault [label="控制权 FAULT\n保持进程驻留，不把状态丢失当作已释放", fillcolor="#7f1d1d", color="#ef4444"];
+    observe [label="OBSERVE_ONLY\n仅订阅 LowState，不创建 publisher", fillcolor="#164e63"];
+    arbiter [label="Go2ControlArbiter\nSportClient 与 LowCmd 互斥\nownership epoch / 跨进程锁", fillcolor="#312e81", color="#818cf8"];
+
+    observe -> hl [style=dotted, label="高层 JOINT_LOCK 已确认"];
+    hl -> acq [label="acquire() / ReleaseMode"];
+    acq -> hold [label="首帧 safe-hold 写入与反馈确认"];
+    hold -> active [label="新鲜、同 epoch 的目标"];
+    active -> hold [label="revoke / TTL / watchdog"];
+    hold -> reacq [label="仅在验证落地后 release()"];
+    reacq -> hl [label="严格晚于交还的新鲜 mode=6"];
+    acq -> authfault [color="#ef4444"];
+    hold -> authfault [color="#ef4444"];
+    active -> authfault [color="#ef4444"];
+    reacq -> authfault [color="#ef4444"];
+    arbiter -> sportbridge [label="Sport lease"];
+    arbiter -> lowbridge [label="唯一 epoch"];
+  }
+
+  subgraph cluster_impact {
+    label="D. Impact-aware 着陆：算法阶段与多速率流水线（目前为参考/仿真实现）";
+    color="#334155";
+    style="rounded";
+
+    ppre [label="PRE_TOUCHDOWN\nAUTO_LANDING 内", fillcolor="#713f12"];
+    ptouch [label="TOUCHDOWN\n接触事件所在周期", fillcolor="#7c2d12"];
+    precover [label="POST_TOUCHDOWN_RECOVERY\n接触保持、恢复与稳定驻留", fillcolor="#14532d"];
+    exitbarrier [label="退出屏障\n恢复证据有效 + residual 持续为零\n停止 setpoint + Go2 safe-hold\n稳定驻留时间满足", fillcolor="#334155"];
+
+    snapshot [label="异步低频状态快照\n状态/接触域/基线版本"];
+    mpc [label="AsyncLatestMPCWorker\nImpactAwareNLP / SLSQP 参考求解器\n一帧求解 + 审计 + generation fence"];
+    mailbox [label="LatestPolicyMailbox\n最新未过期策略\n足端期望力 + 已乘 κ 的旋翼残差"];
+    lowstate [label="高频相干 LowState 快照\n关节、姿态、法向足力、序号/时间戳"];
+    contact [label="FootContactDetector\n触地/脱离迟滞\n变化即失效旧 contact epoch"];
+    adm [label="每腿导纳 → IK → 关节/变化率限幅"];
+    exec [label="ImpactAwareLowCmdExecutor\n校验 epoch / mapping / TTL / ACK"];
+    writer [label="LowCmd 固定周期 owner\nq/dq/Kp/Kd/tau + CRC\n超时转 safe-hold"];
+    fcsink [label="FlightControllerResidualSink\nreserve → stage → ACK → 执行回读\n顺序 [RR,LF,LR,RF]，单位 N"];
+    fcadd [label="飞控高速环\nu_final = u_fc + Δu_applied\n过期/失联：仅 Δu→0，保留基线"];
+    safety [label="LandingSafetySupervisor + SafetyMonitor\nACK/年龄/抖动/owner/关节误差\n力矩/温度/接触/人工接管", fillcolor="#7f1d1d", color="#ef4444"];
+    atom [label="跨 Go2 / 飞控原子提交器\n尚未实现并验证", fillcolor="#7f1d1d", color="#ef4444"];
+    gate [label="真机门禁（当前关闭）\nPHASE_NOT_AVAILABLE\nCOORDINATED_ACTUATION_NOT_CONFIGURED", shape=octagon, fillcolor="#7f1d1d", color="#f87171", penwidth=2];
+    serial [label="ImpactAwareLandingCoordinator\n串行离线参考路径，不是硬件调度器", fillcolor="#3f3f46"];
+
+    ppre -> ptouch [label="确认 touchdown event"];
+    ptouch -> precover [label="持续接触"];
+    precover -> exitbarrier;
+    exitbarrier -> tdverify [label="满足后才离开 AUTO_LANDING", lhead=cluster_fsm];
+
+    snapshot -> mpc -> mailbox;
+    lowstate -> contact -> adm -> exec -> writer -> go2;
+    mailbox -> adm [label="最新足力策略"];
+    mailbox -> fcsink [label="已乘 κ 的 Δu"];
+    fcsink -> fcadd -> pixhawk;
+    contact -> mailbox [label="接触变化：推进域、使旧策略失效", color="#f59e0b"];
+    contact -> fcsink [label="接触变化：先清零 residual", color="#f59e0b"];
+    mpc -> atom [style=dashed];
+    atom -> exec [style=dashed, label="配对提交"];
+    atom -> fcsink [style=dashed, label="同一事务"];
+    safety -> mailbox [color="#ef4444", label="invalidate"];
+    safety -> fcsink [color="#ef4444", label="clear residual"];
+    safety -> writer [color="#ef4444", label="revoke→safe-hold"];
+    safety -> fault [color="#ef4444", label="升级系统故障", lhead=cluster_fsm];
+    serial -> snapshot [style=dotted, label="离线/单周期验证"];
+    atom -> gate [color="#ef4444", style=dashed, label="缺失"];
+    manager -> gate [color="#ef4444", style=dashed, label="HW 自动着陆拒绝"];
+  }
+
+  subgraph cluster_notes {
+    label="图例与实现边界";
+    color="#334155";
+    style="rounded";
+    note1 [shape=note, label="绿色/蓝色：已存在的正常状态或桥接\n橙色：着陆/保守持姿阶段\n红色：故障、门禁或未完成硬件链路"];
+    note2 [shape=note, label="实线：当前代码中的状态边或数据流\n虚线：异常/缺失/硬件禁用路径\n点线：参考、观察或非生产链路"];
+    note3 [shape=note, label="重要：LowCmd 激活后不再要求 SportMode mode=6；\n安全条件改为 owner 健康、LowState 新鲜和跟踪误差有界。"];
+  }
+}

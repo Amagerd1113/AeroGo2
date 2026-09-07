@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
 from pathlib import Path
 from typing import Any, Coroutine, Optional, Set
 
@@ -14,6 +13,7 @@ from aerogo2.cli.completer import AeroGo2Completer
 from aerogo2.cli.dispatcher import CommandDispatcher, DispatchOutcome
 from aerogo2.cli.history import CommandHistory
 from aerogo2.cli.renderer import ConsoleRenderer
+from aerogo2.common.async_utils import await_nonabandonable
 from aerogo2.common.enums import RuntimeMode, SystemState
 
 
@@ -53,6 +53,22 @@ class InteractiveShell:
     def background_task_count(self) -> int:
         return sum(not task.done() for task in self._tasks)
 
+    def request_supervised_shutdown(self, reason: str) -> bool:
+        """Wake the prompt and enter the existing ownership-aware shutdown path.
+
+        This synchronous entry point is intentionally idempotent so a burst of
+        SIGINT/SIGTERM cannot start competing manager shutdown transactions.
+        """
+
+        del reason
+        if self._closed or self._closing:
+            return False
+        self._closing = True
+        run_task = self._run_task
+        if run_task is not None and not run_task.done():
+            run_task.cancel()
+        return True
+
     async def run(self) -> int:
         session = self._ensure_session()
         self._run_task = asyncio.current_task()
@@ -62,54 +78,82 @@ class InteractiveShell:
             self.dispatcher.manager.snapshot,
             logging_enabled=self.dispatcher._event_sink is not None,
         )
-        self._spawn(self._monitor_loop(), "aerogo2-safety-monitor")
+        self._ensure_monitor_task()
         try:
-            while not self._closing:
-                try:
-                    line = await session.prompt_async(
-                        self.renderer.prompt_text(
-                            self.dispatcher.manager.runtime_mode,
-                            self.dispatcher.manager.snapshot,
+            # A rejected close is not an exit. Resume the prompt (and replace
+            # a crashed monitor) until manager.shutdown has positively handed
+            # back every owner. This prevents asyncio.run() from cancelling
+            # supervision while a non-daemon LowCmd writer remains alive.
+            while not self._closed:
+                while not self._closing:
+                    try:
+                        line = await session.prompt_async(
+                            self.renderer.prompt_text(
+                                self.dispatcher.manager.runtime_mode,
+                                self.dispatcher.manager.snapshot,
+                            )
                         )
-                    )
-                except KeyboardInterrupt:
-                    await self.handle_ctrl_c()
-                    continue
-                except asyncio.CancelledError:
-                    self._consume_current_task_cancellation()
-                    if self._closing:
-                        break
-                    await self.handle_ctrl_c()
-                    continue
-                except EOFError:
-                    outcome = await self.dispatcher.dispatch(
-                        "exit",
-                        record_history=False,
-                    )
+                    except KeyboardInterrupt:
+                        await self.handle_ctrl_c()
+                        continue
+                    except asyncio.CancelledError:
+                        self._consume_current_task_cancellation()
+                        if self._closing:
+                            break
+                        await self.handle_ctrl_c()
+                        continue
+                    except EOFError:
+                        outcome = await self.dispatcher.dispatch(
+                            "exit",
+                            record_history=False,
+                        )
+                        if outcome.should_exit:
+                            break
+                        continue
+                    try:
+                        outcome = await self.dispatcher.dispatch(
+                            line,
+                            record_history=False,
+                        )
+                    except KeyboardInterrupt:
+                        await self.handle_ctrl_c()
+                        continue
+                    except asyncio.CancelledError:
+                        self._consume_current_task_cancellation()
+                        if self._closing:
+                            break
+                        await self.handle_ctrl_c()
+                        continue
+                    if outcome.watch_target is not None:
+                        await self._watch(outcome)
                     if outcome.should_exit:
                         break
-                    continue
-                try:
-                    outcome = await self.dispatcher.dispatch(
-                        line,
-                        record_history=False,
-                    )
-                except KeyboardInterrupt:
-                    await self.handle_ctrl_c()
-                    continue
-                except asyncio.CancelledError:
-                    self._consume_current_task_cancellation()
-                    if self._closing:
-                        break
-                    await self.handle_ctrl_c()
-                    continue
-                if outcome.watch_target is not None:
-                    await self._watch(outcome)
-                if outcome.should_exit:
-                    break
+                await self.close()
+                if not self._closed:
+                    await asyncio.sleep(0)
+                    self._ensure_monitor_task()
         finally:
             try:
-                await self.close()
+                # Unexpected prompt/runtime exceptions also may not orphan an
+                # owned writer. Remain resident and retry supervised shutdown;
+                # status loss is treated as pending by manager.shutdown.
+                while not self._closed:
+                    try:
+                        await self.close()
+                        if self._closed:
+                            break
+                        self._ensure_monitor_task()
+                        await asyncio.sleep(1.0 / self.dispatcher.manager.config.system.loop_hz)
+                    except asyncio.CancelledError:
+                        # A second SIGINT/SIGTERM must not escape while the
+                        # sole owner is still pending. Treat every cancellation
+                        # as another shutdown request and keep supervision.
+                        self._consume_current_task_cancellation()
+                    except Exception as exc:
+                        self.renderer.error(
+                            "Shell shutdown raised while ownership may remain: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
             finally:
                 self._run_task = None
         return 0
@@ -150,17 +194,33 @@ class InteractiveShell:
     async def close(self) -> None:
         if self._closed:
             return
+        # Shutdown is the authoritative owner handoff. Do not cancel the
+        # monitor or discard the interactive recovery path first: shutdown can
+        # legitimately be rejected while the sole LowCmd writer must keep a
+        # conservative hold stream alive.
+        shutdown_task = asyncio.ensure_future(self.dispatcher.manager.shutdown())
+        shutdown, cancelled = await await_nonabandonable(shutdown_task)
+        if cancelled:
+            self._consume_current_task_cancellation()
+        low_level = self.dispatcher.manager.snapshot.go2.low_level_status
+        if not shutdown.ok or low_level.ownership_pending:
+            self._closing = False
+            self.renderer.warning(
+                "Shell close inhibited because control ownership was not safely "
+                "handed back: " + shutdown.message
+            )
+            return
         self._closing = True
         current = asyncio.current_task()
-        for task in tuple(self._tasks):
-            if task is not current:
-                task.cancel()
-        for task in tuple(self._tasks):
-            if task is not current:
-                with suppress(asyncio.CancelledError):
-                    await task
+        background = tuple(task for task in self._tasks if task is not current)
+        for task in background:
+            task.cancel()
+        if background:
+            join_task = asyncio.ensure_future(asyncio.gather(*background, return_exceptions=True))
+            _, join_cancelled = await await_nonabandonable(join_task)
+            if join_cancelled:
+                self._consume_current_task_cancellation()
         self._tasks.clear()
-        await self.dispatcher.manager.shutdown()
         self._closed = True
 
     async def _watch(self, outcome: DispatchOutcome) -> None:
@@ -187,7 +247,12 @@ class InteractiveShell:
             return
         uncancel = getattr(task, "uncancel", None)
         if callable(uncancel):
-            uncancel()
+            cancelling = getattr(task, "cancelling", None)
+            if callable(cancelling):
+                while cancelling() > 0:
+                    uncancel()
+            else:
+                uncancel()
 
     async def _monitor_loop(self) -> None:
         interval = 1.0 / self.dispatcher.manager.config.system.loop_hz
@@ -238,6 +303,13 @@ class InteractiveShell:
         task: asyncio.Task[None] = asyncio.create_task(coroutine, name=name)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    def _ensure_monitor_task(self) -> None:
+        if any(
+            not task.done() and task.get_name() == "aerogo2-safety-monitor" for task in self._tasks
+        ):
+            return
+        self._spawn(self._monitor_loop(), "aerogo2-safety-monitor")
 
 
 __all__ = ["InteractiveShell"]

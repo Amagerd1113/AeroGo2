@@ -1,0 +1,96 @@
+{
+  "pass": true,
+  "hardware_output_permitted": false,
+  "model": "NORMAL_ONLY_VERTICAL",
+  "leg_order": [
+    "FR",
+    "FL",
+    "RR",
+    "RL"
+  ],
+  "rotor_order": [
+    "RR",
+    "LF",
+    "LR",
+    "RF"
+  ],
+  "touchdown_com_height_world_m": 0.314805846483303,
+  "foot_lever_arms_from_com_body_m": [
+    [
+      0.1934,
+      -0.14200000000000002,
+      -0.314805846483303
+    ],
+    [
+      0.1934,
+      0.14200000000000002,
+      -0.314805846483303
+    ],
+    [
+      -0.19339999999999996,
+      -0.14200000000000002,
+      -0.314805846483303
+    ],
+    [
+      -0.19339999999999996,
+      0.14200000000000002,
+      -0.314805846483303
+    ]
+  ],
+  "assumptions": {
+    "ground": "horizontal plane in ENU world frame",
+    "touchdown": "simultaneous four-foot contact after one MPC interval",
+    "rotor_force": "quasi-static world-Z force; no PWM/throttle conversion",
+    "contact_force": "desired normal force only; not raw Go2 SDK counts"
+  },
+  "solver": {
+    "success": true,
+    "status": "success",
+    "message": "Optimization terminated successfully; max|eq|=8.88247e-17, min(ineq)=-1.00001e-17, min(bound)=0",
+    "objective": 34.1850023034775,
+    "solve_time_s": 0.32229159999405965,
+    "max_equality_violation": 8.882471875512707e-17,
+    "min_inequality_residual": -1.000007097528427e-17,
+    "min_variable_bound_residual": 0.0
+  },
+  "first_stage": {
+    "rotor_forces_n": [
+      64.00869363747974,
+      64.00869363757897,
+      64.00869363747138,
+      64.00869363747047
+    ],
+    "desired_contact_normal_forces_n": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "normal_impulses_ns": [
+    [
+      1.3017413924150403,
+      1.301741392415172,
+      1.301741207584557,
+      1.301741207585204
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  ]
+}

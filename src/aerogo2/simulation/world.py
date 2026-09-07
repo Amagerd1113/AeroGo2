@@ -13,9 +13,9 @@ from aerogo2.bridges.fake_pixhawk import FakePixhawk
 from aerogo2.bridges.rc_monitor import RCMonitor
 from aerogo2.common.clock import ManualClock
 from aerogo2.common.config import AppConfig
-from aerogo2.common.enums import SystemState
+from aerogo2.common.enums import ImpactLandingPhase, SystemState
 from aerogo2.common.immutable import frozen_mapping
-from aerogo2.common.models import LandingEstimate
+from aerogo2.common.models import ImpactLandingRecoveryEvidence, LandingEstimate
 from aerogo2.common.results import OperationResult
 from aerogo2.landing.safe_descent_controller import SafeDescentController
 from aerogo2.manager.system_manager import SystemManager
@@ -63,6 +63,11 @@ class SimulationWorld:
 
     def _build_components(self) -> None:
         self._landing_estimate = None
+        self._simulated_impact_recovery_complete = False
+        self._simulated_impact_recovery_sequence = 0
+        self._simulated_impact_recovery_session_id: Optional[int] = None
+        self._simulated_impact_clear_ack_timestamp: Optional[float] = None
+        self._simulated_impact_recovery_cached: Optional[ImpactLandingRecoveryEvidence] = None
         self.pixhawk = FakePixhawk(
             clock=self.clock,
             esc_mapping=self.config.esc.slots,
@@ -78,8 +83,85 @@ class SimulationWorld:
             landing_controller=SafeDescentController(self.config),
             clock=self.clock,
             event_logger=self._event_logger,
+            impact_recovery_source=self._impact_recovery_status,
         )
         self._channels = self._safe_channels()
+
+    def inject_impact_recovery_completion(self, completed: bool = True) -> None:
+        """Enable a continuously fresh, explicitly simulation-only attestation."""
+
+        if type(completed) is not bool:
+            raise TypeError("completed must be a bool")
+        if completed:
+            session_id = self.manager.snapshot.impact_landing_session_id
+            if session_id <= 0:
+                raise RuntimeError(
+                    "simulation recovery completion requires an active landing session"
+                )
+            if (
+                not self._simulated_impact_recovery_complete
+                or self._simulated_impact_recovery_session_id != session_id
+            ):
+                self._simulated_impact_clear_ack_timestamp = self.clock.monotonic()
+            self._simulated_impact_recovery_session_id = session_id
+        else:
+            self._simulated_impact_recovery_session_id = None
+            self._simulated_impact_clear_ack_timestamp = None
+        self._simulated_impact_recovery_complete = completed
+        self._simulated_impact_recovery_cached = None
+
+    def _impact_recovery_status(self) -> ImpactLandingRecoveryEvidence:
+        if not self._simulated_impact_recovery_complete:
+            return ImpactLandingRecoveryEvidence()
+        now = self.clock.monotonic()
+        session_id = self.manager.snapshot.impact_landing_session_id
+        if session_id != self._simulated_impact_recovery_session_id:
+            self._simulated_impact_recovery_complete = False
+            self._simulated_impact_recovery_cached = None
+            return ImpactLandingRecoveryEvidence()
+        owner_epoch = self.manager.snapshot.go2.low_level_status.owner_epoch
+        clear_ack_timestamp = self._simulated_impact_clear_ack_timestamp
+        if clear_ack_timestamp is None:
+            return ImpactLandingRecoveryEvidence()
+        cached = self._simulated_impact_recovery_cached
+        if (
+            cached is not None
+            and cached.timestamp == now
+            and cached.landing_session_id == session_id
+            and cached.go2_ownership_epoch == owner_epoch
+        ):
+            return cached
+        self._simulated_impact_recovery_sequence += 1
+        evidence = ImpactLandingRecoveryEvidence(
+            timestamp=now,
+            valid_until=now + self.config.safety.impact_recovery_status_max_age_s,
+            landing_session_id=session_id,
+            sequence=self._simulated_impact_recovery_sequence,
+            phase=ImpactLandingPhase.POST_TOUCHDOWN_RECOVERY,
+            healthy=True,
+            controller_quiesced=True,
+            recovery_complete=True,
+            load_transfer_complete=True,
+            body_state_stable=True,
+            contacts=(True, True, True, True),
+            admittance_blends=(1.0, 1.0, 1.0, 1.0),
+            go2_ownership_epoch=owner_epoch,
+            contact_epoch=1,
+            residual_zero_acknowledged=True,
+            residual_zero_ack_timestamp=clear_ack_timestamp,
+            residual_zero_execution_timestamp=clear_ack_timestamp,
+            residual_zero_status_timestamp=now,
+            fc_session_id=1,
+            fc_control_epoch=1,
+            fc_transport_generation=1,
+            last_residual_command_sequence=0,
+            clear_through_command_sequence=0,
+            residual_register_inactive=True,
+            baseline_controller_retained=True,
+            reason="SIMULATION_ONLY synthetic recovery/FC-clear attestation",
+        )
+        self._simulated_impact_recovery_cached = evidence
+        return evidence
 
     async def start(self) -> OperationResult:
         if self._scenario_busy_for_caller():
@@ -95,6 +177,14 @@ class SimulationWorld:
         await self.manager.start()
         self._feed_rc(debounce=True)
         result = await self.manager.connect_all()
+        if result.ok:
+            # FakePixhawk deliberately keeps its four MAVLink source clocks
+            # independent.  A newly connected deterministic world nevertheless
+            # has one complete simulated telemetry observation; publish it
+            # explicitly so an immediate safe shutdown does not rely on a
+            # heartbeat to refresh the landed-state source implicitly.
+            self.pixhawk.inject_telemetry_cycle()
+            await self.manager.refresh_snapshot()
         self._started = result.ok
         return result
 
@@ -364,7 +454,17 @@ class SimulationWorld:
                 reason="simulated ground contact",
             )
         )
-        iterations = int(self.config.safety.touchdown_confirm_s / 0.05) + 2
+        self.inject_impact_recovery_completion()
+        iterations = (
+            int(
+                (
+                    self.config.safety.touchdown_confirm_s
+                    + self.config.safety.post_touchdown_stable_confirm_s
+                )
+                / 0.05
+            )
+            + 4
+        )
         for _ in range(iterations):
             await self.step(0.05)
             if self.manager.state is SystemState.TOUCHDOWN_VERIFY:
@@ -588,7 +688,7 @@ class SimulationWorld:
 
     def _heartbeat_all(self) -> None:
         if self.pixhawk.get_status().connected:
-            self.pixhawk.inject_heartbeat()
+            self.pixhawk.inject_telemetry_cycle()
         if self.f446.get_status().connected:
             self.f446.inject_status()
         if self.go2.get_status().connected:
@@ -597,7 +697,7 @@ class SimulationWorld:
 
     def _heartbeat_except(self, excluded: str) -> None:
         if excluded != "pixhawk" and self.pixhawk.get_status().connected:
-            self.pixhawk.inject_heartbeat()
+            self.pixhawk.inject_telemetry_cycle()
         if excluded != "f446" and self.f446.get_status().connected:
             self.f446.inject_status()
         if excluded != "go2" and self.go2.get_status().connected:

@@ -11,7 +11,7 @@ from typing import Iterable, Iterator, List, Optional, Tuple
 from prompt_toolkit.history import DummyHistory, History
 
 
-class CommandHistory(History):
+class CommandHistory(History):  # type: ignore[misc]
     """A small JSON-lines prompt-toolkit history.
 
     Only normal command lines should be sent to this class.  ConfirmationService

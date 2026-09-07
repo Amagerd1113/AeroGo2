@@ -168,6 +168,7 @@ class FakePixhawk:
     def inject_status(self, **changes: object) -> PixhawkStatus:
         """Replace telemetry fields and keep public/compatibility views coherent."""
 
+        supplied_fields = frozenset(changes)
         if "rc_failsafe" in changes and "failsafe" not in changes:
             changes["failsafe"] = changes["rc_failsafe"]
         if "attitude_rpy" in changes:
@@ -183,6 +184,21 @@ class FakePixhawk:
             changes["relative_altitude_m"] = -local_position[2]
 
         now = self._clock.monotonic()
+        if supplied_fields.intersection(
+            {"attitude_rpy", "roll_rad", "pitch_rad", "yaw_rad", "angular_velocity"}
+        ):
+            changes.setdefault("attitude_timestamp", now)
+        if supplied_fields.intersection(
+            {
+                "local_position",
+                "local_velocity",
+                "relative_altitude_m",
+                "vertical_velocity_mps",
+            }
+        ):
+            changes.setdefault("kinematics_timestamp", now)
+        if "landed" in supplied_fields:
+            changes.setdefault("landed_state_timestamp", now)
         if "esc_rpm" in changes or "esc_online" in changes:
             rpm_by_slot = cast(
                 Mapping[int, float],
@@ -205,7 +221,16 @@ class FakePixhawk:
                 )
                 for item in source_esc
             )
-        changes.setdefault("heartbeat_timestamp", now)
+        heartbeat_fields = {
+            "heartbeat_timestamp",
+            "connected",
+            "armed",
+            "flight_mode",
+            "failsafe",
+            "rc_failsafe",
+        }
+        if not supplied_fields or supplied_fields.intersection(heartbeat_fields):
+            changes.setdefault("heartbeat_timestamp", now)
         status = replace(self._status, **changes)  # type: ignore[arg-type]
         self._status = replace(
             status,
@@ -281,6 +306,17 @@ class FakePixhawk:
 
     def inject_heartbeat(self) -> PixhawkStatus:
         return self.inject_status()
+
+    def inject_telemetry_cycle(self) -> PixhawkStatus:
+        """Refresh all independently timed touchdown sources in simulation."""
+
+        now = self._clock.monotonic()
+        return self.inject_status(
+            heartbeat_timestamp=now,
+            attitude_timestamp=now,
+            kinematics_timestamp=now,
+            landed_state_timestamp=now,
+        )
 
     def clear_history(self) -> None:
         self._setpoint_history.clear()

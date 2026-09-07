@@ -1,0 +1,131 @@
+{
+  "checks": {
+    "config_load": {
+      "pass": true
+    },
+    "contact_detection_and_admittance_execution": {
+      "contacts_confirmed": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "joint_and_admittance_outputs_finite": true,
+      "pass": true,
+      "stance_blend_eta": 1.0,
+      "stance_force_equation_error_n": 0.0,
+      "touchdown_blend_eta": 0.0,
+      "touchdown_events": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "touchdown_force_equation_error_n": 0.0
+    },
+    "impact_momentum_reset_and_sticking": {
+      "angular_momentum_error_norm_nms": 0.0,
+      "linear_momentum_error_norm_ns": 0.0,
+      "minimum_impulse_constraint_margin": 0.0,
+      "normal_impulse_ns": 6.0,
+      "pass": true,
+      "postimpact_sticking_velocity_norm_m_per_s": 0.0,
+      "synthetic_preimpact_vertical_velocity_m_per_s": -0.6,
+      "tolerance": 1e-05
+    },
+    "nlp_slsqp": {
+      "horizon_steps": 4,
+      "iterations": 1,
+      "max_equality_violation": 1.8291115289059682e-17,
+      "message": "Optimization terminated successfully; max|eq|=1.82911e-17, min(ineq)=1",
+      "min_inequality_residual": 1.0,
+      "objective": 6.941313743933604e-29,
+      "pass": true,
+      "solve_time_s": 0.9698491999879479,
+      "status": "success"
+    },
+    "parameter_validation": {
+      "pass": true
+    },
+    "rotor_residual_gain_endpoints": {
+      "gain_one_applied": 0.9999999999999997,
+      "gain_one_command_error_norm_n": 0.0,
+      "gain_one_transport_target_error_norm_n": 0.0,
+      "gain_zero_applied": 0.0,
+      "gain_zero_command_error_norm_n": 0.0,
+      "gain_zero_transport_target_defined": false,
+      "pass": true,
+      "ramp_duration_s": 4.0,
+      "raw_residual_correction_n": [
+        10.0,
+        10.0,
+        10.0,
+        10.0
+      ],
+      "tolerance": 1e-05
+    },
+    "static_hover_allocation_and_dynamics": {
+      "metrics": {
+        "angular_acceleration_norm_rad_per_s2": 6.670794953451861e-15,
+        "hover_thrusts_n": [
+          24.516625,
+          24.51662499999999,
+          24.516624999999987,
+          24.51662499999999
+        ],
+        "linear_acceleration_norm_m_per_s2": 3.552713678800501e-15,
+        "minimum_rotor_constraint_margin": 15.483374999999999,
+        "reaction_torques_nm": [
+          0.24516624999999995,
+          0.2451662499999999,
+          -0.2451662499999998,
+          -0.2451662499999999
+        ],
+        "thrust_law_error_norm_n": 7.105427357601002e-15,
+        "thrust_rate_norm_n_per_s": 0.0,
+        "wrench_error_norm": 2.865479443111888e-14
+      },
+      "pass": true,
+      "tolerance": 1e-05
+    },
+    "strict_configuration_assembly": {
+      "pass": true
+    },
+    "synthetic_profile_safety": {
+      "failures": [],
+      "pass": true,
+      "values": {
+        "allow_hardware_output": false,
+        "parameters_identified": false,
+        "physical_use_prohibited": true,
+        "profile": "synthetic_demo",
+        "schema_version": 3,
+        "world_frame": "ENU_Z_UP"
+      }
+    },
+    "touchdown_nlp_slsqp": {
+      "iterations": 1,
+      "max_equality_violation": 0.0,
+      "message": "Optimization terminated successfully; max|eq|=0, min(ineq)=2.1",
+      "min_inequality_residual": 2.100000000000001,
+      "pass": true,
+      "postimpact_sticking_velocity_norm_m_per_s": 0.0,
+      "preimpact_vertical_velocity_m_per_s": -0.3,
+      "solve_time_s": 0.13702640001429245,
+      "solved_touchdown_impulse_ns": [
+        0.0,
+        0.0,
+        3.0000000000000018
+      ],
+      "status": "success"
+    }
+  },
+  "config_path": "E:\\Codes\\AeroGo2_ImpactAware_Merged\\configs\\impact_aware_mpc_demo.yaml",
+  "disclaimer": "Synthetic offline software verification only. This report is not a reproduction of the paper experiments, does not validate identified AeroGo2 parameters, and must not be used as evidence of hardware safety or physical performance.",
+  "hardware_output_permitted": false,
+  "overall_pass": true,
+  "paper_experiment_reproduction": false,
+  "report_type": "aerogo2_impact_aware_mpc_synthetic_dry_run",
+  "schema_version": 1,
+  "synthetic": true
+}

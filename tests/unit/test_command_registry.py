@@ -72,6 +72,9 @@ flight revoke
 flight status
 go2 confirm-lock
 go2 controller
+go2 lowcmd acquire
+go2 lowcmd release
+go2 lowcmd status
 go2 motion
 go2 status
 health

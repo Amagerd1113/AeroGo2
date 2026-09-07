@@ -38,6 +38,59 @@ go2:
   landing_contact_confirm_s: 0.5
   landing_compliance_settle_s: 1.5
 
+  # Sole rt/lowcmd owner. Its write tier intentionally remains unusable until
+  # the exact robot has been identified on a props-removed/hanging test fixture.
+  # Enabling LowCmd while any write-side value is null is rejected.
+  low_level:
+    # Read-only LowState observation has a separate gate. It requires only the
+    # topic/age and verified coordinate mapping; it never creates rt/lowcmd.
+    observe_only_enabled: false
+    # This switch is the independently gated LowCmd write/ownership path.
+    enabled: false
+    low_state_topic: null
+    low_command_topic: null
+    send_period_s: null
+    maximum_jitter_s: null
+    low_state_max_age_s: null
+    target_ttl_s: null
+    acquire_timeout_s: null
+    release_timeout_s: null
+    safe_hold_policy: null
+    safe_hold_pose_rad: null
+    safe_hold_position_tolerance_rad: null
+    safe_hold_velocity_tolerance_rad_s: null
+    # Per-joint limit for a causally paired LowCmd-write/LowState tracking
+    # sample. This is distinct from both delta-q and safe-hold tolerances.
+    tracking_position_error_limit_rad: null
+    safe_hold_ack_timeout_s: null
+    restore_mode_form: null
+    restore_mode_name: null
+    mapping_version: null
+    mapping_hash: null
+    joint_names: null
+    motor_ids: null
+    directions: null
+    zero_offsets_rad: null
+    q_min_rad: null
+    q_max_rad: null
+    dq_max_rad_s: null
+    maximum_delta_q_rad: null
+    kp: null
+    kd: null
+    tau_ff_nm: null
+    tau_limit_nm: null
+    # Commission these separately for missing/stale/non-finite q/dq. They do
+    # not use an instantaneous software PD envelope because feedback is absent.
+    feedback_loss_degraded_kp: null
+    feedback_loss_degraded_kd: null
+    feedback_loss_degraded_tau_ff_nm: null
+    # Hardware enable is rejected unless the per-joint lower-layer clamp has
+    # been measured on this exact robot/firmware and this flag is exactly true.
+    firmware_torque_limit_nm: null
+    firmware_torque_clamp_verified: null
+    # Detection threshold only; not an independent thermal cutoff.
+    temperature_limit_c: null
+
 esc:
   # Hobbywing NodeID/ThrottleID/output order validated by pixhawk_x8_cli_diag.py:
   # 1=rear-right, 2=left-front, 3=left-rear, 4=right-front.
@@ -47,4 +100,3 @@ esc:
   slot_2: "LF"
   slot_3: "LR"
   slot_4: "RF"
-

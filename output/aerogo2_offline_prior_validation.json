@@ -1,0 +1,71 @@
+{
+  "pass": true,
+  "hardware_output_permitted": false,
+  "profile": "aerogo2_provisional_offline_hybrid",
+  "mass_kg": 26.087,
+  "inertia_body_kg_m2": [
+    [
+      1.960517510297,
+      0.00012166,
+      -0.021263416909
+    ],
+    [
+      0.00012166,
+      2.296378784538,
+      -3.12e-05
+    ],
+    [
+      -0.021263416909,
+      -3.12e-05,
+      3.741901685208
+    ]
+  ],
+  "lever_arms_from_com_body_m": [
+    [
+      -0.470226009,
+      -0.470226009,
+      0.0672
+    ],
+    [
+      0.470226009,
+      0.470226009,
+      0.0672
+    ],
+    [
+      -0.470226009,
+      0.470226009,
+      0.0672
+    ],
+    [
+      0.470226009,
+      -0.470226009,
+      0.0672
+    ]
+  ],
+  "level_hover_thrust_per_rotor_n": 63.956519637499994,
+  "offline_rotor_thrust_ceiling_n": 147.1585899,
+  "rotor_thrust_ceiling_source": "minimum 100%-throttle endpoint of reviewed X8 G2 12S/14S static tables; offline feasibility only",
+  "physical_prior_fields": [
+    "mass.total_nominal_kg",
+    "offline_inertia_estimate.nominal_body_kg_m2",
+    "geometry.lever_arms_from_com_body_m",
+    "geometry.thrust_directions_body",
+    "model.gravity_m_per_s2"
+  ],
+  "numerical_only_fields": [
+    "rotor.aerodynamics and spin directions",
+    "rotor actuator time constants and thrust-rate limits",
+    "contact/impact force limits and detector thresholds",
+    "MPC horizon, weights, bounds and solver settings",
+    "admittance gains, workspaces and joint limits"
+  ],
+  "solver": {
+    "success": true,
+    "status": "success",
+    "message": "Optimization terminated successfully; max|eq|=1.11704e-16, min(ineq)=1",
+    "iterations": 1,
+    "solve_time_s": 0.7969987000105903,
+    "max_equality_violation": 1.1170411867161872e-16,
+    "min_inequality_residual": 1.0
+  }
+}

@@ -17,3 +17,7 @@ f446:
 go2:
   network_interface: "eth0"
   domain_id: 0
+  # Hardware overlay must not unlock LowCmd. Populate and validate all values
+  # in a reviewed site-specific overlay before changing this switch.
+  low_level:
+    enabled: false

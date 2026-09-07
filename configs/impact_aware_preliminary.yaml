@@ -1,0 +1,243 @@
+# 初步离线模型专用，绝不是实机控制配置。
+#
+# 本文件是质量、CAD、惯量、CoM、固定展开旋翼几何和初步执行器先验的唯一编辑入口。
+# 后续测量参数时只修改这里，不要在 Python、system.yaml 或文档中复制一份数值。
+# 读取时必须显式传 allow_provisional=True；无论怎样修改本文件，for_hardware=True 都会失败。
+
+schema_version: 4
+profile: provisional_offline
+parameters_identified: false
+physical_use_prohibited: true
+allow_hardware_output: false
+
+frames:
+  world: ENU_Z_UP
+  body: X_FORWARD_Y_LEFT_Z_UP
+  rotor_order: [RR, LF, LR, RF]
+
+model:
+  # 第一阶段只保留 CoM 竖直运动和标量法向冲量；不包含摩擦锥、切向力/冲量、
+  # 三维冲击峰值或姿态冲击重置。
+  contact_model: NORMAL_ONLY_VERTICAL
+  gravity_m_per_s2: 9.80665
+  # 刚体动力学的位置/速度必须属于整机总质心 C；Go2 腿 FK/IK 必须以 B 为根。
+  # B 与 C 不重合，禁止再把一个含糊的 body position 同时喂给两条路径。
+  dynamics_reference_point: TOTAL_SYSTEM_COM_C
+  leg_kinematics_reference_point: GO2_BODY_ORIGIN_B
+
+mass:
+  # 2026-09-04 暂定值。以后应在电池、桨、线束和载荷全部装好后称量整机，并填写不确定度。
+  go2_nominal_kg: 16.087
+  added_system_nominal_kg: 10.0
+  total_nominal_kg: 26.087
+  total_uncertainty_kg: null
+
+go2_urdf:
+  # Unitree 官方 unitree_ros/go2_description。文件固定在本目录，并在每次加载时校验哈希；
+  # 程序不会运行时联网读取 master。16.087 kg 是 URDF 模型值，不是真机称重结果。
+  source_repository: https://github.com/unitreerobotics/unitree_ros
+  source_file_commit: a3b70cae6fd4a82c0e1ece633d5c6f97e88c9d76
+  model_quality: URDF_MODEL_ESTIMATE
+  upstream_raw_sha256: sha256:7d19fe48e2e689ee1a032ab99f2a4a8b671d87e73de48d3e65811682a5b48b9e
+  # 随工程文件只比上游原始文件多一个末尾换行，因此本地哈希与 upstream_raw_sha256 不同。
+  bundled_path: go2_description.unitree_ros.urdf
+  bundled_sha256: sha256:8f4571b49f35ce04b8833d561c403bddeb9cd8f7077e2ddbee82895726de487c
+  license_path: UNITREE_ROS_LICENSE.txt
+  expected_robot_name: go2_description
+  root_link: base
+
+  # 暂把用户定义的 B 与 URDF base 原点重合，便于离线计算。
+  # 【待修改】若 B 是机身上表面而非 URDF base，实测 p_U^B；几何粗估可为 [0,0,-0.057] m。
+  urdf_root_from_body_origin_B_m: [0.0, 0.0, 0.0]
+  body_origin_B_alignment_identified: false
+
+  # Unitree 官方 MuJoCo home 站姿；只作离线估计。真机 safe-hold 必须捕获 LowState 当前角度。
+  reference_pose: UNITREE_MUJOCO_HOME_ESTIMATE
+  # SDK motor 顺序固定为 FR, FL, RR, RL，每腿 hip, thigh, calf。
+  sdk_joint_order:
+    - FR_hip_joint
+    - FR_thigh_joint
+    - FR_calf_joint
+    - FL_hip_joint
+    - FL_thigh_joint
+    - FL_calf_joint
+    - RR_hip_joint
+    - RR_thigh_joint
+    - RR_calf_joint
+    - RL_hip_joint
+    - RL_thigh_joint
+    - RL_calf_joint
+  sdk_joint_positions_rad:
+    - 0.0
+    - 0.9
+    - -1.8
+    - 0.0
+    - 0.9
+    - -1.8
+    - 0.0
+    - 0.9
+    - -1.8
+    - 0.0
+    - 0.9
+    - -1.8
+
+cad_source:
+  # 当前附件的身份记录。该 AP203 文件有装配几何，但没有材料密度、质量或惯量属性；
+  # OpenCascade 检查还发现整体 B-rep 非完全有效，因此不能把几何积分值写入控制器。
+  file_name: 碳管铝件板总装打开.STEP
+  sha256: sha256:824d1a45ee9e136b392aa6bc1c66bec69d052c8e4b7a662a34e8685dc3f43d9a
+  file_size_bytes: 341022183
+  step_schema: STEP_AP203_CONFIG_CONTROL_DESIGN
+  length_unit: MILLIMETRE
+  brep_validation_passed: false
+  material_density_properties_present: false
+  mass_inertia_properties_present: false
+  complete_system_scope_verified: false
+
+inertia:
+  # 不要虚构对角惯量。必须在完整 CAD/BOM、明确的 12 关节角、电池和载荷构型下，
+  # 把名义惯量与逐元素绝对不确定度一起填写；两者只填一个会被拒绝。
+  method: COMPLETE_CAD_BOM_PARALLEL_AXIS
+  nominal_body_kg_m2: null
+  uncertainty_body_kg_m2: null
+  cad_bom_revision: null
+  # “标准站姿”目前只是临时名称，后续仍需给出可复现的 12 关节角及关节顺序。
+  reference_pose: UNITREE_GO2_STANDARD_STANDING_POSE_PROVISIONAL
+
+offline_inertia_estimate:
+  # 可让离线 MPC/仿真获得有限数值，但绝不能替代完整 CAD/BOM 或真机辨识。
+  # 为使用户暂定的整机 C=[0,0,0.050] m 与各分量质量满足一阶矩平衡，
+  # 剩余 5.62 kg（机架、电池、飞控、安装件和线束的合并等效质量）必须具有下面的等效质心。
+  # 注意：这不等于“旋翼机架本体质心 O”；机架本体仍简化在 O，但其质量尚未从 5.62 kg 中拆出。
+  # 若强行把全部 5.62 kg 放在 O，复算得到整机 z_C 约 29.77 mm，而不是用户暂定的 50 mm。
+  # 下界：剩余质量集中于该一阶矩平衡质心；上界：保持同一质心并在 xy 平面按 0.665 m
+  # 半径对称分布；名义值取上下界中点。区间不是统计置信区间，真实交叉项仍未辨识。
+  method: GO2_URDF_HOME_PLUS_X8_AND_BALANCED_REMAINDER_INTERVAL_V2
+  quality: PROVISIONAL_OFFLINE_ONLY
+  reference_point: TOTAL_SYSTEM_COM_C
+  x8_system_mass_each_kg: 1.095
+  x8_count: 4
+  remaining_added_mass_kg: 5.62
+  # 【待修改】该值由当前 B↔URDF base 暂定重合、URDF Go2 CoM、C/B、X8 位置及各质量反算。
+  # 改动上述任一项后都必须同步重新计算；加载器会以 1e-9 kg·m 容差拒绝不闭合配置。
+  remaining_added_mass_effective_com_from_body_origin_B_m: [0.004847170654, 0.0, 0.191098213990]
+  remaining_mass_distribution_interval: LOWER_AT_FIRST_MOMENT_BALANCE_COM_UPPER_PLANAR_RADIUS_ABOUT_SAME_COM
+  nominal_body_kg_m2:
+    - [1.960517510297, 0.000121660000, -0.021263416909]
+    - [0.000121660000, 2.296378784538, -0.000031200000]
+    - [-0.021263416909, -0.000031200000, 3.741901685208]
+  diagonal_lower_body_kg_m2: [1.339191385297, 1.675052659538, 2.499249435208]
+  diagonal_upper_body_kg_m2: [2.581843635297, 2.917704909538, 4.984553935208]
+  cross_terms_unbounded: true
+  hardware_use_prohibited: true
+
+geometry:
+  # 所有向量均以机体系 x前/y左/z上表达。定义：B 为 Go2 机身/狗背参考点，
+  # O 为机架旋转中心，C 为整机总质心。当前三点在同一 z 轴。
+  body_origin_B_definition: GO2_DORSAL_BODY_REFERENCE_B_PROVISIONAL
+  frame_center_O_from_body_origin_B_m: [0.0, 0.0, 0.0972]
+  total_com_C_from_body_origin_B_m: [0.0, 0.0, 0.0500]
+  # 第一阶段把“旋翼机架本体”的质心简化在 O；这不表示全部 10 kg 附加系统都集中于 O。
+  rotor_frame_com_from_body_origin_B_m: [0.0, 0.0, 0.0972]
+  # 四个电机推力轴中心所在平面比 O 高 20 mm。
+  rotor_plane_from_frame_center_O_m: [0.0, 0.0, 0.0200]
+  frame_offsets_identified: false
+  # p_C^B - p_O^B = 0.0500 - 0.0972 = -0.0472 m。
+  total_com_from_frame_center_body_m: [0.0, 0.0, -0.0472]
+
+  # 展开状态下，机架中心到旋翼轴的水平投影半径为 0.665 m；
+  # 旋翼平面相对整机 CoM 的高度为 0.0972 + 0.0200 - 0.0500 = +0.0672 m。
+  # 控制循环直接使用下面四个固定力臂，
+  # 不在线计算折展位置或力臂。
+  horizontal_radius_from_frame_center_m: 0.665
+  rotor_plane_z_from_com_m: 0.0672
+  horizontal_origin_assumption: FRAME_CENTER_XY_EQUALS_TOTAL_COM_XY_PROVISIONAL
+  azimuth_assumption: SYMMETRIC_EQUAL_SPACING_PROVISIONAL
+
+  # 方位角：从机体 +x（前方）开始，俯视沿绕 +z 逆时针为正。
+  # 几何起始臂为 45°，相邻臂间隔 90°。按周向顺序是 LF、LR、RR、RF；
+  # 这与控制数组 [RR, LF, LR, RF] 的顺序不同，不能据此改动电机通道映射。
+  azimuth_reference: BODY_POSITIVE_X_CCW_ABOUT_BODY_POSITIVE_Z
+  geometric_sequence_start_azimuth_deg: 45.0
+  adjacent_arm_spacing_deg: 90.0
+  geometric_sequence_rotor_order: [LF, LR, RR, RF]
+  # 用户定义的“第一个旋翼”是 x>0、y>0 象限，对应 LF。
+  first_rotor_positive_xy_label: LF
+
+  # a = 0.665/sqrt(2) = 0.470226009... m；顺序固定为 [RR, LF, LR, RF]。
+  lever_arms_from_com_body_m:
+    - [-0.470226009, -0.470226009, 0.0672] # RR
+    - [0.470226009, 0.470226009, 0.0672]   # LF
+    - [-0.470226009, 0.470226009, 0.0672]  # LR
+    - [0.470226009, -0.470226009, 0.0672]  # RF
+  thrust_directions_body:
+    - [0.0, 0.0, 1.0]
+    - [0.0, 0.0, 1.0]
+    - [0.0, 0.0, 1.0]
+    - [0.0, 0.0, 1.0]
+  # “第一阶段不考虑位置误差”不等于误差为零。保持 null 表示尚未测量，
+  # 当前确定性离线模型不传播该误差，也不会把几何误认为已完成标定。
+  lever_arm_uncertainty_m: null
+
+rotor_prior:
+  motor_system_model: X8 G2
+  # 两套电池电气上相互独立，但旋翼电池电压会改变可用推力和 headroom；
+  # 这里只用于选择厂家离线曲线，不参与当前一维控制。确认实物后再填 12 或 14。
+  battery_series_cells: null
+  # 若飞控以后提供经验证的 N 单位接口，上层不必保存油门曲线；实际桨型号仍需作为
+  # 构型身份和质量/惯量记录。第一阶段可保持 null。
+  installed_propeller_model: null
+  # 下列曲线仅为厂家静态台架先验：X8 G2 + MFP 30x11S、25°C、海平面；
+  # 12S 对应报告 46 V，14S 对应 54 V，不能直接生成实机指令。
+  manufacturer_curve_ids:
+    - X8_G2_12S_46V_MFP_30X11S_25C_SEA_LEVEL
+    - X8_G2_14S_54V_MFP_30X11S_25C_SEA_LEVEL
+  manufacturer_input_semantics: ESC_REPORT_THROTTLE_PERCENT_STATIC_BENCH_ONLY
+  # 厂家 throttle% 既不是 Pixhawk 归一化量也不是 PWM；表中推力不能证明实机瞬时推力。
+  throttle_percent_is_pixhawk_normalized: false
+  throttle_percent_is_pwm: false
+  curve_output_is_installed_executed_thrust: false
+  curve_output_may_be_used_as_hardware_command: false
+
+flight_controller:
+  hardware: PIXHAWK_6X
+  # 油门/PWM/RPM→推力可以由飞控内部负责，但主机必须核对固件身份、坐标系、
+  # 电机映射和 residual 能力。仅知道板卡是 Pixhawk 6X 不足以证明接口语义。
+  firmware_stack: null
+  # 【待同伴确认】以下参数不能由 Pixhawk 6X 板卡型号推导；影响状态/力矩坐标变换。
+  firmware_version: null
+  airframe_type: null
+  mount_orientation: null
+  output_coordinate_frame: null
+  quaternion_order: null
+  imu_from_total_com_body_m: null
+  # 当前没有真实 residual 执行端；这些字段不能通过修改 YAML 变成 true。
+  per_sample_execution_ack: false
+  same_tick_baseline: false
+  residual_ttl: false
+  newton_interface: false
+
+contact:
+  # Unitree 公共字段是 int16 标量。未标定时只能在确认源、脚序、符号和阈值后用于
+  # 滞回接触事件，不能当作 N，也不能构造三维足端力。
+  measurement_semantics: UNCALIBRATED_CONTACT_EVENT_ONLY
+  lowstate_source: null
+  detector_config_version: null
+  detector_config_hash: null
+  mapping_version: null
+  mapping_hash: null
+  algorithm_leg_order: null
+  sdk_indices_by_leg: null
+  signs_by_algorithm_leg: null
+  contact_on_threshold_sdk_counts: null
+  contact_off_threshold_sdk_counts: null
+  filter_time_constant_s: null
+  contact_confirm_s: null
+  release_confirm_s: null
+  maximum_sample_gap_s: null
+  maximum_feedback_age_s: null
+  minimum_consecutive_samples: null
+  maximum_source_tick_jump: null
+  normal_force_input_available: false
+  tangential_force_input_available: false
+  sdk_values_may_be_used_as_newtons: false
