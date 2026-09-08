@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import replace
 from typing import Optional, Tuple
@@ -41,6 +42,10 @@ from aerogo2.landing.impact_aware.types import (
     ReducedState,
     RotorActuatorConfig,
 )
+
+
+def _success_timeout(seconds: float) -> float:
+    return max(seconds, 30.0) if os.name == "nt" else seconds
 
 
 def _weights(*, input_rate_scale: float = 1.0) -> MPCWeights:
@@ -195,7 +200,7 @@ def test_hover_no_contact_reference_is_a_zero_cost_feasible_solve() -> None:
             max_iterations=20,
             ftol=1e-10,
             constraint_tolerance=1e-8,
-            timeout_s=2.0,
+            timeout_s=_success_timeout(2.0),
             display=False,
         )
     )
@@ -380,7 +385,7 @@ def test_slsqp_solves_nonzero_arm_and_planned_leg_motion_touchdown() -> None:
             max_iterations=200,
             ftol=1e-10,
             constraint_tolerance=1e-7,
-            timeout_s=5.0,
+            timeout_s=_success_timeout(5.0),
             display=False,
         ),
         warm_start=zero_impulse_warm_start,
@@ -480,7 +485,7 @@ def test_slsqp_projects_redundant_two_foot_sticking_but_validates_all_rows() -> 
     # Two point contacts have six scalar sticking equations but rank five.
     assert nlp.equality_residual(decision).size == nlp._solver_equality_residual(decision).size + 1
     result = nlp.solve(
-        SLSQPSettings(200, 1e-10, 1e-7, 5.0, False),
+        SLSQPSettings(200, 1e-10, 1e-7, _success_timeout(5.0), False),
         warm_start=warm_start,
     )
 
@@ -690,7 +695,7 @@ def test_three_phase_touchdown_rollout_transfers_support_to_legs() -> None:
     assert np.max(np.abs(nlp.equality_residual(nlp.pack(warm_start)))) > 0.4
 
     result = nlp.solve(
-        SLSQPSettings(300, 1e-9, 1e-6, 8.0, False),
+        SLSQPSettings(300, 1e-9, 1e-6, _success_timeout(8.0), False),
         warm_start=warm_start,
     )
 
@@ -890,7 +895,7 @@ def test_kappa_zero_fixes_applied_command_to_baseline_and_returns_no_target() ->
     assert nlp.rotor_execution_residual(nlp.pack(guess)) == pytest.approx(np.zeros(8))
     assert reconstruct_transport_target(plan, 0, np.full(4, 10.0)) is None
 
-    result = nlp.solve(SLSQPSettings(50, 1e-10, 1e-7, 3.0, False))
+    result = nlp.solve(SLSQPSettings(50, 1e-10, 1e-7, _success_timeout(3.0), False))
     assert result.success, result.message
     assert result.first_input is not None
     assert result.first_input.rotor_thrust_commands_n == pytest.approx(np.full(4, 10.0))

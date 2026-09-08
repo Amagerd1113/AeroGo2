@@ -454,7 +454,8 @@ class SimulationWorld:
                 reason="simulated ground contact",
             )
         )
-        self.inject_impact_recovery_completion()
+        if self.manager.snapshot.autoland_mpc_selected:
+            self.inject_impact_recovery_completion()
         iterations = (
             int(
                 (
@@ -624,7 +625,11 @@ class SimulationWorld:
         # Run the normal manager cycle so the prior CH10=MANUAL warning is
         # re-evaluated and cleared before the autoland preflight snapshot.
         await self.manager.tick()
-        prepared = await self.manager.prepare_autoland()
+        prepared = (
+            await self.manager.prepare_mpc_autoland(operator_confirmed=True)
+            if self.config.landing.mpc_enabled
+            else await self.manager.prepare_autoland()
+        )
         states.append(self.manager.state)
         if not prepared.ok:
             return prepared

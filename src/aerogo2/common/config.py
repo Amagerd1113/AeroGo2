@@ -135,6 +135,7 @@ _LANDING_KEYS = frozenset(
         "controller_timeout_s",
         "manual_override_deadband_us",
         "default_abort_mode",
+        "mpc_enabled",
     }
 )
 _ESC_KEYS = frozenset({"slot_1", "slot_2", "slot_3", "slot_4", "mavlink_display_shift"})
@@ -406,6 +407,7 @@ class LandingConfig:
     controller_timeout_s: float
     manual_override_deadband_us: int
     default_abort_mode: str
+    mpc_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -1569,6 +1571,8 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
         maximum=700,
     )
     nonempty_text(landing, "default_abort_mode", "landing.default_abort_mode")
+    if "mpc_enabled" in landing:
+        boolean(landing, "mpc_enabled", "landing.mpc_enabled")
 
     slots = [nonempty_text(esc, f"slot_{index}", f"esc.slot_{index}") for index in range(1, 5)]
     if all(item is not None for item in slots):
@@ -1835,6 +1839,7 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
             controller_timeout_s=float(_required(landing, "controller_timeout_s")),
             manual_override_deadband_us=_required(landing, "manual_override_deadband_us"),
             default_abort_mode=_required(landing, "default_abort_mode"),
+            mpc_enabled=bool(landing.get("mpc_enabled", False)),
         ),
         esc=EscConfig(
             slots={index: _required(esc, f"slot_{index}") for index in range(1, 5)},

@@ -68,6 +68,7 @@ def test_nonfinite_and_nonnumeric_values_fail_closed(
         "system.dry_run",
         "system.hardware_write_enabled",
         "go2.enabled",
+        "landing.mpc_enabled",
     ],
 )
 def test_boolean_strings_are_never_coerced(
@@ -158,6 +159,7 @@ def test_loaded_boolean_and_integer_types_remain_exact(app_config: AppConfig) ->
         "dry_run": app_config.system.dry_run,
         "hardware_write_enabled": app_config.system.hardware_write_enabled,
         "go2_enabled": app_config.go2.enabled,
+        "landing_mpc_enabled": app_config.landing.mpc_enabled,
         "flight_duty": app_config.f446.flight_duty,
         "flight_enable_channel": app_config.rc.flight_enable_channel,
     }
@@ -165,8 +167,25 @@ def test_loaded_boolean_and_integer_types_remain_exact(app_config: AppConfig) ->
     assert type(values["dry_run"]) is bool
     assert type(values["hardware_write_enabled"]) is bool
     assert type(values["go2_enabled"]) is bool
+    assert type(values["landing_mpc_enabled"]) is bool
     assert type(values["flight_duty"]) is int
     assert type(values["flight_enable_channel"]) is int
+
+
+def test_missing_landing_mpc_key_preserves_legacy_default(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    raw = deep_thaw(app_config.raw)
+    landing = raw["landing"]
+    assert isinstance(landing, dict)
+    landing.pop("mpc_enabled", None)
+    path = tmp_path / "legacy-config.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    loaded = load_config(path)
+
+    assert loaded.landing.mpc_enabled is False
 
 
 def test_landing_compliance_rejects_uncalibrated_zero_thresholds(

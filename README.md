@@ -14,11 +14,18 @@ F446 人工 `mr/mf`、快捷 `s`、人工到位确认、实时 HW-039 和自动�
 
 ## Impact-Aware 着陆扩展（默认禁用）
 
-本工程以 GitHub `main` 短提交 `851146d` 为上游基线，加入了固定展开构型下的
-impact-aware 着陆算法、Go2 LowCmd 唯一 owner 候选和飞控旋翼 residual 主机接口。
+本工程在 GitHub `main` 0.3.15 基础上合入了固定展开构型下的 impact-aware 着陆算法、
+Go2 LowCmd 唯一 owner 候选和飞控旋翼 residual 主机接口。`landing.mpc_enabled`
+是能力开关，默认 `false`。即使设为 `true`，每次飞行也不会自动开启 MPC：进入
+`FLIGHT_MANUAL` 后必须执行 `autoland prepare mpc` 并精确输入
+`CONFIRM_MPC_AUTOLAND`，才为本次自动着陆选择 Impact-aware 恢复路径。普通
+`autoland prepare` 始终保持原有 SafeDescent 路径；中止、完成或故障会清除本次选择。
+用 `autoland status` 可分别核对 `mpc_available` 和 `mpc_selected_for_session`。
+
 当前实验主线只使用法向一维模型；未经 N 标定的 Go2 SDK 足力 counts 只用于接触事件。
-LowCmd owner 已注入 runtime 但默认禁用；真实多速率控制链和 Pixhawk residual 执行端
-尚未接入，因此论文目标提交、正 κ 和硬件自动着陆继续 fail closed。当前文件职责、配置、参数及测试边界见
+状态机开关目前只接通 DRY-RUN 的恢复流程，下降指令仍来自 SafeDescentController；真实多速率
+MPC、Go2 柔顺执行链和 Pixhawk residual 执行端尚未接入。LowCmd owner 默认禁用，正 κ 和
+硬件自动着陆继续 fail closed。当前文件职责、配置、参数及测试边界见
 [Impact-Aware 着陆算法当前说明](docs/IMPACT_AWARE_MPC_INTEGRATION_ZH.md)。
 
 <!-- Encoding-damaged duplicate hidden.
@@ -165,7 +172,7 @@ await state_machine.transition_to(
 [`docs/STATE_TRANSITIONS_ZH.md`](docs/STATE_TRANSITIONS_ZH.md)，状态机、独立 LowCmd 控制权和
 Impact-aware 多速率数据流的总图见
 [`docs/AEROGO2_CURRENT_PROJECT_GRAPH_ZH.svg`](docs/AEROGO2_CURRENT_PROJECT_GRAPH_ZH.svg)。`FLIGHT_READY -> FLIGHT_MANUAL`
-采用一次性两把钥匙：AeroGo2 Shell `flight authorize` 成功后，30 秒内再由 RadioMaster CH5 LOW->HIGH 请求正常 Arm。Pixhawk 必须设置 `DISARM_DELAY=20`；Lua 授权门会在每次授权时校验。进入 `FLIGHT_MANUAL` 后，如果还未确认离地、Pixhawk 仍报告 landed 且自动 Disarm，上层会回到 `FLIGHT_READY`，必须先把 CH5 拉回 LOW 再重新执行 `flight authorize`。离地锁存后不会走这条地面回退。触地检测仍保持禁用，直到 Pixhawk 新鲜遥测连续 1.0 秒证明 `armed=true` 且 `landed=false`；用 `touchdown status` 查看本架次的离地锁存和触地确认进度。Go2 原始 `mode=6` 或本机实测的 `mode=0,error_code=1002` 都会自动确认关节锁。手机切换 Lock On 的瞬时姿态扰动使用可调的 2.0 秒初始宽限和 0.5 秒持续越界确认滤波；必须重新静止后才进入 `FLIGHT_READY`。若固件两种锁定信号都不回报，仍可在 `GO2_JOINT_LOCK_WAIT` 中使用守卫式 `go2 confirm-lock`.
+采用一次性两把钥匙：AeroGo2 Shell `flight authorize` 成功后，30 秒内再由 RadioMaster CH5 LOW->HIGH 请求正常 Arm。Pixhawk 必须设置 `DISARM_DELAY=20`；Lua 授权门会在每次授权时校验。进入 `FLIGHT_MANUAL` 后，如果还未确认离地、Pixhawk 仍报告 landed 且自动 Disarm，上层会回到 `FLIGHT_READY`，必须先把 CH5 拉回 LOW 再重新执行 `flight authorize`。离地锁存后不会走这条地面回退。触地检测仍保持禁用，直到 Pixhawk 新鲜遥测连续 1.0 秒证明 `armed=true` 且 `landed=false`；用 `touchdown status` 查看本架次的离地锁存和触地确认进度。Go2 原始 `mode=6` 或本机实测的 `mode=0,error_code=1002` 都会自动确认关节锁。手机切换 Lock On 的瞬时姿态扰动使用可调的 2.0 秒初始宽限和 0.5 秒持续越界确认滤波；必须重新静止后才进入 `FLIGHT_READY`。若固件两种锁定信号都不回报，仍可在 `GO2_JOINT_LOCK_WAIT` 中使用守卫式 `go2 confirm-lock`。
 
 0.3.12 允许在确认触地后从 `TOUCHDOWN_VERIFY` 进入受保护的 `MANUAL_POSITIONING`，由操作者手动把 F446 调到 WALK 端点，再通过 `motor endpoint walk` 与 `motor confirm walk` 完成验证。若已经进入腿部柔顺的 `LANDING_COMPLIANT`，系统会先恢复关节锁定，绝不在柔顺姿态下直接移动变形机构。
 
@@ -448,6 +455,13 @@ Shell；armed 时必须精确确认。
 - `safety_limits.yaml`
 - `f446.yaml`
 - `landing.yaml`
+
+`landing.mpc_enabled` 默认为 `false`。设为 `true` 只让 MPC 选项在 DRY-RUN
+可用；它本身不改变任何一次飞行。进入 `FLIGHT_MANUAL` 后执行
+`autoland prepare mpc` 并输入 `CONFIRM_MPC_AUTOLAND`，才为本次自动着陆锁存
+Impact-aware 触地后恢复门。执行普通 `autoland prepare` 仍使用 legacy 路径。
+该配置和运行时确认都不授权 LowCmd 或任何硬件输出，硬件写权限仍由独立配置和未完成的
+生产验收门控制。
 
 后加载值覆盖先加载值，include 循环、缺少章节、RC 通道冲突、阈值重叠、
 F446 方向/期望状态冲突、ESC 物理映射冲突、非正超时，以及 Phase 1

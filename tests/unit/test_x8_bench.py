@@ -27,7 +27,7 @@ def test_x8_alignment_matches_canonical_diag(app_config: AppConfig) -> None:
     assert report.errors == ()
     assert report.script_path.name == "pixhawk_x8_cli_diag.py"
     assert report.script_sha256 == (
-        "sha256:7987dbf41d17e9c6d9dbd811b9be1fda0eea37c25028def17c4fca2986123dbb"
+        "sha256:31c47ecf629400fc07849a9d7dab00892be5b9deccda1e2b047a9469210c4341"
     )
     assert "x8 slots={1: 'RR', 2: 'LF', 3: 'LR', 4: 'RF'}" in report.details
     assert "standard parameter audit=17 critical values" in report.details

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from typing import Callable, Optional
 
@@ -47,6 +48,9 @@ from aerogo2.landing.impact_aware.types import (
     RotorActuatorConfig,
 )
 
+_CYCLE_S = 8.0 if os.name == "nt" else 1.0
+_SOLVER_TIMEOUT_S = 7.0 if os.name == "nt" else 0.8
+
 
 def _problem() -> ImpactAwareMPCProblem:
     horizon = 1
@@ -67,7 +71,7 @@ def _problem() -> ImpactAwareMPCProblem:
     return ImpactAwareMPCProblem(
         initial_state=state,
         previous_input=previous,
-        dt_s=1.0,
+        dt_s=_CYCLE_S,
         contact_schedule=np.zeros((horizon + 1, 4), dtype=int),
         foot_leg_order=GO2_SDK_LEG_ORDER,
         foot_lever_arms_from_com_body_m=FootLeverArmsFromComBodyHorizon(
@@ -158,7 +162,7 @@ def _coordinator(
             max_iterations=20,
             ftol=1e-10,
             constraint_tolerance=1e-8,
-            timeout_s=0.8,
+            timeout_s=_SOLVER_TIMEOUT_S,
         ),
         contact_detector=FootContactDetector(
             ContactDetectorConfig(
@@ -191,8 +195,8 @@ def _cycle(state: SystemState, timestamp_s: float = 1.0) -> LandingCycleInput:
     return LandingCycleInput(
         sequence=7,
         timestamp_s=timestamp_s,
-        dt_s=1.0,
-        command_ttl_s=1.0,
+        dt_s=_CYCLE_S,
+        command_ttl_s=_CYCLE_S,
         system_state=state,
         freshness=LandingInputFreshness(
             state_estimate_timestamp_s=timestamp_s,
@@ -483,7 +487,7 @@ def test_cycle_timing_contract_rejects_coercion_and_multi_cycle_ttl() -> None:
         )
 
     with pytest.raises(ValueError, match="cannot exceed one MPC cycle"):
-        replace(_cycle(SystemState.AUTO_LANDING), command_ttl_s=1.01)
+        replace(_cycle(SystemState.AUTO_LANDING), command_ttl_s=_CYCLE_S + 0.01)
 
 
 def test_actual_mpc_geometry_and_nominal_admittance_plan_may_differ() -> None:

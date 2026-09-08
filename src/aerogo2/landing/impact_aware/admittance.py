@@ -19,7 +19,7 @@ import math
 from dataclasses import dataclass, field, replace
 from numbers import Real
 from threading import Lock
-from typing import TYPE_CHECKING, Optional, Protocol, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Protocol, Sequence, Tuple, Union, cast
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -97,7 +97,7 @@ def _positive_vector3(name: str, value: ArrayLike) -> FloatArray:
 def _componentwise_deadband(value: FloatArray, deadband: FloatArray) -> FloatArray:
     """Remove a symmetric per-axis deadband without a boundary discontinuity."""
 
-    return np.sign(value) * np.maximum(np.abs(value) - deadband, 0.0)
+    return cast(FloatArray, np.sign(value) * np.maximum(np.abs(value) - deadband, 0.0))
 
 
 def _rotation_body_to_world(value: ArrayLike) -> FloatArray:
@@ -561,7 +561,7 @@ class LegAdmittanceController:
         )
         self._stance_stiffness = _spd_matrix(
             "stance_stiffness",
-            config.stance_stiffness,
+            cast(MatrixSpec, config.stance_stiffness),
         )
         self._force_error_deadband = _nonnegative_vector3(
             "force_error_deadband_n",

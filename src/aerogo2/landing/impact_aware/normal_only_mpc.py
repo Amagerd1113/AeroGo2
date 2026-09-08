@@ -441,7 +441,7 @@ class NormalOnlyMPCProblem:
                 "foot_heights_from_com_m must remain fixed after each foot enters contact"
             )
 
-        for name, value in (
+        scalar_fields: Tuple[Tuple[str, object], ...] = (
             ("dt_s", dt),
             ("mass_kg", mass),
             ("gravity_m_per_s2", gravity),
@@ -452,7 +452,8 @@ class NormalOnlyMPCProblem:
             ("minimum_com_height_world_m", minimum_height),
             ("maximum_com_height_world_m", maximum_height),
             ("maximum_abs_vertical_velocity_m_per_s", maximum_speed),
-        ):
+        )
+        for name, value in scalar_fields:
             object.__setattr__(self, name, value)
         object.__setattr__(self, "leg_order", leg_order)
         object.__setattr__(self, "rotor_order", rotor_order)

@@ -309,11 +309,11 @@ safe-hold 的成功证据也是因果性的：revoke 后目标身份必须从 le
 | 6. 180° 姿态代价失效 | 姿态误差改为 SO(3) 主值 Log/geodesic，包含 π 附近的稳定分支，180° 不再得到零代价；着陆几何同时对全预测域施加倾角硬锥且配置必须 `<π/2`。 | 验证飞控/估计器坐标系、四元数顺序、连续性和 IMU-C 偏置；依据支撑试验给出实际 roll/pitch 上限。几何上“小于 90°”只是防止数学退化，不是可接受的实体着陆限值。 |
 | 7. 多速率跨设备一致性 | command/policy 携带完整 identity、TTL 与腿序；LowCmd bridge 回报 DDS writer generation 和软件限幅后的 `writer_enqueued_q_rad`，高频环只有取得对应 sequence 的 writer evidence 才提交导纳状态；mailbox ACK 不再冒充电机 ACK。同一 sequence 冻结首次 writer 入队 q；capability、publisher、generation 或序号变化均 fail closed。writer 在构造后重检 TTL；`Write` 跨 TTL 返回会立刻 fault 且不产生 target ACK；safe-hold 要求请求、写入和后续 LowState 的因果证据。 | 仍缺 Go2 与 FC 的共同未来执行时刻或事务栅栏；现有顺序会留下“新 residual＋旧腿策略”窗口。主机无法撤回已经进入 DDS 的过期帧，DDS `Write` 也不是电机应用确认；还缺运行期间持续其他 `rt/lowcmd` publisher 监测、独立 OS watchdog、机器人端命令租约/watchdog 和飞控端 watchdog。上述链路及断网、阻塞、进程崩溃、重启/epoch 变化必须在硬件上验收。 |
 
-X8 诊断脚本固定为 SHA-256 `7987dbf41d17e9c6d9dbd811b9be1fda0eea37c25028def17c4fca2986123dbb`，最大读取 512 KiB。入口在对齐检查和启动前均重新验证；最终通过 `python -` 的标准输入执行刚刚完成 hash 验证的同一字节快照，而不是再按路径打开可能已变化的文件。hash、白名单或映射任一不符都会拒绝执行；这只收窄诊断工具风险，不构成飞行或带桨许可。
+X8 诊断脚本固定为 SHA-256 `31c47ecf629400fc07849a9d7dab00892be5b9deccda1e2b047a9469210c4341`，最大读取 512 KiB。入口在对齐检查和启动前均重新验证；最终通过 `python -` 的标准输入执行刚刚完成 hash 验证的同一字节快照，而不是再按路径打开可能已变化的文件。hash、白名单或映射任一不符都会拒绝执行；这只收窄诊断工具风险，不构成飞行或带桨许可。
 
-### 9.2 P0：集成自动着陆前必须补齐
+### 9.2 P0：接入真实执行前必须补齐
 
-1. `HardwareWorld`/simulation 仍注入 legacy `SafeDescentController`；`AppConfig` 未组装 impact production 对象；
+1. 顶层 `landing.mpc_enabled` 仅开放 DRY-RUN 选择能力；每次进入 `FLIGHT_MANUAL` 后仍须执行 `autoland prepare mpc` 并精确确认，状态机才锁存本次 Impact-aware 触地后恢复流程。普通 `autoland prepare` 始终走 legacy，仿真可验证两条路径；但 `HardwareWorld`/simulation 的下降指令仍由 `SafeDescentController` 生成，`AppConfig` 尚未组装 impact production 控制对象；
 2. 缺真实同步的 LowState/state-estimator/contact/ground/kinematics input builder，以及硬件 landing estimator 和 post-touchdown recovery evidence producer；
 3. 缺闭合并验证的法向执行控制器：至少要定义期望法向力如何变成安全的腿命令，并量化实际响应与 MPC 假设的偏差；
 4. 缺有确定时间上界的 production solver；法向一维离线 SLSQP 不能因算例通过就接入实时链；

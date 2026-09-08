@@ -139,7 +139,11 @@ async def test_signal_shutdown_stays_resident_until_lowcmd_owner_is_clear() -> N
     assert shell.request_supervised_shutdown("SIGTERM")
     assert not shell.request_supervised_shutdown("duplicate SIGTERM")
     await asyncio.wait_for(manager.shutdown_called.wait(), timeout=1.0)
-    await asyncio.sleep(0)
+    for _ in range(20):
+        if not shell._closing:
+            break
+        await asyncio.sleep(0)
+    assert not shell._closing
     assert not run_task.done()
     assert manager.shutdown_calls == 1
 

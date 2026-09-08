@@ -87,7 +87,8 @@ mpc:
     max_iterations: 80
     ftol: 1.0e-7
     constraint_tolerance: 1.0e-5
-    timeout_s: 3.0
+    # Offline-only budget includes Windows spawn/import overhead; hardware use is prohibited.
+    timeout_s: 10.0
     display: false
   weights:
     tracking: [20, 20, 40, 10, 10, 30, 15, 15, 15, 5, 5, 5]

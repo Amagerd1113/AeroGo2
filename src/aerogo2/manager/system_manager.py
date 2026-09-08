@@ -180,6 +180,7 @@ class SystemManager:
         self._f446_current_clear_key: Optional[Tuple[Any, ...]] = None
         self._touchdown_confirmed = False
         self._autoland_active = False
+        self._autoland_mpc_selected = False
         self._setpoint_active = False
         self._ground_arm_authorized = False
         self._ground_arm_authorization_expires_at: Optional[float] = None
@@ -271,6 +272,9 @@ class SystemManager:
             and record.new_state is SystemState.FLIGHT_MANUAL
         ):
             self._reset_touchdown_cycle()
+            self._aborted_impact_touchdown_latched = False
+            self._clear_aborted_impact_airborne_dwell()
+            self._autoland_mpc_selected = False
         elif record.new_state in (
             SystemState.BOOT_SAFE,
             SystemState.WALK,
@@ -279,6 +283,7 @@ class SystemManager:
             SystemState.EMERGENCY_STOP,
         ):
             self._reset_touchdown_cycle()
+            self._autoland_mpc_selected = False
 
     async def start(self) -> OperationResult:
         """Start services but leave every device disconnected in BOOT_SAFE."""
@@ -640,6 +645,7 @@ class SystemManager:
             configuration_source=configuration_source,
             landing_estimate=self._estimate,
             autoland_active=self._autoland_active,
+            autoland_mpc_selected=self._autoland_mpc_selected,
             external_setpoint_active=self._setpoint_active,
             maintenance_mode=self._maintenance_mode,
             joint_lock_confirmed=joint_lock_confirmed,
@@ -706,7 +712,6 @@ class SystemManager:
     def _reset_impact_landing_completion(self, *, new_session: bool) -> None:
         if new_session:
             self._impact_landing_session_id += 1
-            self._aborted_impact_touchdown_latched = False
         self._clear_aborted_impact_airborne_dwell()
         self._impact_recovery = ImpactLandingRecoveryEvidence()
         self._last_confirmed_impact_recovery = None
@@ -2964,9 +2969,25 @@ class SystemManager:
 
     async def prepare_autoland(self) -> OperationResult:
         async with self._operation_lock:
-            return await self._prepare_autoland_unlocked()
+            return await self._prepare_autoland_unlocked(mpc_selected=False)
 
-    async def _prepare_autoland_unlocked(self) -> OperationResult:
+    async def prepare_mpc_autoland(
+        self,
+        *,
+        operator_confirmed: bool = False,
+    ) -> OperationResult:
+        async with self._operation_lock:
+            return await self._prepare_autoland_unlocked(
+                mpc_selected=True,
+                operator_confirmed=operator_confirmed,
+            )
+
+    async def _prepare_autoland_unlocked(
+        self,
+        *,
+        mpc_selected: bool,
+        operator_confirmed: bool = False,
+    ) -> OperationResult:
         if self._runtime_mode is not RuntimeMode.DRY_RUN:
             return OperationResult.failure(
                 "PHASE_NOT_AVAILABLE",
@@ -2976,6 +2997,23 @@ class SystemManager:
             return OperationResult.failure(
                 "INVALID_STATE", "autoland prepare requires FLIGHT_MANUAL"
             )
+        if self._aborted_impact_touchdown_latched:
+            return OperationResult.failure(
+                "IMPACT_RECOVERY_REENTRY_BLOCKED",
+                "A new continuously confirmed airborne cycle is required after a "
+                "post-impact recovery abort",
+            )
+        if mpc_selected and not self.config.landing.mpc_enabled:
+            return OperationResult.failure(
+                "MPC_AUTOLAND_DISABLED",
+                "landing.mpc_enabled must be true before MPC can be selected in flight",
+            )
+        if mpc_selected and (type(operator_confirmed) is not bool or not operator_confirmed):
+            return OperationResult.failure(
+                "MPC_AUTOLAND_CONFIRMATION_REQUIRED",
+                "Exact in-flight confirmation CONFIRM_MPC_AUTOLAND is required",
+            )
+        self._autoland_mpc_selected = False
         self._landing_controller.reset()
         self._last_landing_update = None
         self._next_landing_update_at = None
@@ -2983,15 +3021,32 @@ class SystemManager:
         try:
             await self._state_machine.transition_to(
                 SystemState.AUTO_LANDING_READY,
-                reason="landing estimator/controller initialized; no setpoint sent",
+                reason=(
+                    "Impact-Aware/MPC landing confirmed in flight; estimator/controller "
+                    "initialized; no setpoint sent"
+                    if mpc_selected
+                    else "legacy landing estimator/controller initialized; no setpoint sent"
+                ),
                 snapshot=self._snapshot,
             )
         except TransitionRejected as exc:
             return OperationResult.failure("AUTOLAND_PRECHECK_FAILED", str(exc))
+        self._autoland_mpc_selected = mpc_selected
         self._reset_impact_landing_completion(new_session=True)
-        self._emit("AUTOLAND_READY")
+        landing_mode = "impact_aware_mpc" if mpc_selected else "legacy_safe_descent"
+        self._emit(
+            "AUTOLAND_READY",
+            landing_mode=landing_mode,
+            mpc_selected_for_session=mpc_selected,
+        )
         await self.refresh_snapshot()
-        return OperationResult.success("Automatic landing ready; setpoints remain stopped")
+        return OperationResult.success(
+            "Automatic landing ready; setpoints remain stopped",
+            {
+                "landing_mode": landing_mode,
+                "mpc_selected_for_session": mpc_selected,
+            },
+        )
 
     async def start_autoland(self) -> OperationResult:
         async with self._operation_lock:
@@ -3006,6 +3061,11 @@ class SystemManager:
         if self.state is not SystemState.AUTO_LANDING_READY:
             return OperationResult.failure(
                 "INVALID_STATE", "autoland start requires AUTO_LANDING_READY"
+            )
+        if self._autoland_mpc_selected and not self.config.landing.mpc_enabled:
+            return OperationResult.failure(
+                "MPC_AUTOLAND_DISABLED",
+                "MPC selection is no longer permitted by landing.mpc_enabled",
             )
         if self.config.go2.low_level.enabled:
             return OperationResult.failure(
@@ -3033,7 +3093,14 @@ class SystemManager:
             and self._autoland_active
             and self._setpoint_active
         ):
-            self._emit("AUTOLAND_STARTED")
+            self._emit(
+                "AUTOLAND_STARTED",
+                landing_mode=(
+                    "impact_aware_mpc" if self._autoland_mpc_selected else "legacy_safe_descent"
+                ),
+                mpc_available=self.config.landing.mpc_enabled,
+                mpc_selected_for_session=self._autoland_mpc_selected,
+            )
             return first
         return OperationResult.failure(
             "AUTOLAND_START_FAILED",
@@ -3786,6 +3853,15 @@ class SystemManager:
             return {
                 "active": self._autoland_active,
                 "external_setpoint_active": self._setpoint_active,
+                "landing_mode": (
+                    "impact_aware_mpc" if self._autoland_mpc_selected else "legacy_safe_descent"
+                ),
+                "mpc_available": self.config.landing.mpc_enabled,
+                "mpc_selected_for_session": self._autoland_mpc_selected,
+                "impact_recovery_required": bool(
+                    self._autoland_mpc_selected and self.state is SystemState.AUTO_LANDING
+                ),
+                "hardware_output_available": False,
                 "last_command": {
                     "vx_des": self._last_landing_command.vx_des,
                     "vy_des": self._last_landing_command.vy_des,
@@ -4335,11 +4411,7 @@ class SystemManager:
             status.kinematics_timestamp,
             status.landed_state_timestamp,
         )
-        if (
-            self.config.go2.low_level.enabled
-            and self.state is SystemState.FLIGHT_MANUAL
-            and self._aborted_impact_touchdown_latched
-        ):
+        if self.state is SystemState.FLIGHT_MANUAL and self._aborted_impact_touchdown_latched:
             independent_airborne_evidence = bool(
                 pixhawk_touchdown_sources_are_current(
                     status,
@@ -4406,7 +4478,7 @@ class SystemManager:
             )
             return
         if (
-            self.config.go2.low_level.enabled
+            self._autoland_mpc_selected
             and self.state is SystemState.AUTO_LANDING
             and self._impact_recovery_wait_started_at is not None
             and now - self._impact_recovery_wait_started_at
@@ -4422,7 +4494,7 @@ class SystemManager:
         touchdown = all(self._touchdown_conditions(height).values())
         if not touchdown:
             self._reset_touchdown_candidate()
-            if self.state is SystemState.AUTO_LANDING and self.config.go2.low_level.enabled:
+            if self.state is SystemState.AUTO_LANDING and self._autoland_mpc_selected:
                 await self._clear_post_touchdown_stability()
             return
         if self._touchdown_height_reference is None:
@@ -4435,7 +4507,7 @@ class SystemManager:
         ):
             self._touchdown_height_reference = height
             self._touchdown_since = now
-            if self.state is SystemState.AUTO_LANDING and self.config.go2.low_level.enabled:
+            if self.state is SystemState.AUTO_LANDING and self._autoland_mpc_selected:
                 await self._clear_post_touchdown_stability()
             return
         if self._touchdown_since is None:
@@ -4443,12 +4515,15 @@ class SystemManager:
             return
         if now - self._touchdown_since < self.config.safety.touchdown_confirm_s:
             return
-        if self.state is SystemState.AUTO_LANDING and self.config.go2.low_level.enabled:
+        if self.state is SystemState.AUTO_LANDING and self._autoland_mpc_selected:
             await self._advance_impact_recovery_exit(now)
             return
-        await self._complete_touchdown_transition(
-            "manual landing touchdown conditions held for configured duration"
+        completion_reason = (
+            "legacy automatic landing touchdown conditions held for configured duration"
+            if self.state is SystemState.AUTO_LANDING
+            else "manual landing touchdown conditions held for configured duration"
         )
+        await self._complete_touchdown_transition(completion_reason)
 
     def _impact_recovery_evidence_failure(self, now: float) -> Optional[str]:
         evidence = self._impact_recovery
@@ -4720,7 +4795,7 @@ class SystemManager:
 
     async def _complete_touchdown_transition(self, reason: str) -> None:
         automatic_landing = self.state is SystemState.AUTO_LANDING
-        impact_aware_landing = automatic_landing and self.config.go2.low_level.enabled
+        impact_aware_landing = automatic_landing and self._autoland_mpc_selected
         if not automatic_landing and self._aborted_impact_touchdown_latched:
             self._touchdown_since = None
             self._touchdown_height_reference = None
@@ -4821,7 +4896,13 @@ class SystemManager:
         self._aborted_impact_touchdown_latched = False
         self._clear_aborted_impact_airborne_dwell()
         self._autoland_active = False
-        self._emit("TOUCHDOWN_CONFIRMED", landing_session_id=self._impact_landing_session_id)
+        completed_mpc_landing = self._autoland_mpc_selected
+        self._autoland_mpc_selected = False
+        self._emit(
+            "TOUCHDOWN_CONFIRMED",
+            landing_session_id=self._impact_landing_session_id,
+            mpc_selected_for_session=completed_mpc_landing,
+        )
         await self.refresh_snapshot()
 
     def _landing_compliance_entry_result(self) -> OperationResult:
@@ -5140,6 +5221,7 @@ class SystemManager:
                 "AUTOLAND_ABORT_FAILED",
                 f"Abort entry action failed; manager entered {self.state.name}",
             )
+        self._autoland_mpc_selected = False
         return OperationResult.success("Returned to FLIGHT_MANUAL")
 
     async def _adopt_boot_configuration(self) -> None:

@@ -423,6 +423,13 @@ class TransitionGuards:
 
         if new_state is SystemState.AUTO_LANDING:
             self._require_autoland_sources_current(snapshot, codes, messages)
+            if snapshot.autoland_mpc_selected and not self._config.landing.mpc_enabled:
+                self._reject(
+                    codes,
+                    messages,
+                    "MPC_AUTOLAND_DISABLED",
+                    "The in-flight MPC selection is not enabled by configuration",
+                )
             if snapshot.rc.auto_landing_request is not AutoLandingRequest.AUTO_EXECUTE:
                 self._reject(
                     codes,
@@ -517,7 +524,7 @@ class TransitionGuards:
                     "PIXHAWK_NOT_LANDED",
                     "Pixhawk landed state is not confirmed",
                 )
-            if current is SystemState.AUTO_LANDING and self._config.go2.low_level.enabled:
+            if current is SystemState.AUTO_LANDING and snapshot.autoland_mpc_selected:
                 evidence = snapshot.impact_recovery
                 low_level = snapshot.go2.low_level_status
                 maximum_low_state_age = self._config.go2.low_level.low_state_max_age_s

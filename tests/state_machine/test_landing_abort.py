@@ -597,13 +597,19 @@ def test_landing_filter_rejects_missing_required_estimate_values(
     assert_zero_invalid(command)
 
 
+@pytest.mark.parametrize("mpc_enabled", [False, True])
 @pytest.mark.asyncio
 async def test_non_dry_run_never_issues_any_control_bridge_write(
     app_config: AppConfig,
     clock: ManualClock,
+    mpc_enabled: bool,
 ) -> None:
+    config = replace(
+        app_config,
+        landing=replace(app_config.landing, mpc_enabled=mpc_enabled),
+    )
     pixhawk = FakePixhawk(clock=clock)
-    f446 = FakeF446(config=app_config.f446, clock=clock)
+    f446 = FakeF446(config=config.f446, clock=clock)
     go2 = FakeGo2(clock=clock)
     control_calls = (
         AsyncMock(),
@@ -624,11 +630,11 @@ async def test_non_dry_run_never_issues_any_control_bridge_write(
         go2.request_flight_pose,
     ) = control_calls
     manager = SystemManager(
-        config=app_config,
+        config=config,
         pixhawk=pixhawk,
         f446=f446,
         go2=go2,
-        landing_controller=SafeDescentController(app_config),
+        landing_controller=SafeDescentController(config),
         clock=clock,
         runtime_mode=RuntimeMode.HARDWARE_READONLY,
     )

@@ -71,6 +71,7 @@ STATE_ACTIONS: Final[Mapping[str, FrozenSet[SystemState]]] = MappingProxyType(
             }
         ),
         "autoland_prepare": frozenset({SystemState.FLIGHT_MANUAL}),
+        "autoland_prepare_mpc": frozenset({SystemState.FLIGHT_MANUAL}),
         "autoland_start": frozenset({SystemState.AUTO_LANDING_READY}),
         "autoland_abort": frozenset(
             {

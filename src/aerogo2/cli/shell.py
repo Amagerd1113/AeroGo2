@@ -130,7 +130,10 @@ class InteractiveShell:
                         break
                 await self.close()
                 if not self._closed:
-                    await asyncio.sleep(0)
+                    try:
+                        await asyncio.sleep(0)
+                    except asyncio.CancelledError:
+                        self._consume_current_task_cancellation()
                     self._ensure_monitor_task()
         finally:
             try:

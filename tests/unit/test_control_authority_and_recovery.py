@@ -32,6 +32,7 @@ def _enabled_lowcmd_config(config: AppConfig) -> AppConfig:
 
     return replace(
         config,
+        landing=replace(config.landing, mpc_enabled=True),
         go2=replace(
             config.go2,
             low_level=replace(
@@ -106,6 +107,7 @@ def _active_lowcmd_snapshot(
     return replace(
         base,
         state=SystemState.AUTO_LANDING,
+        autoland_mpc_selected=True,
         pixhawk=replace(base.pixhawk, armed=True, landed=False),
         go2=replace(
             base.go2,
@@ -447,6 +449,7 @@ def test_only_auto_landing_requires_recovery_gate_before_touchdown_verify(
             reason="fresh touchdown estimate",
         ),
         impact_landing_session_id=8,
+        autoland_mpc_selected=True,
     )
     guards = TransitionGuards(config)
 

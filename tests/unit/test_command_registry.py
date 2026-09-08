@@ -26,6 +26,7 @@ audit pixhawk
 audit rc
 autoland abort
 autoland prepare
+autoland prepare mpc
 autoland start
 autoland status
 check communication
@@ -332,6 +333,7 @@ def test_read_only_commands_require_no_confirmation(name: str) -> None:
         ("transform flight", "TRANSFORM_TO_FLIGHT"),
         ("transform walk", "TRANSFORM_TO_WALK"),
         ("go2 confirm-lock", "CONFIRM_GO2_JOINT_LOCK"),
+        ("autoland prepare mpc", "CONFIRM_MPC_AUTOLAND"),
     ],
 )
 def test_dangerous_commands_publish_exact_confirmation_metadata(name: str, phrase: str) -> None:
@@ -432,6 +434,7 @@ HARDWARE_ACTUATOR_COMMANDS = (
 
 DRY_RUN_ONLY_ACTUATOR_COMMANDS = (
     "autoland prepare",
+    "autoland prepare mpc",
     "autoland start",
     "autoland abort",
     "controller reset",

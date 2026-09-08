@@ -338,8 +338,7 @@ class Go2LowLevelStatus:
             raise ValueError("writer_enqueue_generation must be a nonnegative integer")
         writer_q = tuple(self.writer_enqueued_q_rad)
         if writer_q and (
-            len(writer_q) != 12
-            or any(finite_real(value) is None for value in writer_q)
+            len(writer_q) != 12 or any(finite_real(value) is None for value in writer_q)
         ):
             raise ValueError("writer_enqueued_q_rad must be empty or contain 12 finite values")
         if (self.writer_enqueue_generation == 0) is not (len(writer_q) == 0):
@@ -358,9 +357,7 @@ class Go2LowLevelStatus:
         ):
             sequence = getattr(self, name)
             if sequence is not None and (
-                isinstance(sequence, bool)
-                or not isinstance(sequence, int)
-                or sequence < 0
+                isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0
             ):
                 raise ValueError(f"{name} must be None or a nonnegative integer")
         if self.writer_enqueued_target_sequence is not None and (
@@ -705,6 +702,7 @@ class SystemSnapshot:
     configuration: Configuration = Configuration.UNKNOWN
     landing_estimate: LandingEstimate = field(default_factory=LandingEstimate)
     autoland_active: bool = False
+    autoland_mpc_selected: bool = False
     external_setpoint_active: bool = False
     maintenance_mode: bool = False
     joint_lock_confirmed: bool = False

@@ -94,6 +94,7 @@ class CommandService:
                 "walk_stop": "walk_stop",
                 "walk_stand": "walk_stand",
                 "autoland_prepare": "prepare_autoland",
+                "autoland_prepare_mpc": "_prepare_mpc_autoland",
                 "autoland_start": "start_autoland",
                 "autoland_abort": "abort_autoland",
                 "controller_reset": "reset_controller",
@@ -169,6 +170,12 @@ class CommandService:
         return OperationResult.failure(
             "UNKNOWN_GO2_LOWCMD_ACTION",
             f"Unsupported action {action}",
+        )
+
+    async def _prepare_mpc_autoland(self) -> OperationResult:
+        return cast(
+            OperationResult,
+            await self._manager.prepare_mpc_autoland(operator_confirmed=True),
         )
 
     async def _run_f446_action(

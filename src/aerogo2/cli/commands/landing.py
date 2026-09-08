@@ -2,7 +2,11 @@
 
 from typing import Tuple
 
-from aerogo2.cli.command_models import CommandPermission, CommandSpec
+from aerogo2.cli.command_models import (
+    CommandPermission,
+    CommandSpec,
+    ConfirmationPolicy,
+)
 from aerogo2.cli.commands._helpers import command, readonly
 from aerogo2.common.enums import SystemState
 
@@ -24,11 +28,28 @@ def command_specs() -> Tuple[CommandSpec, ...]:
         ),
         command(
             "autoland prepare",
-            "Initialize controller and estimator without sending setpoints",
+            "Prepare the legacy automatic landing for this flight",
             "landing",
             "autoland_prepare",
             capability=CommandPermission.SAFE_CONTROL,
             allowed_states=frozenset({SystemState.FLIGHT_MANUAL}),
+            dry_run_only=True,
+        ),
+        command(
+            "autoland prepare mpc",
+            "Confirm and prepare Impact-Aware/MPC landing for this flight",
+            "landing",
+            "autoland_prepare_mpc",
+            capability=CommandPermission.SAFE_CONTROL,
+            allowed_states=frozenset({SystemState.FLIGHT_MANUAL}),
+            confirmation=ConfirmationPolicy.exact(
+                "CONFIRM_MPC_AUTOLAND",
+                prompt="Confirm Impact-Aware/MPC landing for this flight",
+                warning=(
+                    "This selects the guarded Impact-Aware/MPC recovery path only for "
+                    "the current automatic-landing attempt."
+                ),
+            ),
             dry_run_only=True,
         ),
         command(

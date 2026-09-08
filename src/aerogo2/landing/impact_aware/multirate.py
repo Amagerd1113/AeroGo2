@@ -3450,7 +3450,7 @@ class HighRateLegController:
         ):
             return "force observation mode changed inside one landing session"
         if self._ground_normal_world is not None and not np.array_equal(
-            sample.ground_normal_world,
+            cast(Any, sample.ground_normal_world),
             self._ground_normal_world,
         ):
             return "ground normal changed inside one landing session"

@@ -1,0 +1,4 @@
+# Byte-pinned URDF must be identical on every checkout.
+configs/go2_description.unitree_ros.urdf text eol=lf
+pixhawk_x8_cli_diag.py text eol=lf
+scripts/pixhawk_x8_cli_diag.py text eol=lf
