@@ -235,6 +235,25 @@ def test_ch10_manual_position_requests_manual_override(
     assert monitor.get_status().manual_override
 
 
+def test_ch10_manual_takeover_bypasses_switch_debounce(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    monitor = RCMonitor(app_config.rc, clock)
+    channels = safe_channels()
+    channels[10] = 2000
+    stabilize(monitor, clock, channels, app_config.rc.debounce_s)
+    assert monitor.get_status().auto_landing_request is AutoLandingRequest.AUTO_EXECUTE
+
+    channels[10] = 1000
+    status = monitor.update(channels)
+
+    assert status.manual_override
+    # The high-level request remains debounced for this first sample.  The raw
+    # LOW override is what makes the safety exit immediate.
+    assert status.auto_landing_request is AutoLandingRequest.AUTO_EXECUTE
+
+
 def test_centered_sticks_do_not_request_stick_override_in_auto(
     app_config: AppConfig,
     clock: ManualClock,

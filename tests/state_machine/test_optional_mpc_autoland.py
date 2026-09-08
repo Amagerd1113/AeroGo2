@@ -9,6 +9,7 @@ from aerogo2.cli.confirmation import ConfirmationService, ScriptedConfirmationRe
 from aerogo2.cli.dispatcher import CommandDispatcher
 from aerogo2.common.config import AppConfig
 from aerogo2.common.enums import (
+    AutoLandingRequest,
     CommandStatus,
     ConfirmationLevel,
     RuntimeMode,
@@ -178,6 +179,67 @@ async def test_cli_exact_phrase_is_the_in_flight_activation_boundary(
         assert accepted.result.status is CommandStatus.SUCCESS
         assert world.manager.state is SystemState.AUTO_LANDING_READY
         assert world.manager.snapshot.autoland_mpc_selected
+    finally:
+        await world.shutdown()
+
+
+@pytest.mark.parametrize("phase", ["ready", "active"])
+@pytest.mark.parametrize("takeover", ["ch10", "stick"])
+@pytest.mark.asyncio
+async def test_mpc_autoland_allows_immediate_rc_takeover(
+    app_config: AppConfig,
+    phase: str,
+    takeover: str,
+) -> None:
+    config = replace(
+        app_config,
+        landing=replace(app_config.landing, mpc_enabled=True),
+    )
+    world = SimulationWorld(config)
+    try:
+        assert (await world.start()).ok
+        assert (await world._reach_flight_manual([])).ok
+        world._set_landing_estimate(
+            LandingEstimate(
+                valid=True,
+                ground_detected=True,
+                height_m=1.0,
+                vertical_velocity_mps=0.0,
+                horizontal_velocity_mps=0.0,
+                timestamp=world.clock.monotonic(),
+                reason="simulated estimator valid",
+            )
+        )
+        world._set_switches(autoland=1500)
+        await world.manager.tick()
+        assert (await world.manager.prepare_mpc_autoland(operator_confirmed=True)).ok
+        assert world.manager.state is SystemState.AUTO_LANDING_READY
+        assert world.manager.snapshot.autoland_mpc_selected
+
+        if phase == "active":
+            world._set_switches(autoland=1900)
+            assert (await world.manager.start_autoland()).ok
+            assert world.manager.state is SystemState.AUTO_LANDING
+            assert world.pixhawk.external_setpoints_active
+
+        if takeover == "ch10":
+            world._channels[config.rc.auto_landing_channel] = 1000
+        else:
+            world._channels[1] = 1500 + config.rc.manual_override_deadband_us + 1
+        world._feed_rc(debounce=False)
+        rc = world.rc_monitor.get_status()
+        assert rc.manual_override
+        if takeover == "ch10":
+            assert rc.auto_landing_request is not AutoLandingRequest.MANUAL
+
+        await world.manager.tick()
+
+        assert world.manager.state is SystemState.FLIGHT_MANUAL
+        assert not world.pixhawk.external_setpoints_active
+        assert world.pixhawk.get_status().armed
+        assert not world.manager.snapshot.autoland_active
+        assert not world.manager.snapshot.autoland_mpc_selected
+        assert not world.manager.last_landing_command.valid
     finally:
         await world.shutdown()
 

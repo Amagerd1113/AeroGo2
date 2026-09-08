@@ -111,9 +111,17 @@ class RCMonitor:
         flight_position = self.position(self._config.flight_enable_channel)
         morphology_position = self.position(self._config.morphology_channel)
         autoland_position = self.position(self._config.auto_landing_channel)
+        raw_autoland_position = self.classify(
+            channel_copy.get(self._config.auto_landing_channel)
+        )
         auto_request = self._auto_request(autoland_position)
-        manual_override = autoland_position is RCPosition.LOW or self._stick_override_requested(
-            channel_copy
+        # Entering an automatic mode remains debounced, but leaving it is a
+        # safety action: a raw CH10 LOW sample must request takeover in the
+        # current RC frame instead of waiting for the switch debounce period.
+        manual_override = (
+            raw_autoland_position is RCPosition.LOW
+            or autoland_position is RCPosition.LOW
+            or self._stick_override_requested(channel_copy)
         )
         self._status = RCStatus(
             connected=True,

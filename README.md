@@ -21,6 +21,10 @@ Go2 LowCmd 唯一 owner 候选和飞控旋翼 residual 主机接口。`landing.m
 `CONFIRM_MPC_AUTOLAND`，才为本次自动着陆选择 Impact-aware 恢复路径。普通
 `autoland prepare` 始终保持原有 SafeDescent 路径；中止、完成或故障会清除本次选择。
 用 `autoland status` 可分别核对 `mpc_available` 和 `mpc_selected_for_session`。
+在 `AUTO_LANDING_READY` 或 `AUTO_LANDING` 中，把 RadioMaster CH10 拉回 MANUAL
+会按原始 LOW 样本在当前 RC 帧请求接管，不等待进入自动档所用的防抖时间；已标定的
+CH1–CH4 任一摇杆超过 deadband 也会立即请求接管。接管事务停止外部 setpoint、撤销
+本次 MPC 选择并返回 `FLIGHT_MANUAL`，不会自动 Disarm。
 
 当前实验主线只使用法向一维模型；未经 N 标定的 Go2 SDK 足力 counts 只用于接触事件。
 状态机开关目前只接通 DRY-RUN 的恢复流程，下降指令仍来自 SafeDescentController；真实多速率
@@ -190,7 +194,7 @@ Impact-aware 多速率数据流的总图见
 8. RC failsafe 立即把 CH5/CH9/CH10 高层请求恢复为安全值。
 9. 自动降落失效会停止外部 setpoint，但绝不自动停旋翼或 disarm。
 10. 只有连续确认实际离地后才启用本架次触地检测；地面 armed/landed 状态不能直接触发 `TOUCHDOWN_VERIFY`。
-11. RadioMaster 人工接管优先于自动降落。
+11. RadioMaster 人工接管优先于自动降落；CH10 回到 MANUAL 的退出动作不等待开关防抖。
 12. 启动固定进入 `BOOT_SAFE`，不恢复运动。
 13. 构型未知时同时禁止飞行许可和步行许可。
 14. F446 手动命令在普通模式不可用；Phase 1 中维护模式本身也不可用。
