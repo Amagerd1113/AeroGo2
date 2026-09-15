@@ -23,6 +23,26 @@ X8_ESC_SLOT_MAPPING = {1: "RR", 2: "LF", 3: "LR", 4: "RF"}
 GO2_LOW_LEVEL_JOINT_COUNT = 12
 GO2_LOW_LEVEL_SAFE_HOLD_POLICIES = frozenset({"capture_current", "configured_pose"})
 
+# Defaults added after the original field configuration was deployed. Applying
+# them to the merged document keeps older, otherwise valid site configurations
+# usable while preserving strict validation for explicit overrides.
+_COMPATIBILITY_DEFAULTS: Mapping[str, Mapping[str, Any]] = {
+    "safety": {
+        "touchdown_max_source_age_s": 0.30,
+        "touchdown_max_source_skew_s": 0.25,
+        "post_touchdown_stable_confirm_s": 1.0,
+        "post_touchdown_stability_max_check_gap_s": 0.1,
+        "aborted_impact_airborne_confirm_s": 0.5,
+        "impact_recovery_status_max_age_s": 0.1,
+        "impact_recovery_completion_timeout_s": 5.0,
+        "impact_recovery_finalization_timeout_s": 2.0,
+    },
+    "landing": {
+        "takeover_blend_s": 0.3,
+        "impact_force_window_s": 0.05,
+    },
+}
+
 _ROOT_KEYS = frozenset(
     {"includes", "system", "pixhawk", "f446", "go2", "rc", "safety", "landing", "esc"}
 )
@@ -558,6 +578,21 @@ def _load_merged(path: Path, seen: Optional[Tuple[Path, ...]] = None) -> Dict[st
         _deep_merge(result, included)
     _deep_merge(result, document)
     return result
+
+
+def _apply_compatibility_defaults(raw: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return an effective document with post-deployment fields populated."""
+
+    effective = dict(raw)
+    for section_name, defaults in _COMPATIBILITY_DEFAULTS.items():
+        raw_section = effective.get(section_name)
+        if not isinstance(raw_section, Mapping):
+            continue
+        section = dict(raw_section)
+        for key, default in defaults.items():
+            section.setdefault(key, default)
+        effective[section_name] = section
+    return effective
 
 
 def _section(raw: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -1630,7 +1665,7 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
 
 
 def validate_config(path: Path) -> Tuple[str, ...]:
-    raw = _load_merged(path)
+    raw = _apply_compatibility_defaults(_load_merged(path))
     return tuple(_validate_raw(raw))
 
 
@@ -1907,7 +1942,7 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
 
 def load_config(path: Path) -> AppConfig:
     source = Path(path).resolve()
-    raw = _load_merged(source)
+    raw = _apply_compatibility_defaults(_load_merged(source))
     errors = _validate_raw(raw)
     if errors:
         raise ConfigurationError("; ".join(errors))

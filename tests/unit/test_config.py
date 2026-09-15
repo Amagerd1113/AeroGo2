@@ -75,6 +75,58 @@ def test_missing_airborne_confirmation_defaults_to_one_second(
     assert loaded.safety.airborne_confirm_s == 1.0
 
 
+def test_new_landing_safety_fields_use_compatibility_defaults(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    raw = deep_thaw(app_config.raw)
+    expected = {
+        "safety.touchdown_max_source_age_s": 0.30,
+        "safety.touchdown_max_source_skew_s": 0.25,
+        "safety.post_touchdown_stable_confirm_s": 1.0,
+        "safety.post_touchdown_stability_max_check_gap_s": 0.1,
+        "safety.aborted_impact_airborne_confirm_s": 0.5,
+        "safety.impact_recovery_status_max_age_s": 0.1,
+        "safety.impact_recovery_completion_timeout_s": 5.0,
+        "safety.impact_recovery_finalization_timeout_s": 2.0,
+        "landing.takeover_blend_s": 0.3,
+        "landing.impact_force_window_s": 0.05,
+    }
+    for dotted_key in expected:
+        section, key = dotted_key.split(".")
+        del raw[section][key]
+    path = tmp_path / "legacy-landing-config.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    loaded = load_config(path)
+
+    assert loaded.safety.touchdown_max_source_age_s == 0.30
+    assert loaded.safety.touchdown_max_source_skew_s == 0.25
+    assert loaded.safety.post_touchdown_stable_confirm_s == 1.0
+    assert loaded.safety.post_touchdown_stability_max_check_gap_s == 0.1
+    assert loaded.safety.aborted_impact_airborne_confirm_s == 0.5
+    assert loaded.safety.impact_recovery_status_max_age_s == 0.1
+    assert loaded.safety.impact_recovery_completion_timeout_s == 5.0
+    assert loaded.safety.impact_recovery_finalization_timeout_s == 2.0
+    assert loaded.landing.takeover_blend_s == 0.3
+    assert loaded.landing.impact_force_window_s == 0.05
+    for dotted_key, value in expected.items():
+        assert loaded.get(dotted_key) == value
+
+
+def test_explicit_compatibility_field_override_remains_strictly_validated(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    raw = deep_thaw(app_config.raw)
+    raw["landing"]["takeover_blend_s"] = 0
+    path = tmp_path / "invalid-landing-config.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="landing.takeover_blend_s must be positive"):
+        load_config(path)
+
+
 def test_missing_go2_accepted_state_codes_uses_firmware_compatibility_default(
     tmp_path: Path,
     app_config: AppConfig,
