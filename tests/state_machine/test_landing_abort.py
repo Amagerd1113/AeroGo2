@@ -812,3 +812,52 @@ async def test_landing_impact_reports_deduplicated_calibrated_peak(
     assert report["sampled_peak_normal_force_by_leg_n"] == (10.0, 20.0, 30.0, 40.0)
     assert report["newton_output_available"] is True
     assert report["calibration_hash"] == _test_force_calibration().calibration_hash
+
+
+@pytest.mark.asyncio
+async def test_force_monitor_continues_in_flight_manual_and_keeps_prior_peak(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    manager, _, _, _ = await manager_in_autoland(app_config, clock)
+    manager._foot_force_calibration = _test_force_calibration()
+    peak = Go2FootForceFeedback(
+        receipt_timestamp_s=clock.monotonic(),
+        receipt_sequence=10,
+        subscription_generation=1,
+        source_tick=20,
+        source_tick_valid=True,
+        source_tick_monotonic=True,
+        raw_sdk_int16=(100, 100, 100, 100),
+        raw_valid=True,
+    )
+    manager._observe_landing_impact_force(peak)
+    assert (await manager.abort_autoland("test handoff")).ok
+    assert manager.state is SystemState.FLIGHT_MANUAL
+
+    clock.advance(0.01)
+    manual_sample = Go2FootForceFeedback(
+        receipt_timestamp_s=clock.monotonic(),
+        receipt_sequence=11,
+        subscription_generation=1,
+        source_tick=21,
+        source_tick_valid=True,
+        source_tick_monotonic=True,
+        raw_sdk_int16=(20, 20, 20, 20),
+        raw_valid=True,
+    )
+    manager._observe_landing_impact_force(manual_sample)
+
+    report = manager.query("landing impact")
+    assert report["monitoring_scope"] == "process_lifetime_all_states"
+    assert report["current_state"] == "FLIGHT_MANUAL"
+    assert report["sample_count"] == 2
+    assert report["latest_sdk_counts"] == (20, 20, 20, 20)
+    assert report["peak_abs_sdk_counts_by_channel"] == (100, 100, 100, 100)
+    assert report["sampled_peak_total_normal_force_n"] == pytest.approx(200.0)
+    assert report["sampled_peak_normal_force_by_leg_n"] == (
+        50.0,
+        50.0,
+        50.0,
+        50.0,
+    )

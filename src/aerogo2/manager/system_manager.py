@@ -167,6 +167,7 @@ class SystemManager:
         self._takeover_started_at: Optional[float] = None
         self._takeover_start_command: Optional[LandingCommand] = None
         self._takeover_reason: Optional[str] = None
+        self._impact_force_monitor_started_at = now
         self._impact_force_last_identity: Optional[Tuple[int, int, int]] = None
         self._impact_force_sample_count = 0
         self._impact_force_latest_raw: Optional[Tuple[int, int, int, int]] = None
@@ -3038,7 +3039,6 @@ class SystemManager:
         self._last_landing_update = None
         self._next_landing_update_at = None
         self._reset_gradual_takeover()
-        self._reset_impact_force_report()
         await self.refresh_snapshot()
         try:
             await self._state_machine.transition_to(
@@ -4010,8 +4010,8 @@ class SystemManager:
         self._impact_force_error = None
 
     def _observe_landing_impact_force(self, feedback: Any) -> None:
-        if self.state not in (SystemState.AUTO_LANDING, SystemState.TOUCHDOWN_VERIFY):
-            return
+        """Continuously accumulate LowState force samples in every system state."""
+
         if not feedback.source_identity_valid or feedback.source_tick is None:
             self._impact_force_error = "LowState foot-force sample identity is invalid"
             return
@@ -4070,7 +4070,10 @@ class SystemManager:
     def _impact_force_report(self) -> Mapping[str, Any]:
         calibration = self._foot_force_calibration
         return {
-            "landing_session_id": self._impact_landing_session_id,
+            "monitoring_scope": "process_lifetime_all_states",
+            "monitor_started_at": self._impact_force_monitor_started_at,
+            "current_state": self.state.name,
+            "current_landing_session_id": self._impact_landing_session_id,
             "sample_count": self._impact_force_sample_count,
             "latest_sdk_counts": self._impact_force_latest_raw,
             "sdk_count_source": self._impact_force_sdk_source,
@@ -4090,7 +4093,7 @@ class SystemManager:
             ),
             "calibration_hash": (calibration.calibration_hash if calibration is not None else None),
             "measurement_note": (
-                "Sampled LowState peak; sensor bandwidth may under-read the true instantaneous impact peak"
+                "All-state process-lifetime LowState peak; sensor bandwidth may under-read the true instantaneous impact peak"
             ),
             "error": self._impact_force_error,
         }
