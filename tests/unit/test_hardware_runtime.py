@@ -328,7 +328,7 @@ async def test_pixhawk_outputs_remain_locked(
 
     assert not result.ok
     assert result.code == "PIXHAWK_SETPOINT_LOCKED"
-    with pytest.raises(BridgeError, match="RadioMaster"):
+    with pytest.raises(BridgeError, match="locked by hardware configuration"):
         await bridge.request_mode("GUIDED")
 
 
@@ -415,7 +415,9 @@ async def test_pixhawk_ground_arm_authorization_times_out_without_lua_ack(
     assert not bridge.ground_arm_authorization_active()
 
 
-def test_hardware_world_never_unlocks_pixhawk_outputs(app_config: AppConfig) -> None:
+def test_hardware_world_unlocks_pixhawk_only_with_both_write_gates(
+    app_config: AppConfig,
+) -> None:
     unlocked = replace(
         app_config,
         system=replace(
@@ -429,7 +431,16 @@ def test_hardware_world_never_unlocks_pixhawk_outputs(app_config: AppConfig) -> 
 
     assert world.f446._allow_motion
     assert world.go2._allow_control
-    assert not world.pixhawk._allow_setpoints
+    assert world.pixhawk._allow_setpoints
+    assert world.pixhawk._allow_mode_changes
+
+    disabled = replace(
+        unlocked,
+        landing=replace(unlocked.landing, hardware_autoland_enabled=False),
+    )
+    locked_world = HardwareWorld(disabled, runtime_mode=RuntimeMode.HARDWARE)
+    assert not locked_world.pixhawk._allow_setpoints
+    assert not locked_world.pixhawk._allow_mode_changes
 
 
 @pytest.mark.asyncio
@@ -616,3 +627,221 @@ async def test_pixhawk_arm_edge_closes_live_gate_but_retains_one_shot_receipt(
     )
 
     assert not bridge.ground_arm_authorization_active()
+
+
+@pytest.mark.asyncio
+async def test_pixhawk_mode_request_waits_for_heartbeat_confirmation(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    bridge = MavlinkPixhawkBridge(
+        app_config.pixhawk,
+        app_config.esc.slots,
+        clock=clock,
+        allow_setpoints=True,
+        allow_mode_changes=True,
+        external_control_mode="GUIDED",
+        fallback_mode="LOITER",
+    )
+    mavlink_constants = SimpleNamespace(
+        MAV_CMD_DO_SET_MODE=176,
+        MAV_MODE_FLAG_CUSTOM_MODE_ENABLED=1,
+        MAV_MODE_FLAG_SAFETY_ARMED=128,
+        MAV_STATE_CRITICAL=5,
+    )
+    bridge._mavlink = SimpleNamespace(
+        mavlink=mavlink_constants,
+        mode_string_v10=lambda message: message.mode,
+    )
+    sent: list[tuple[object, ...]] = []
+
+    def command_long_send(*args: object) -> None:
+        sent.append(args)
+        bridge._handle_message(
+            SimpleNamespace(
+                get_type=lambda: "HEARTBEAT",
+                base_mode=0,
+                system_status=3,
+                mode="GUIDED",
+            )
+        )
+
+    bridge._connection = SimpleNamespace(
+        mav=SimpleNamespace(command_long_send=command_long_send),
+        mode_mapping=lambda: {"GUIDED": 4, "LOITER": 5},
+    )
+    bridge._connected = True
+
+    assert await bridge.request_mode("guided")
+    assert bridge.get_status().flight_mode == "GUIDED"
+    assert sent[0][2] == 176
+    assert sent[0][4:6] == (1.0, 4.0)
+
+
+@pytest.mark.asyncio
+async def test_pixhawk_setpoint_requires_confirmed_mode_and_fresh_heartbeat(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    sent: list[tuple[object, ...]] = []
+    bridge = MavlinkPixhawkBridge(
+        app_config.pixhawk,
+        app_config.esc.slots,
+        clock=clock,
+        allow_setpoints=True,
+        allow_mode_changes=True,
+    )
+    bridge._connected = True
+    bridge._connection = SimpleNamespace(
+        mav=SimpleNamespace(set_position_target_local_ned_send=lambda *args: sent.append(args))
+    )
+    bridge._mavlink = SimpleNamespace(mavlink=SimpleNamespace(MAV_FRAME_LOCAL_NED=1))
+    bridge._status = replace(
+        bridge._status,
+        connected=True,
+        flight_mode="LOITER",
+        heartbeat_timestamp=clock.monotonic(),
+    )
+
+    wrong_mode = await bridge.send_velocity_setpoint(0.0, 0.0, 0.2, 0.0)
+    assert wrong_mode.code == "PIXHAWK_EXTERNAL_MODE_NOT_CONFIRMED"
+    assert sent == []
+
+    bridge._status = replace(bridge._status, flight_mode="GUIDED")
+    accepted = await bridge.send_velocity_setpoint(0.0, 0.0, 0.2, 0.0)
+    assert accepted.ok
+    assert len(sent) == 1
+
+    clock.advance(app_config.pixhawk.heartbeat_timeout_s + 0.01)
+    stale = await bridge.send_velocity_setpoint(0.0, 0.0, 0.2, 0.0)
+    assert stale.code == "PIXHAWK_HEARTBEAT_STALE"
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_pixhawk_stop_preserves_fresh_pilot_selected_mode(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    bridge = MavlinkPixhawkBridge(
+        app_config.pixhawk,
+        app_config.esc.slots,
+        clock=clock,
+        allow_setpoints=True,
+        allow_mode_changes=True,
+    )
+    bridge._connected = True
+    bridge._setpoint_active = True
+    bridge._external_control_engaged = True
+    bridge._status = replace(
+        bridge._status,
+        connected=True,
+        flight_mode="ALT_HOLD",
+        heartbeat_timestamp=clock.monotonic(),
+    )
+    bridge._connection = SimpleNamespace()
+
+    result = await bridge.stop_external_setpoints()
+
+    assert result.ok
+    assert result.data["pilot_mode_preserved"] is True
+    assert result.data["confirmed_mode"] == "ALT_HOLD"
+    assert not bridge._setpoint_active
+    assert not bridge._external_control_engaged
+
+
+@pytest.mark.asyncio
+async def test_pixhawk_stop_confirms_fallback_before_disabling_stream(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    bridge = MavlinkPixhawkBridge(
+        app_config.pixhawk,
+        app_config.esc.slots,
+        clock=clock,
+        allow_setpoints=True,
+        allow_mode_changes=True,
+        external_control_mode="GUIDED",
+        fallback_mode="LOITER",
+    )
+    mavlink_constants = SimpleNamespace(
+        MAV_CMD_DO_SET_MODE=176,
+        MAV_MODE_FLAG_CUSTOM_MODE_ENABLED=1,
+        MAV_MODE_FLAG_SAFETY_ARMED=128,
+        MAV_STATE_CRITICAL=5,
+    )
+    bridge._mavlink = SimpleNamespace(
+        mavlink=mavlink_constants,
+        mode_string_v10=lambda message: message.mode,
+    )
+
+    def command_long_send(*args: object) -> None:
+        assert args[5] == 5.0
+        bridge._handle_message(
+            SimpleNamespace(
+                get_type=lambda: "HEARTBEAT",
+                base_mode=128,
+                system_status=3,
+                mode="LOITER",
+            )
+        )
+
+    bridge._connection = SimpleNamespace(
+        mav=SimpleNamespace(command_long_send=command_long_send),
+        mode_mapping=lambda: {"GUIDED": 4, "LOITER": 5},
+    )
+    bridge._connected = True
+    bridge._setpoint_active = True
+    bridge._external_control_engaged = True
+    bridge._status = replace(
+        bridge._status,
+        connected=True,
+        armed=True,
+        flight_mode="GUIDED",
+        heartbeat_timestamp=clock.monotonic(),
+    )
+
+    result = await bridge.stop_external_setpoints()
+
+    assert result.ok
+    assert result.data["pilot_mode_preserved"] is False
+    assert result.data["confirmed_mode"] == "LOITER"
+    assert bridge.get_status().flight_mode == "LOITER"
+    assert not bridge._setpoint_active
+
+
+def test_pixhawk_accepts_only_valid_downward_distance_sensor(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    bridge = MavlinkPixhawkBridge(app_config.pixhawk, app_config.esc.slots, clock=clock)
+    bridge._mavlink = SimpleNamespace(mavlink=SimpleNamespace(MAV_SENSOR_ROTATION_PITCH_270=25))
+
+    bridge._handle_message(
+        SimpleNamespace(
+            get_type=lambda: "DISTANCE_SENSOR",
+            orientation=25,
+            current_distance=123,
+            min_distance=20,
+            max_distance=4000,
+            id=7,
+        )
+    )
+    status = bridge.get_status()
+    assert status.ground_distance_m == pytest.approx(1.23)
+    assert status.ground_distance_timestamp == clock.monotonic()
+    assert status.ground_distance_sensor_id == 7
+
+    bridge._handle_message(
+        SimpleNamespace(
+            get_type=lambda: "DISTANCE_SENSOR",
+            orientation=0,
+            current_distance=100,
+            min_distance=20,
+            max_distance=4000,
+            id=8,
+        )
+    )
+    ignored = bridge.get_status()
+    assert ignored.ground_distance_m == pytest.approx(1.23)
+    assert ignored.ground_distance_sensor_id == 7

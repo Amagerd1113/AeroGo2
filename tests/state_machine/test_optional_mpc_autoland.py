@@ -45,7 +45,8 @@ def test_mpc_prepare_command_requires_exact_confirmation_in_flight() -> None:
 
     assert spec.confirmation.level is ConfirmationLevel.EXACT_PHRASE
     assert spec.confirmation.exact_phrase == "CONFIRM_MPC_AUTOLAND"
-    assert spec.permission.allowed_modes == frozenset({RuntimeMode.DRY_RUN})
+    assert spec.permission.allowed_modes == frozenset(RuntimeMode)
+    assert spec.permission.requires_hardware_write
     assert spec.permission.allowed_states == frozenset({SystemState.FLIGHT_MANUAL})
     assert (
         PermissionPolicy()

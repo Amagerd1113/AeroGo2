@@ -15,6 +15,12 @@ def command_specs() -> Tuple[CommandSpec, ...]:
     return (
         readonly("autoland status", "Show automatic landing state", "landing", "query_controller"),
         readonly(
+            "autoland hardware",
+            "Show real-hardware autoland and MPC capability gates",
+            "landing",
+            "query_controller",
+        ),
+        readonly(
             "touchdown status",
             "Show airborne latch and touchdown confirmation progress",
             "landing",
@@ -45,7 +51,7 @@ def command_specs() -> Tuple[CommandSpec, ...]:
             "autoland_prepare",
             capability=CommandPermission.SAFE_CONTROL,
             allowed_states=frozenset({SystemState.FLIGHT_MANUAL}),
-            dry_run_only=True,
+            requires_hardware_write=True,
         ),
         command(
             "autoland prepare mpc",
@@ -62,16 +68,16 @@ def command_specs() -> Tuple[CommandSpec, ...]:
                     "the current automatic-landing attempt."
                 ),
             ),
-            dry_run_only=True,
+            requires_hardware_write=True,
         ),
         command(
             "autoland start",
-            "Start FakePixhawk-only automatic landing output",
+            "Start guarded automatic landing output",
             "landing",
             "autoland_start",
             capability=CommandPermission.SAFE_CONTROL,
             allowed_states=frozenset({SystemState.AUTO_LANDING_READY}),
-            dry_run_only=True,
+            requires_hardware_write=True,
         ),
         command(
             "autoland abort",
@@ -80,7 +86,6 @@ def command_specs() -> Tuple[CommandSpec, ...]:
             "autoland_abort",
             aliases=("abort",),
             capability=CommandPermission.SAFETY_STOP,
-            dry_run_only=True,
         ),
         readonly("controller status", "Show controller status", "landing", "query_controller"),
         readonly("controller timing", "Show controller timing", "landing", "query_controller"),

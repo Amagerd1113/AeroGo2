@@ -71,6 +71,11 @@ class PixhawkStatus:
     landed_state_timestamp: float = 0.0
     vertical_velocity_mps: float = 0.0
     relative_altitude_m: float = 0.0
+    # Downward rangefinder distance is the only hardware source accepted as
+    # height above the landing surface. Relative altitude above Home is not.
+    ground_distance_m: Optional[float] = None
+    ground_distance_timestamp: float = 0.0
+    ground_distance_sensor_id: Optional[int] = None
     roll_rad: float = 0.0
     pitch_rad: float = 0.0
     yaw_rad: float = 0.0

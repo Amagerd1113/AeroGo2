@@ -25,7 +25,7 @@
 | FSM/触地恢复 | ownership 和退出守卫已实现 | 已有硬件 estimator/recovery producer |
 | 真机自动着陆 | 代码级阻断 | 改 YAML 即可开启 |
 
-非 DRY-RUN 自动着陆仍返回 `PHASE_NOT_AVAILABLE`；LowCmd 协同执行仍返回 `COORDINATED_ACTUATION_NOT_CONFIGURED`。这是应保留的 fail-closed 行为。
+普通 SafeDescent 自动着陆已接入带 GUIDED/HEARTBEAT/向下测距守卫的 HW 路径；MPC 真机选择返回 `MPC_HARDWARE_CHAIN_UNAVAILABLE`，LowCmd 协同执行仍返回 `COORDINATED_ACTUATION_NOT_CONFIGURED`。后两项是应保留的 fail-closed 行为。
 
 初步法向配置当前使用 schema v4：v4 增加满足指定 C 的一阶矩闭合与惯量复算，旧 v3 因语义不自洽而明确拒绝，v1/v2 仅保留兼容读取。独立的完整 `impact_aware_mpc` demo/template 使用 schema v3：动力学参考点为 C、腿运动学参考点为 B，旋翼力臂从 C 起算。两个 schema 版本号属于不同 loader，不能混用或静默继承。
 
@@ -313,7 +313,7 @@ X8 诊断脚本固定为 SHA-256 `31c47ecf629400fc07849a9d7dab00892be5b9deccda1e
 
 ### 9.2 P0：接入真实执行前必须补齐
 
-1. 顶层 `landing.mpc_enabled` 仅开放 DRY-RUN 选择能力；每次进入 `FLIGHT_MANUAL` 后仍须执行 `autoland prepare mpc` 并精确确认，状态机才锁存本次 Impact-aware 触地后恢复流程。普通 `autoland prepare` 始终走 legacy，仿真可验证两条路径；但 `HardwareWorld`/simulation 的下降指令仍由 `SafeDescentController` 生成，`AppConfig` 尚未组装 impact production 控制对象；
+1. 顶层 `landing.mpc_enabled` 仍仅开放 MPC 的 DRY-RUN 选择能力；每次进入 `FLIGHT_MANUAL` 后仍须执行 `autoland prepare mpc` 并精确确认，状态机才锁存本次 Impact-aware 触地后恢复流程。普通 `autoland prepare` 始终走 legacy，仿真可验证两条路径；但 `HardwareWorld`/simulation 的下降指令仍由 `SafeDescentController` 生成，`AppConfig` 尚未组装 impact production 控制对象；
 2. 缺真实同步的 LowState/state-estimator/contact/ground/kinematics input builder，以及硬件 landing estimator 和 post-touchdown recovery evidence producer；
 3. 缺闭合并验证的法向执行控制器：至少要定义期望法向力如何变成安全的腿命令，并量化实际响应与 MPC 假设的偏差；
 4. 缺有确定时间上界的 production solver；法向一维离线 SLSQP 不能因算例通过就接入实时链；
@@ -460,7 +460,7 @@ python scripts/validate_aerogo2_offline_prior.py --output output/aerogo2_offline
 
 | 实现层 | 当前真实含义 |
 |---|---|
-| 顶层 runtime | 自动着陆仍是 legacy `SafeDescentController` 的 DRY-RUN 速度 setpoint；硬件模式直接拒绝 |
+| 顶层 runtime | legacy `SafeDescentController` 已有受守卫的 DRY-RUN/HW 速度 setpoint；MPC 硬件模式直接拒绝 |
 | 论文数学 reference | 三维 6-DoF、3D GRF/冲量/摩擦锥、导纳和 SLSQP 均有独立离线实现 |
 | 近期可实施实验模型 | 法向一维动力学 + 标量接触事件；仍是 offline/shadow，尚未接入执行器 |
 

@@ -358,6 +358,8 @@ def test_manual_override_immediately_invalidates_previous_valid_output(
 async def manager_in_autoland(
     app_config: AppConfig,
     clock: ManualClock,
+    *,
+    runtime_mode: RuntimeMode = RuntimeMode.DRY_RUN,
 ) -> Tuple[SystemManager, FakePixhawk, FakeF446, FakeGo2]:
     pixhawk = FakePixhawk(clock=clock)
     f446 = FakeF446(config=app_config.f446, clock=clock)
@@ -369,6 +371,7 @@ async def manager_in_autoland(
         go2=go2,
         landing_controller=SafeDescentController(app_config),
         clock=clock,
+        runtime_mode=runtime_mode,
     )
     assert (await manager.start()).ok
     assert (await manager.connect_all()).ok
@@ -400,6 +403,18 @@ async def manager_in_autoland(
         )
     )
     assert (await manager.request_transform_flight(operator_confirmed=True)).ok
+    if manager.state is SystemState.GO2_JOINT_LOCK_WAIT:
+        go2.inject_status(
+            locomotion_mode="IDLE_STAND",
+            body_velocity=(0.0, 0.0, 0.0),
+            stable=True,
+            standing=True,
+            controller_active=False,
+            fault_code=1002,
+            joints_locked=True,
+        )
+        await manager.tick()
+    assert manager.state is SystemState.FLIGHT_READY
     assert (await manager.authorize_ground_arm()).ok
     manager.accept_rc_status(
         RCStatus(
@@ -416,17 +431,26 @@ async def manager_in_autoland(
     await manager.tick()
     assert manager.state is SystemState.FLIGHT_MANUAL
 
-    manager.accept_landing_estimate(
-        LandingEstimate(
-            valid=True,
-            ground_detected=True,
-            height_m=1.0,
-            vertical_velocity_mps=0.0,
-            horizontal_velocity_mps=0.0,
-            timestamp=clock.monotonic(),
-            reason="valid simulated estimate",
+    if runtime_mode is RuntimeMode.DRY_RUN:
+        manager.accept_landing_estimate(
+            LandingEstimate(
+                valid=True,
+                ground_detected=True,
+                height_m=1.0,
+                vertical_velocity_mps=0.0,
+                horizontal_velocity_mps=0.0,
+                timestamp=clock.monotonic(),
+                reason="valid simulated estimate",
+            )
         )
-    )
+    else:
+        pixhawk.inject_status(
+            ground_distance_m=1.0,
+            ground_distance_timestamp=clock.monotonic(),
+            local_velocity=(0.0, 0.0, 0.0),
+            vertical_velocity_mps=0.0,
+            kinematics_timestamp=clock.monotonic(),
+        )
     manager.accept_rc_status(
         RCStatus(
             connected=True,
@@ -454,6 +478,76 @@ async def manager_in_autoland(
     assert pixhawk.external_setpoints_active
     assert len(pixhawk.setpoint_history) == 1
     return manager, pixhawk, f446, go2
+
+
+@pytest.mark.asyncio
+async def test_hardware_legacy_autoland_enters_confirmed_guided_mode(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    config = replace(
+        app_config,
+        system=replace(
+            app_config.system,
+            dry_run=False,
+            hardware_write_enabled=True,
+        ),
+        landing=replace(
+            app_config.landing,
+            hardware_autoland_enabled=True,
+        ),
+    )
+
+    manager, pixhawk, _, _ = await manager_in_autoland(
+        config,
+        clock,
+        runtime_mode=RuntimeMode.HARDWARE,
+    )
+
+    assert pixhawk.mode_history[-1] == config.landing.hardware_autoland_mode
+    assert pixhawk.external_setpoints_active
+    report = manager.query("autoland hardware")
+    assert report["legacy_autoland_permitted"] is True
+    assert report["mpc_hardware_permitted"] is False
+
+
+@pytest.mark.asyncio
+async def test_hardware_mpc_selection_fails_closed_with_explicit_blockers(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    config = replace(
+        app_config,
+        system=replace(
+            app_config.system,
+            dry_run=False,
+            hardware_write_enabled=True,
+        ),
+        landing=replace(
+            app_config.landing,
+            mpc_enabled=True,
+            hardware_autoland_enabled=True,
+        ),
+    )
+    manager, _, _, _ = await manager_in_autoland(
+        config,
+        clock,
+        runtime_mode=RuntimeMode.HARDWARE,
+    )
+    assert (await manager.abort_autoland("test reset")).ok
+    manager.accept_rc_status(
+        replace(
+            manager.snapshot.rc,
+            auto_landing_request=AutoLandingRequest.AUTO_READY,
+            timestamp=clock.monotonic(),
+        )
+    )
+
+    result = await manager.prepare_mpc_autoland(operator_confirmed=True)
+
+    assert not result.ok
+    assert result.code == "MPC_HARDWARE_CHAIN_UNAVAILABLE"
+    assert "production_pixhawk_residual_endpoint_unavailable" in result.data["blockers"]
 
 
 @pytest.mark.parametrize(
@@ -727,11 +821,14 @@ async def test_non_dry_run_never_issues_any_control_bridge_write(
         await manager.walk_stand(),
         await manager.request_transform_flight(operator_confirmed=True),
         await manager.request_transform_walk(operator_confirmed=True),
+    ):
+        assert result.code == "PHASE_NOT_AVAILABLE"
+    for result in (
         await manager.prepare_autoland(),
         await manager.start_autoland(),
         await manager.update_autoland(),
     ):
-        assert result.code == "PHASE_NOT_AVAILABLE"
+        assert result.code == "HARDWARE_AUTOLAND_DISABLED"
     assert (await manager.stop_transform_motion()).ok
     assert (await manager.stop_supervised()).ok
     await manager._enter_boot_safe(manager.snapshot)

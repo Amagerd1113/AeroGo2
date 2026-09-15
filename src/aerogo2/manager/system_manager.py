@@ -45,6 +45,7 @@ from aerogo2.common.models import (
     TransitionRecord,
     snapshot_to_dict,
 )
+from aerogo2.common.numeric import finite_real
 from aerogo2.common.results import GuardResult, OperationResult
 from aerogo2.landing.controller_base import LandingControllerBase
 from aerogo2.landing.impact_aware.executor import ImpactAwareLowCmdExecutor
@@ -73,6 +74,16 @@ _IMPACT_FORCE_HISTORY_MAX_SAMPLES = 8192
 _IMPACT_FORCE_PEAK_HISTORY_MAX = 512
 _IMPACT_FORCE_QUERY_MAX_SAMPLES = 200
 _IMPACT_FORCE_LOG_PERIOD_S = 0.2
+_MPC_HARDWARE_BLOCKERS = (
+    "cross_device_activation_transaction_unverified",
+    "go2_motor_side_application_ack_unavailable",
+    "continuous_dds_owner_monitor_unavailable",
+    "independent_supervisor_watchdog_unverified",
+    "production_atomic_force_sample_unavailable",
+    "calibrated_normal_force_pipeline_unverified",
+    "normal_force_tracking_error_unvalidated",
+    "production_pixhawk_residual_endpoint_unavailable",
+)
 
 
 class SystemManager:
@@ -272,6 +283,40 @@ class SystemManager:
         return self._runtime_mode is RuntimeMode.DRY_RUN or (
             self._runtime_mode is RuntimeMode.HARDWARE and self.config.system.hardware_write_enabled
         )
+
+    def _hardware_autoland_enabled(self) -> bool:
+        return bool(
+            self._runtime_mode is RuntimeMode.HARDWARE
+            and self.config.system.hardware_write_enabled
+            and self.config.landing.hardware_autoland_enabled
+        )
+
+    def _autoland_runtime_permitted(self) -> bool:
+        return self._runtime_mode is RuntimeMode.DRY_RUN or self._hardware_autoland_enabled()
+
+    def _hardware_autoland_report(self) -> Mapping[str, Any]:
+        standard_blockers: List[str] = []
+        if self._runtime_mode is not RuntimeMode.HARDWARE:
+            standard_blockers.append("runtime_mode_is_not_hardware")
+        if not self.config.system.hardware_write_enabled:
+            standard_blockers.append("system.hardware_write_enabled_is_false")
+        if not self.config.landing.hardware_autoland_enabled:
+            standard_blockers.append("landing.hardware_autoland_enabled_is_false")
+        if not self._snapshot.pixhawk.connected:
+            standard_blockers.append("pixhawk_disconnected")
+        if not self._snapshot.landing_estimate.valid:
+            standard_blockers.append("fresh_downward_rangefinder_or_velocity_unavailable")
+        return {
+            "legacy_autoland_permitted": not standard_blockers,
+            "legacy_blockers": standard_blockers,
+            "external_control_mode": self.config.landing.hardware_autoland_mode,
+            "takeover_mode": self.config.landing.hardware_takeover_mode,
+            "mode_confirm_timeout_s": self.config.landing.hardware_mode_confirm_timeout_s,
+            "current_flight_mode": self._snapshot.pixhawk.flight_mode,
+            "mpc_configured": self.config.landing.mpc_enabled,
+            "mpc_hardware_permitted": False,
+            "mpc_hardware_blockers": list(_MPC_HARDWARE_BLOCKERS),
+        }
 
     async def _on_state_transition(self, record: TransitionRecord) -> None:
         if record.new_state in (
@@ -513,6 +558,9 @@ class SystemManager:
         go2_motion_invalid = len(go2_velocity) != 3 or any(
             not math.isfinite(item) for item in go2_velocity
         )
+        pixhawk_velocity = cast(Tuple[float, float, float], tuple(pixhawk.local_velocity))
+        if pixhawk_velocity == (0.0, 0.0, 0.0) and pixhawk.vertical_velocity_mps != 0.0:
+            pixhawk_velocity = (0.0, 0.0, pixhawk.vertical_velocity_mps)
         pixhawk = replace(
             pixhawk,
             timestamp=pixhawk.heartbeat_timestamp,
@@ -520,11 +568,13 @@ class SystemManager:
             rc_failsafe=pixhawk.rc_failsafe,
             attitude_rpy=(pixhawk.roll_rad, pixhawk.pitch_rad, pixhawk.yaw_rad),
             local_position=(0.0, 0.0, -pixhawk.relative_altitude_m),
-            local_velocity=(0.0, 0.0, pixhawk.vertical_velocity_mps),
+            local_velocity=pixhawk_velocity,
             rc_channels=dict(self._rc.channels),
             esc_rpm={item.slot: item.rpm for item in pixhawk.esc},
             esc_online={item.slot: item.healthy for item in pixhawk.esc},
         )
+        if self._runtime_mode is not RuntimeMode.DRY_RUN:
+            self._estimate = self._hardware_landing_estimate(pixhawk, now)
         firmware_configuration = self._configuration_from_f446(f446)
         configuration: Configuration
         if not f446.connected:
@@ -710,6 +760,56 @@ class SystemManager:
             impact_landing_exit_ready=self._impact_landing_exit_ready,
         )
         return self._snapshot
+
+    def _hardware_landing_estimate(
+        self,
+        pixhawk: Any,
+        now: float,
+    ) -> LandingEstimate:
+        distance = finite_real(pixhawk.ground_distance_m)
+        velocity = tuple(pixhawk.local_velocity)
+        timestamps = (
+            finite_real(pixhawk.ground_distance_timestamp),
+            finite_real(pixhawk.kinematics_timestamp),
+        )
+        fresh = bool(
+            distance is not None
+            and distance > 0.0
+            and len(velocity) == 3
+            and all(finite_real(item) is not None for item in velocity)
+            and all(timestamp is not None and timestamp > 0.0 for timestamp in timestamps)
+            and all(
+                timestamp_is_fresh(
+                    now,
+                    cast(float, timestamp),
+                    self.config.safety.controller_timeout_s,
+                )
+                for timestamp in timestamps
+            )
+            and timestamps_are_coherent(
+                tuple(cast(float, timestamp) for timestamp in timestamps),
+                self.config.safety.touchdown_max_source_skew_s,
+            )
+        )
+        if not fresh:
+            return LandingEstimate(
+                valid=False,
+                ground_detected=False,
+                timestamp=now,
+                reason=(
+                    "fresh downward DISTANCE_SENSOR and GLOBAL_POSITION_INT velocity are required"
+                ),
+            )
+        vx, vy, vz = (float(item) for item in velocity)
+        return LandingEstimate(
+            valid=True,
+            ground_detected=True,
+            height_m=distance,
+            vertical_velocity_mps=vz,
+            horizontal_velocity_mps=math.hypot(vx, vy),
+            timestamp=min(cast(float, timestamp) for timestamp in timestamps),
+            reason=("Pixhawk downward DISTANCE_SENSOR plus GLOBAL_POSITION_INT velocity"),
+        )
 
     def accept_rc_status(self, status: RCStatus) -> None:
         """Accept telemetry produced by RCMonitor; this never sends RC data."""
@@ -3028,10 +3128,19 @@ class SystemManager:
         mpc_selected: bool,
         operator_confirmed: bool = False,
     ) -> OperationResult:
-        if self._runtime_mode is not RuntimeMode.DRY_RUN:
+        if not self._autoland_runtime_permitted():
             return OperationResult.failure(
-                "PHASE_NOT_AVAILABLE",
-                "Phase 1 automatic landing is available only in DRY-RUN",
+                "HARDWARE_AUTOLAND_DISABLED",
+                "Hardware automatic landing requires HARDWARE runtime plus "
+                "system.hardware_write_enabled and landing.hardware_autoland_enabled",
+                data=self._hardware_autoland_report(),
+            )
+        if mpc_selected and self._runtime_mode is not RuntimeMode.DRY_RUN:
+            return OperationResult.failure(
+                "MPC_HARDWARE_CHAIN_UNAVAILABLE",
+                "MPC hardware actuation remains blocked until the flight-controller "
+                "residual endpoint and cross-device execution acknowledgements are present",
+                data={"blockers": list(_MPC_HARDWARE_BLOCKERS)},
             )
         if self.state is not SystemState.FLIGHT_MANUAL:
             return OperationResult.failure(
@@ -3094,10 +3203,11 @@ class SystemManager:
             return await self._start_autoland_unlocked()
 
     async def _start_autoland_unlocked(self) -> OperationResult:
-        if self._runtime_mode is not RuntimeMode.DRY_RUN:
+        if not self._autoland_runtime_permitted():
             return OperationResult.failure(
-                "PHASE_NOT_AVAILABLE",
-                "Phase 1 automatic landing is available only in DRY-RUN",
+                "HARDWARE_AUTOLAND_DISABLED",
+                "Hardware automatic landing is not enabled",
+                data=self._hardware_autoland_report(),
             )
         if self.state is not SystemState.AUTO_LANDING_READY:
             return OperationResult.failure(
@@ -3113,6 +3223,21 @@ class SystemManager:
                 "COORDINATED_ACTUATION_NOT_CONFIGURED",
                 "LowCmd-enabled automatic landing requires an injected, bounded first-policy activation transaction; the legacy velocity-setpoint starter is intentionally blocked",
             )
+        if self._runtime_mode is RuntimeMode.HARDWARE:
+            try:
+                mode_confirmed = await self._pixhawk.request_mode(
+                    self.config.landing.hardware_autoland_mode
+                )
+            except (BridgeError, OSError, RuntimeError, ValueError) as exc:
+                return OperationResult.failure(
+                    "AUTOLAND_MODE_ENTRY_FAILED",
+                    str(exc),
+                )
+            if not mode_confirmed:
+                return OperationResult.failure(
+                    "AUTOLAND_MODE_ENTRY_TIMEOUT",
+                    f"Pixhawk did not confirm {self.config.landing.hardware_autoland_mode}",
+                )
         await self.refresh_snapshot()
         try:
             await self._state_machine.transition_to(
@@ -3121,6 +3246,11 @@ class SystemManager:
                 snapshot=self._snapshot,
             )
         except TransitionRejected as exc:
+            try:
+                await self._stop_setpoints()
+            except (BridgeError, OSError, RuntimeError) as stop_exc:
+                await self._fault("AUTOLAND_MODE_EXIT_FAILED", str(stop_exc))
+                return OperationResult.failure("AUTOLAND_MODE_EXIT_FAILED", str(stop_exc))
             return OperationResult.failure("AUTOLAND_START_REJECTED", str(exc))
         self._autoland_active = True
         self._last_landing_update = None
@@ -3158,10 +3288,11 @@ class SystemManager:
             return await self._update_autoland_unlocked()
 
     async def _update_autoland_unlocked(self) -> OperationResult:
-        if self._runtime_mode is not RuntimeMode.DRY_RUN:
+        if not self._autoland_runtime_permitted():
             return OperationResult.failure(
-                "PHASE_NOT_AVAILABLE",
-                "Phase 1 automatic landing is available only in DRY-RUN",
+                "HARDWARE_AUTOLAND_DISABLED",
+                "Hardware automatic landing authorization was removed",
+                data=self._hardware_autoland_report(),
             )
         if self.state is not SystemState.AUTO_LANDING or not self._autoland_active:
             return OperationResult.failure("AUTOLAND_INACTIVE", "Automatic landing is inactive")
@@ -3178,6 +3309,15 @@ class SystemManager:
                 if not started.ok:
                     return await self._abort_autoland_unlocked(started.message)
             return await self._update_gradual_takeover_unlocked()
+
+        if (
+            self._runtime_mode is RuntimeMode.HARDWARE
+            and self._snapshot.pixhawk.flight_mode.strip().upper()
+            != self.config.landing.hardware_autoland_mode
+        ):
+            return await self._abort_autoland_unlocked(
+                "Pixhawk left the confirmed external-control mode"
+            )
 
         # Revalidate every independently timed landing input before honoring a
         # not-yet-due controller period.  A previous descent setpoint must not
@@ -3256,11 +3396,6 @@ class SystemManager:
                 )
             return await self._abort_autoland_unlocked(command.reason)
         try:
-            if self._runtime_mode is not RuntimeMode.DRY_RUN:
-                return OperationResult.failure(
-                    "PHASE_NOT_AVAILABLE",
-                    "Phase 1 automatic landing is available only in DRY-RUN",
-                )
             setpoint_result = await self._pixhawk.send_velocity_setpoint(
                 command.vx_des,
                 command.vy_des,
@@ -3274,7 +3409,9 @@ class SystemManager:
         self._setpoint_active = True
         self._emit("LANDING_COMMAND", landing_command=command)
         await self.refresh_snapshot()
-        return OperationResult.success("Simulated landing setpoint recorded")
+        return OperationResult.success(
+            "Automatic-landing velocity setpoint accepted by the active runtime"
+        )
 
     def _begin_gradual_takeover(self, reason: str) -> OperationResult:
         command = self._last_landing_command
@@ -3948,6 +4085,8 @@ class SystemManager:
             return self._legacy_query("config")
         if normalized in {"controller status", "autoland status"}:
             return self._legacy_query("controller")
+        if normalized == "autoland hardware":
+            return self._hardware_autoland_report()
         if normalized == "landing impact":
             return self._impact_force_report()
         if normalized == "landing impact history":
@@ -4001,7 +4140,8 @@ class SystemManager:
                 "impact_recovery_required": bool(
                     self._autoland_mpc_selected and self.state is SystemState.AUTO_LANDING
                 ),
-                "hardware_output_available": False,
+                "hardware_output_available": self._hardware_autoland_enabled(),
+                "hardware_readiness": self._hardware_autoland_report(),
                 "takeover": {
                     "active": self._takeover_started_at is not None,
                     "blend_s": self.config.landing.takeover_blend_s,

@@ -52,7 +52,11 @@ class HardwareWorld:
             esc_mavlink_display_shift=config.esc.mavlink_display_shift,
             clock=self.clock,
             rc_timeout_s=config.safety.rc_timeout_s,
-            allow_setpoints=False,
+            allow_setpoints=bool(writes and config.landing.hardware_autoland_enabled),
+            allow_mode_changes=bool(writes and config.landing.hardware_autoland_enabled),
+            external_control_mode=config.landing.hardware_autoland_mode,
+            fallback_mode=config.landing.hardware_takeover_mode,
+            mode_confirm_timeout_s=config.landing.hardware_mode_confirm_timeout_s,
         )
         self.f446 = TextF446Bridge(config.f446, self.clock, allow_motion=writes)
         self.go2_control_arbiter = Go2ControlArbiter(

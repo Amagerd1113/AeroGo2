@@ -138,6 +138,10 @@ _LANDING_KEYS = frozenset(
         "takeover_blend_s",
         "impact_force_window_s",
         "mpc_enabled",
+        "hardware_autoland_enabled",
+        "hardware_autoland_mode",
+        "hardware_takeover_mode",
+        "hardware_mode_confirm_timeout_s",
     }
 )
 _ESC_KEYS = frozenset({"slot_1", "slot_2", "slot_3", "slot_4", "mavlink_display_shift"})
@@ -414,6 +418,10 @@ class LandingConfig:
     takeover_blend_s: float = 0.3
     impact_force_window_s: float = 0.05
     mpc_enabled: bool = False
+    hardware_autoland_enabled: bool = False
+    hardware_autoland_mode: str = "GUIDED"
+    hardware_takeover_mode: str = "LOITER"
+    hardware_mode_confirm_timeout_s: float = 2.5
 
 
 @dataclass(frozen=True)
@@ -1588,6 +1596,22 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
     nonempty_text(landing, "default_abort_mode", "landing.default_abort_mode")
     if "mpc_enabled" in landing:
         boolean(landing, "mpc_enabled", "landing.mpc_enabled")
+    if "hardware_mode_confirm_timeout_s" in landing:
+        finite_number(
+            landing,
+            "hardware_mode_confirm_timeout_s",
+            "landing.hardware_mode_confirm_timeout_s",
+            positive=True,
+        )
+    if "hardware_autoland_enabled" in landing:
+        boolean(
+            landing,
+            "hardware_autoland_enabled",
+            "landing.hardware_autoland_enabled",
+        )
+    for key in ("hardware_autoland_mode", "hardware_takeover_mode"):
+        if key in landing:
+            nonempty_text(landing, key, f"landing.{key}")
 
     slots = [nonempty_text(esc, f"slot_{index}", f"esc.slot_{index}") for index in range(1, 5)]
     if all(item is not None for item in slots):
@@ -1862,6 +1886,16 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
             takeover_blend_s=float(_required(landing, "takeover_blend_s")),
             impact_force_window_s=float(_required(landing, "impact_force_window_s")),
             mpc_enabled=bool(landing.get("mpc_enabled", False)),
+            hardware_autoland_enabled=bool(landing.get("hardware_autoland_enabled", False)),
+            hardware_autoland_mode=str(landing.get("hardware_autoland_mode", "GUIDED"))
+            .strip()
+            .upper(),
+            hardware_takeover_mode=str(landing.get("hardware_takeover_mode", "LOITER"))
+            .strip()
+            .upper(),
+            hardware_mode_confirm_timeout_s=float(
+                landing.get("hardware_mode_confirm_timeout_s", 2.5)
+            ),
         ),
         esc=EscConfig(
             slots={index: _required(esc, f"slot_{index}") for index in range(1, 5)},

@@ -25,6 +25,7 @@ audit f446
 audit pixhawk
 audit rc
 autoland abort
+autoland hardware
 autoland prepare
 autoland prepare mpc
 autoland start
@@ -432,15 +433,12 @@ HARDWARE_ACTUATOR_COMMANDS = (
     "flight authorize",
     "flight revoke",
     "go2 confirm-lock",
-)
-
-DRY_RUN_ONLY_ACTUATOR_COMMANDS = (
     "autoland prepare",
     "autoland prepare mpc",
     "autoland start",
-    "autoland abort",
-    "controller reset",
 )
+
+DRY_RUN_ONLY_ACTUATOR_COMMANDS = ("controller reset",)
 
 PERMITTED_STATE = {
     "transform flight": SystemState.WALK,
@@ -449,6 +447,9 @@ PERMITTED_STATE = {
     "flight authorize": SystemState.FLIGHT_READY,
     "flight revoke": SystemState.FLIGHT_READY,
     "go2 confirm-lock": SystemState.GO2_JOINT_LOCK_WAIT,
+    "autoland prepare": SystemState.FLIGHT_MANUAL,
+    "autoland prepare mpc": SystemState.FLIGHT_MANUAL,
+    "autoland start": SystemState.AUTO_LANDING_READY,
 }
 
 
@@ -499,10 +500,18 @@ def test_real_actuator_commands_allow_explicit_hardware_process_unlock(name: str
 
 
 @pytest.mark.parametrize("name", DRY_RUN_ONLY_ACTUATOR_COMMANDS)
-def test_unimplemented_autoland_outputs_remain_dry_run_only(name: str) -> None:
+def test_remaining_simulation_only_outputs_remain_dry_run_only(name: str) -> None:
     policy = build_registry().get(name).permission
 
     assert policy.allowed_modes == frozenset({RuntimeMode.DRY_RUN})
+
+
+def test_autoland_abort_is_available_as_an_unconfirmed_safety_stop() -> None:
+    spec = build_registry().get("autoland abort")
+
+    assert spec.permission.allowed_modes == frozenset(RuntimeMode)
+    assert not spec.permission.requires_hardware_write
+    assert spec.confirmation.level is ConfirmationLevel.NONE
 
 
 @pytest.mark.parametrize("name", ["stop", "motor stop", "ms", "transform stop", "abort"])

@@ -61,6 +61,10 @@ class MavlinkPixhawkBridge:
         clock: Optional[Clock] = None,
         rc_timeout_s: float = 0.5,
         allow_setpoints: bool = False,
+        allow_mode_changes: bool = False,
+        external_control_mode: str = "GUIDED",
+        fallback_mode: str = "LOITER",
+        mode_confirm_timeout_s: float = 2.5,
     ) -> None:
         self._config = config
         self._esc_mapping = dict(esc_mapping)
@@ -70,12 +74,23 @@ class MavlinkPixhawkBridge:
         self._esc_timeout_s = rc_timeout_s * 2.0
         self._esc_groups: Dict[str, _EscTelemetryGroup] = {}
         self._allow_setpoints = allow_setpoints
+        self._allow_mode_changes = allow_mode_changes
+        self._external_control_mode = external_control_mode.strip().upper()
+        self._fallback_mode = fallback_mode.strip().upper()
+        self._mode_confirm_timeout_s = mode_confirm_timeout_s
+        if not self._external_control_mode or not self._fallback_mode:
+            raise ValueError("Pixhawk external-control and fallback modes must be non-empty")
+        if not math.isfinite(mode_confirm_timeout_s) or mode_confirm_timeout_s <= 0.0:
+            raise ValueError("Pixhawk mode confirmation timeout must be finite and positive")
         self._connection: Optional[Any] = None
         self._mavlink: Optional[Any] = None
         self._reader_task: Optional[asyncio.Task[None]] = None
         self._connected = False
         self._last_rc_timestamp = 0.0
         self._setpoint_active = False
+        self._external_control_engaged = False
+        self._mode_change_lock = asyncio.Lock()
+        self._pending_mode_confirmation: Optional[Tuple[str, asyncio.Future[bool]]] = None
         self._ground_arm_authorized = False
         self._ground_arm_authorization_deadline = 0.0
         # The remote live gate is closed immediately on the first observed
@@ -156,9 +171,14 @@ class MavlinkPixhawkBridge:
         self._connection = None
         self._connected = False
         self._setpoint_active = False
+        self._external_control_engaged = False
         self._ground_arm_authorized = False
         self._ground_arm_authorization_deadline = 0.0
         self._ground_arm_consumed_receipt = False
+        mode_pending = self._pending_mode_confirmation
+        self._pending_mode_confirmation = None
+        if mode_pending is not None and not mode_pending[1].done():
+            mode_pending[1].cancel()
         pending = self._ground_arm_authorization_ack
         self._ground_arm_authorization_ack = None
         if pending is not None and not pending[2].done():
@@ -201,8 +221,62 @@ class MavlinkPixhawkBridge:
         return self.get_status()
 
     async def request_mode(self, mode: str) -> bool:
-        del mode
-        raise BridgeError("Pixhawk mode changes remain assigned to RadioMaster/ArduPilot")
+        clean_mode = mode.strip().upper()
+        if not self._allow_mode_changes:
+            raise BridgeError("Pixhawk mode changes are locked by hardware configuration")
+        if not clean_mode:
+            raise BridgeError("Pixhawk mode name must be non-empty")
+        connection = self._require_connection()
+        mapping = connection.mode_mapping()
+        if not isinstance(mapping, Mapping):
+            raise BridgeError("Pixhawk did not provide an ArduCopter mode mapping")
+        normalized = {str(name).strip().upper(): value for name, value in mapping.items()}
+        if clean_mode not in normalized:
+            raise BridgeError(f"Pixhawk does not advertise flight mode {clean_mode}")
+        now = self._clock.monotonic()
+        status = self.get_status()
+        if (
+            status.flight_mode.strip().upper() == clean_mode
+            and status.heartbeat_timestamp > 0.0
+            and 0.0 <= now - status.heartbeat_timestamp <= self._config.heartbeat_timeout_s
+        ):
+            self._external_control_engaged = clean_mode == self._external_control_mode
+            return True
+
+        async with self._mode_change_lock:
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[bool] = loop.create_future()
+            self._pending_mode_confirmation = (clean_mode, future)
+            mavlink = self._require_mavlink().mavlink
+            try:
+                connection.mav.command_long_send(
+                    self._config.target_system,
+                    self._config.target_component,
+                    mavlink.MAV_CMD_DO_SET_MODE,
+                    0,
+                    float(mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+                    float(normalized[clean_mode]),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+                confirmed = await asyncio.wait_for(
+                    future,
+                    timeout=self._mode_confirm_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                return False
+            except (BridgeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise BridgeError(f"Pixhawk mode request failed: {exc}") from exc
+            finally:
+                pending = self._pending_mode_confirmation
+                if pending is not None and pending[1] is future:
+                    self._pending_mode_confirmation = None
+            if confirmed:
+                self._external_control_engaged = clean_mode == self._external_control_mode
+            return confirmed
 
     async def set_ground_arm_authorization(
         self,
@@ -401,6 +475,22 @@ class MavlinkPixhawkBridge:
             )
         if not all(math.isfinite(item) for item in (vx, vy, vz, yaw_rate)):
             return OperationResult.failure("INVALID_SETPOINT", "Setpoint values must be finite")
+        status = self.get_status()
+        if status.flight_mode.strip().upper() != self._external_control_mode:
+            return OperationResult.failure(
+                "PIXHAWK_EXTERNAL_MODE_NOT_CONFIRMED",
+                f"Expected {self._external_control_mode}, got {status.flight_mode or 'UNKNOWN'}",
+            )
+        heartbeat_age = self._clock.monotonic() - status.heartbeat_timestamp
+        if (
+            status.heartbeat_timestamp <= 0.0
+            or heartbeat_age < 0.0
+            or heartbeat_age > self._config.heartbeat_timeout_s
+        ):
+            return OperationResult.failure(
+                "PIXHAWK_HEARTBEAT_STALE",
+                "A fresh Pixhawk heartbeat is required before every external setpoint",
+            )
         connection = self._require_connection()
         mavlink = self._require_mavlink().mavlink
         type_mask = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10)
@@ -429,8 +519,43 @@ class MavlinkPixhawkBridge:
         return OperationResult.success("Velocity setpoint sent")
 
     async def stop_external_setpoints(self) -> OperationResult:
+        was_active = self._setpoint_active
+        status = self.get_status()
+        current_mode = status.flight_mode.strip().upper()
+        heartbeat_age = self._clock.monotonic() - status.heartbeat_timestamp
+        pilot_mode_is_fresh = bool(
+            current_mode
+            and current_mode != self._external_control_mode
+            and status.heartbeat_timestamp > 0.0
+            and 0.0 <= heartbeat_age <= self._config.heartbeat_timeout_s
+        )
+        needs_fallback = (self._external_control_engaged or was_active) and not pilot_mode_is_fresh
+        if needs_fallback:
+            try:
+                confirmed = await self.request_mode(self._fallback_mode)
+            except (BridgeError, OSError, RuntimeError) as exc:
+                return OperationResult.failure(
+                    "PIXHAWK_FALLBACK_MODE_FAILED",
+                    str(exc),
+                    data={"fallback_mode": self._fallback_mode},
+                )
+            if not confirmed:
+                return OperationResult.failure(
+                    "PIXHAWK_FALLBACK_MODE_TIMEOUT",
+                    f"Pixhawk did not confirm {self._fallback_mode} before setpoint stop",
+                    data={"fallback_mode": self._fallback_mode},
+                )
         self._setpoint_active = False
-        return OperationResult.success("External setpoint stream disabled")
+        self._external_control_engaged = False
+        return OperationResult.success(
+            "Fallback mode confirmed; external setpoint stream disabled",
+            data={
+                "was_active": was_active,
+                "fallback_mode": self._fallback_mode,
+                "pilot_mode_preserved": pilot_mode_is_fresh,
+                "confirmed_mode": current_mode if pilot_mode_is_fresh else self._fallback_mode,
+            },
+        )
 
     async def _reader_loop(self) -> None:
         connection = self._require_connection()
@@ -457,6 +582,9 @@ class MavlinkPixhawkBridge:
             pending = self._ground_arm_authorization_ack
             if pending is not None and not pending[2].done():
                 pending[2].set_exception(BridgeError("Pixhawk reader stopped"))
+            mode_pending = self._pending_mode_confirmation
+            if mode_pending is not None and not mode_pending[1].done():
+                mode_pending[1].set_exception(BridgeError("Pixhawk reader stopped"))
 
     def _request_telemetry(self) -> None:
         connection = self._require_connection()
@@ -466,6 +594,7 @@ class MavlinkPixhawkBridge:
             "MAVLINK_MSG_ID_SYS_STATUS",
             "MAVLINK_MSG_ID_ATTITUDE",
             "MAVLINK_MSG_ID_GLOBAL_POSITION_INT",
+            "MAVLINK_MSG_ID_DISTANCE_SENSOR",
             "MAVLINK_MSG_ID_RC_CHANNELS",
             "MAVLINK_MSG_ID_EXTENDED_SYS_STATE",
             "MAVLINK_MSG_ID_ESC_TELEMETRY_1_TO_4",
@@ -482,7 +611,18 @@ class MavlinkPixhawkBridge:
                     mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
                     0,
                     float(message_id),
-                    100_000.0 if "RC_CHANNELS" in name else 200_000.0,
+                    (
+                        50_000.0
+                        if name
+                        in {
+                            "MAVLINK_MSG_ID_ATTITUDE",
+                            "MAVLINK_MSG_ID_GLOBAL_POSITION_INT",
+                            "MAVLINK_MSG_ID_DISTANCE_SENSOR",
+                        }
+                        else 100_000.0
+                        if "RC_CHANNELS" in name
+                        else 200_000.0
+                    ),
                     0.0,
                     0.0,
                     0.0,
@@ -493,6 +633,13 @@ class MavlinkPixhawkBridge:
                 continue
 
     def _handle_message(self, message: Any) -> None:
+        source_system = getattr(message, "get_srcSystem", None)
+        if callable(source_system):
+            try:
+                if int(source_system()) != self._config.target_system:
+                    return
+            except (TypeError, ValueError):
+                return
         kind = str(message.get_type())
         now = self._clock.monotonic()
         status = self._status
@@ -527,7 +674,10 @@ class MavlinkPixhawkBridge:
                 # Disarm invalidates an unconsumed receipt. A later arm always
                 # requires a new authorization transaction.
                 self._ground_arm_consumed_receipt = False
-            mode = str(mavlink.mode_string_v10(message))
+            mode = str(mavlink.mode_string_v10(message)).strip().upper()
+            pending_mode = self._pending_mode_confirmation
+            if pending_mode is not None and mode == pending_mode[0] and not pending_mode[1].done():
+                pending_mode[1].set_result(True)
             system_status = int(getattr(message, "system_status", 0))
             failsafe = system_status >= int(mavlink.mavlink.MAV_STATE_CRITICAL)
             status = replace(
@@ -540,11 +690,33 @@ class MavlinkPixhawkBridge:
                 timestamp=now,
             )
         elif kind == "COMMAND_ACK":
-            if int(getattr(message, "command", -1)) == _GROUND_ARM_AUTH_COMMAND:
+            command = int(getattr(message, "command", -1))
+            if command == _GROUND_ARM_AUTH_COMMAND:
                 pending = self._ground_arm_authorization_ack
                 sequence = int(getattr(message, "result_param2", 0))
                 if pending is not None and pending[0] == sequence and not pending[2].done():
                     pending[2].set_result(int(getattr(message, "result", -1)))
+            mode_command = getattr(
+                self._require_mavlink().mavlink,
+                "MAV_CMD_DO_SET_MODE",
+                None,
+            )
+            pending_mode = self._pending_mode_confirmation
+            if (
+                mode_command is not None
+                and command == int(mode_command)
+                and pending_mode is not None
+                and not pending_mode[1].done()
+            ):
+                accepted = int(
+                    getattr(
+                        self._require_mavlink().mavlink,
+                        "MAV_RESULT_ACCEPTED",
+                        0,
+                    )
+                )
+                if int(getattr(message, "result", -1)) != accepted:
+                    pending_mode[1].set_result(False)
         elif kind == "ATTITUDE":
             roll = finite_real(getattr(message, "roll", None))
             pitch = finite_real(getattr(message, "pitch", None))
@@ -586,6 +758,39 @@ class MavlinkPixhawkBridge:
                     vy / 100.0,
                     vz / 100.0,
                 ),
+            )
+        elif kind == "DISTANCE_SENSOR":
+            mavlink = self._require_mavlink().mavlink
+            downward = int(
+                getattr(
+                    mavlink,
+                    "MAV_SENSOR_ROTATION_PITCH_270",
+                    25,
+                )
+            )
+            orientation = getattr(message, "orientation", None)
+            current_cm = finite_real(getattr(message, "current_distance", None))
+            minimum_cm = finite_real(getattr(message, "min_distance", None))
+            maximum_cm = finite_real(getattr(message, "max_distance", None))
+            sensor_id = getattr(message, "id", None)
+            if type(orientation) is not int or orientation != downward:
+                return
+            valid = bool(
+                current_cm is not None
+                and minimum_cm is not None
+                and maximum_cm is not None
+                and 0.0 <= minimum_cm <= current_cm <= maximum_cm
+                and current_cm > 0.0
+                and type(sensor_id) is int
+                and sensor_id >= 0
+            )
+            status = replace(
+                status,
+                ground_distance_m=(
+                    current_cm / 100.0 if valid and current_cm is not None else None
+                ),
+                ground_distance_timestamp=now,
+                ground_distance_sensor_id=sensor_id if valid else None,
             )
         elif kind == "EXTENDED_SYS_STATE":
             mavlink = self._require_mavlink().mavlink

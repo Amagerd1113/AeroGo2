@@ -14,3 +14,10 @@ landing:
   # Each flight still requires: autoland prepare mpc + CONFIRM_MPC_AUTOLAND.
   # Real hardware output remains blocked until the production control chain is commissioned.
   mpc_enabled: false
+  # Requires hardware runtime, system.hardware_write_enabled, and a fresh
+  # HEARTBEAT-confirmed mode handshake. MPC hardware output has an additional
+  # flight-controller residual/Go2 atomic-commit gate and remains fail-closed.
+  hardware_autoland_enabled: true
+  hardware_autoland_mode: "GUIDED"
+  hardware_takeover_mode: "LOITER"
+  hardware_mode_confirm_timeout_s: 2.5

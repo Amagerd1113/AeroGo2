@@ -27,9 +27,11 @@ CH1–CH4 任一摇杆超过 deadband 也会立即请求接管。接管事务停
 本次 MPC 选择并返回 `FLIGHT_MANUAL`，不会自动 Disarm。
 
 当前实验主线只使用法向一维模型；未经 N 标定的 Go2 SDK 足力 counts 只用于接触事件。
-状态机开关目前只接通 DRY-RUN 的恢复流程，下降指令仍来自 SafeDescentController；真实多速率
-MPC、Go2 柔顺执行链和 Pixhawk residual 执行端尚未接入。LowCmd owner 默认禁用，正 κ 和
-硬件自动着陆继续 fail closed。当前文件职责、配置、参数及测试边界见
+普通自动降落现可在显式 HW 写入解锁后使用：Pixhawk 必须先通过 HEARTBEAT 回读确认
+GUIDED，向下 DISTANCE_SENSOR 与速度数据必须同时新鲜，每条速度指令前都会复查；接管结束时
+保留飞手已切换的模式，否则先确认 LOITER 再停止外部指令。真实多速率 MPC、Go2 柔顺执行链和
+Pixhawk residual 执行端仍未接入，因此 MPC 真机输出继续 fail closed。当前文件职责、配置、
+参数及测试边界见
 [Impact-Aware 着陆算法当前说明](docs/IMPACT_AWARE_MPC_INTEGRATION_ZH.md)。
 
 <!-- Encoding-damaged duplicate hidden.
@@ -460,12 +462,13 @@ Shell；armed 时必须精确确认。
 - `f446.yaml`
 - `landing.yaml`
 
-`landing.mpc_enabled` 默认为 `false`。设为 `true` 只让 MPC 选项在 DRY-RUN
-可用；它本身不改变任何一次飞行。进入 `FLIGHT_MANUAL` 后执行
+`landing.mpc_enabled` 默认为 `false`；设为 `true` 仍只让 MPC 选项在 DRY-RUN 可选；
+它本身不改变任何一次飞行。进入 `FLIGHT_MANUAL` 后执行
 `autoland prepare mpc` 并输入 `CONFIRM_MPC_AUTOLAND`，才为本次自动着陆锁存
 Impact-aware 触地后恢复门。执行普通 `autoland prepare` 仍使用 legacy 路径。
-该配置和运行时确认都不授权 LowCmd 或任何硬件输出，硬件写权限仍由独立配置和未完成的
-生产验收门控制。
+普通真机自动降落还要求 `landing.hardware_autoland_enabled=true`、HW runtime 和
+`system.hardware_write_enabled=true`。MPC 配置和运行时确认不授权 LowCmd/residual 输出，
+其硬件写权限仍由未完成的生产验收门控制。可用 `autoland hardware` 查看逐项阻断原因。
 
 后加载值覆盖先加载值，include 循环、缺少章节、RC 通道冲突、阈值重叠、
 F446 方向/期望状态冲突、ESC 物理映射冲突、非正超时，以及 Phase 1
