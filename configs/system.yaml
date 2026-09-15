@@ -45,6 +45,8 @@ go2:
     # Read-only LowState observation has a separate gate. It requires only the
     # topic/age and verified coordinate mapping; it never creates rt/lowcmd.
     observe_only_enabled: false
+    # Optional strict JSON calibration; required before landing impact can be shown in N.
+    foot_force_calibration_path: null
     # This switch is the independently gated LowCmd write/ownership path.
     enabled: false
     low_state_topic: null

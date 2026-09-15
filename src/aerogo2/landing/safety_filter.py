@@ -61,6 +61,32 @@ class LandingSafetyFilter:
             timestamp=snapshot.timestamp,
         )
 
+    def apply_takeover(
+        self,
+        candidate: LandingCommand,
+        snapshot: SystemSnapshot,
+        dt: float,
+    ) -> LandingCommand:
+        """Validate a handoff ramp while ignoring only the operator takeover gates."""
+
+        rejection = self._rejection_reason(
+            candidate,
+            snapshot,
+            dt,
+            allow_operator_takeover=True,
+        )
+        if rejection is not None:
+            return self.invalid(snapshot.timestamp, rejection)
+        return LandingCommand(
+            vx_des=candidate.vx_des,
+            vy_des=candidate.vy_des,
+            vz_des=candidate.vz_des,
+            yaw_rate_des=candidate.yaw_rate_des,
+            valid=True,
+            reason=candidate.reason,
+            timestamp=snapshot.timestamp,
+        )
+
     @staticmethod
     def invalid(timestamp: float, reason: str) -> LandingCommand:
         """Return an invalid command whose numerical outputs are all safe zeros."""
@@ -80,6 +106,8 @@ class LandingSafetyFilter:
         candidate: LandingCommand,
         snapshot: SystemSnapshot,
         dt: float,
+        *,
+        allow_operator_takeover: bool = False,
     ) -> Optional[str]:
         if not math.isfinite(snapshot.timestamp):
             return "invalid snapshot timestamp"
@@ -115,9 +143,12 @@ class LandingSafetyFilter:
             return "RC status is unavailable or stale"
         if snapshot.rc.failsafe:
             return "RC failsafe is active"
-        if snapshot.rc.manual_override:
+        if not allow_operator_takeover and snapshot.rc.manual_override:
             return "manual override requested"
-        if snapshot.rc.auto_landing_request is not AutoLandingRequest.AUTO_EXECUTE:
+        if (
+            not allow_operator_takeover
+            and snapshot.rc.auto_landing_request is not AutoLandingRequest.AUTO_EXECUTE
+        ):
             return "CH10 is not AUTO_EXECUTE"
         estimate = snapshot.landing_estimate
         if (
@@ -150,7 +181,12 @@ class LandingSafetyFilter:
             self._config.safety.touchdown_max_source_skew_s,
         ):
             return "Pixhawk and landing-estimator sources are incoherent"
-        if snapshot.active_fault_codes:
+        active_fault_codes = tuple(
+            code
+            for code in snapshot.active_fault_codes
+            if not (allow_operator_takeover and code == "MANUAL_OVERRIDE_REQUESTED")
+        )
+        if active_fault_codes:
             return "active safety faults inhibit automatic landing"
         if not candidate.valid:
             return candidate.reason or "landing candidate is invalid"

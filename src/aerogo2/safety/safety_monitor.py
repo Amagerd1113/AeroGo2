@@ -552,7 +552,7 @@ class SafetyMonitor:
                 "MANUAL_OVERRIDE_REQUESTED",
                 SafetySeverity.WARNING,
                 "RadioMaster manual override was requested.",
-                "Stop external setpoints immediately and return to FLIGHT_MANUAL.",
+                "Run the bounded velocity-setpoint handoff ramp, then return to FLIGHT_MANUAL.",
             )
 
         externally_latched = set(snapshot.active_fault_codes)

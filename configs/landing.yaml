@@ -6,6 +6,8 @@ landing:
   controller_timeout_s: 0.1
   manual_override_deadband_us: 150
   default_abort_mode: "LOITER"
+  # Smoothly ramps the active velocity setpoint to zero before RC handoff.
+  takeover_blend_s: 0.3
   # Makes guarded Impact-Aware/MPC recovery selectable in DRY-RUN.
   # Each flight still requires: autoland prepare mpc + CONFIRM_MPC_AUTOLAND.
   # Real hardware output remains blocked until the production control chain is commissioned.

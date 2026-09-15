@@ -18,6 +18,10 @@ from aerogo2.common.config import AppConfig
 from aerogo2.common.enums import RuntimeMode, SystemState
 from aerogo2.common.models import ImpactLandingRecoveryEvidence, SystemSnapshot
 from aerogo2.common.results import OperationResult
+from aerogo2.landing.impact_aware.go2_foot_force import (
+    Go2FootForceCalibration,
+    load_go2_foot_force_calibration,
+)
 from aerogo2.landing.safe_descent_controller import SafeDescentController
 from aerogo2.manager.system_manager import SystemManager
 from aerogo2.safety.esc_telemetry import assess_esc_telemetry
@@ -35,6 +39,7 @@ class HardwareWorld:
         runtime_mode: RuntimeMode,
         event_logger: Optional[Any] = None,
         impact_recovery_source: Optional[Callable[[], ImpactLandingRecoveryEvidence]] = None,
+        foot_force_calibration: Optional[Go2FootForceCalibration] = None,
     ) -> None:
         if runtime_mode not in (RuntimeMode.HARDWARE, RuntimeMode.HARDWARE_READONLY):
             raise ValueError("HardwareWorld requires a hardware runtime mode")
@@ -68,6 +73,10 @@ class HardwareWorld:
             ground_transfer_verifier=self._verify_go2_ground_transfer,
         )
         self.rc_monitor = RCMonitor(config.rc, self.clock)
+        configured_calibration = foot_force_calibration
+        calibration_path = config.go2.low_level.foot_force_calibration_path
+        if configured_calibration is None and calibration_path is not None:
+            configured_calibration = load_go2_foot_force_calibration(calibration_path)
         self.manager = SystemManager(
             config=config,
             pixhawk=self.pixhawk,
@@ -80,6 +89,7 @@ class HardwareWorld:
             rc_monitor=self.rc_monitor,
             go2_low_level=self.go2_low_level,
             impact_recovery_source=impact_recovery_source,
+            foot_force_calibration=configured_calibration,
         )
         self._impact_recovery_source_bound = impact_recovery_source is not None
 

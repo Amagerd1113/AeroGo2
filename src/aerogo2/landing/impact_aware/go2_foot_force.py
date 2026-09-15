@@ -20,7 +20,8 @@ import math
 from dataclasses import dataclass
 from enum import Enum
 from numbers import Integral, Real
-from typing import Iterable, Tuple, cast
+from pathlib import Path
+from typing import Any, Dict, Iterable, Mapping, Tuple, Union, cast
 
 from aerogo2.common.models import Go2FootForceFeedback
 from aerogo2.landing.impact_aware.types import validate_four_foot_leg_order
@@ -268,6 +269,87 @@ class Go2FootForceCalibration:
         )
 
 
+_CALIBRATION_KEYS = frozenset(
+    {
+        "mapping_version",
+        "mapping_hash",
+        "calibration_version",
+        "calibration_hash",
+        "algorithm_leg_order",
+        "sdk_indices_by_leg",
+        "source",
+        "offsets_sdk_by_algorithm_leg",
+        "scales_n_per_sdk_unit_by_algorithm_leg",
+        "signs_by_algorithm_leg",
+        "maximum_valid_normal_force_n_by_algorithm_leg",
+    }
+)
+
+
+def load_go2_foot_force_calibration(
+    path: Union[str, Path],
+) -> Go2FootForceCalibration:
+    """Load one strict, robot-specific calibration JSON file."""
+
+    source_path = Path(path).resolve()
+    try:
+        if not source_path.is_file():
+            raise Go2FootForceAdapterError(
+                f"foot-force calibration path is not a file: {source_path}"
+            )
+        if source_path.stat().st_size > 65_536:
+            raise Go2FootForceAdapterError("foot-force calibration exceeds 64 KiB")
+        text = source_path.read_text(encoding="utf-8")
+
+        def unique_object(pairs: Iterable[Tuple[str, Any]]) -> Dict[str, Any]:
+            result: Dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise Go2FootForceAdapterError(f"duplicate foot-force calibration key {key!r}")
+                result[key] = value
+            return result
+
+        payload = json.loads(text, object_pairs_hook=unique_object)
+    except Go2FootForceAdapterError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise Go2FootForceAdapterError(
+            f"cannot read foot-force calibration {source_path}: {exc}"
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise Go2FootForceAdapterError("foot-force calibration root must be an object")
+    actual = frozenset(payload)
+    if actual != _CALIBRATION_KEYS:
+        missing = sorted(_CALIBRATION_KEYS - actual)
+        unknown = sorted(actual - _CALIBRATION_KEYS)
+        raise Go2FootForceAdapterError(
+            f"invalid foot-force calibration keys; missing={missing}, unknown={unknown}"
+        )
+    try:
+        source = Go2FootForceSource(payload["source"])
+        return Go2FootForceCalibration(
+            mapping_version=cast(str, payload["mapping_version"]),
+            mapping_hash=cast(str, payload["mapping_hash"]),
+            calibration_version=cast(str, payload["calibration_version"]),
+            calibration_hash=cast(str, payload["calibration_hash"]),
+            algorithm_leg_order=cast(Any, payload["algorithm_leg_order"]),
+            sdk_indices_by_leg=cast(Any, payload["sdk_indices_by_leg"]),
+            source=source,
+            offsets_sdk_by_algorithm_leg=cast(Any, payload["offsets_sdk_by_algorithm_leg"]),
+            scales_n_per_sdk_unit_by_algorithm_leg=cast(
+                Any, payload["scales_n_per_sdk_unit_by_algorithm_leg"]
+            ),
+            signs_by_algorithm_leg=cast(Any, payload["signs_by_algorithm_leg"]),
+            maximum_valid_normal_force_n_by_algorithm_leg=cast(
+                Any, payload["maximum_valid_normal_force_n_by_algorithm_leg"]
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Go2FootForceAdapterError(
+            f"invalid foot-force calibration {source_path}: {exc}"
+        ) from exc
+
+
 @dataclass(frozen=True)
 class CalibratedGo2NormalForceSample:
     """One valid four-foot scalar normal-force observation in algorithm order."""
@@ -388,4 +470,5 @@ __all__ = [
     "calibrate_go2_normal_forces",
     "compute_go2_foot_force_calibration_hash",
     "compute_go2_foot_force_mapping_hash",
+    "load_go2_foot_force_calibration",
 ]

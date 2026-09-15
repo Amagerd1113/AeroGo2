@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import pytest
@@ -12,6 +13,7 @@ from aerogo2.landing.impact_aware.go2_foot_force import (
     calibrate_go2_normal_forces,
     compute_go2_foot_force_calibration_hash,
     compute_go2_foot_force_mapping_hash,
+    load_go2_foot_force_calibration,
 )
 
 
@@ -158,3 +160,42 @@ def test_feedback_dto_rejects_non_int16_and_inconsistent_tick_validity() -> None
         _feedback(source_tick=None, source_tick_valid=True)
     with pytest.raises(ValueError, match="monotonic"):
         _feedback(source_tick=None, source_tick_valid=False, source_tick_monotonic=True)
+
+
+def test_strict_calibration_file_loads_verified_identity(tmp_path) -> None:
+    calibration = _calibration()
+    payload = {
+        "mapping_version": calibration.mapping_version,
+        "mapping_hash": calibration.mapping_hash,
+        "calibration_version": calibration.calibration_version,
+        "calibration_hash": calibration.calibration_hash,
+        "algorithm_leg_order": list(calibration.algorithm_leg_order),
+        "sdk_indices_by_leg": list(calibration.sdk_indices_by_leg),
+        "source": calibration.source.value,
+        "offsets_sdk_by_algorithm_leg": list(calibration.offsets_sdk_by_algorithm_leg),
+        "scales_n_per_sdk_unit_by_algorithm_leg": list(
+            calibration.scales_n_per_sdk_unit_by_algorithm_leg
+        ),
+        "signs_by_algorithm_leg": list(calibration.signs_by_algorithm_leg),
+        "maximum_valid_normal_force_n_by_algorithm_leg": list(
+            calibration.maximum_valid_normal_force_n_by_algorithm_leg
+        ),
+    }
+    path = tmp_path / "force.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_go2_foot_force_calibration(path)
+
+    assert loaded == calibration
+
+
+def test_calibration_file_rejects_duplicate_and_unknown_keys(tmp_path) -> None:
+    duplicate = tmp_path / "duplicate.json"
+    duplicate.write_text('{"mapping_version":"a","mapping_version":"b"}', encoding="utf-8")
+    with pytest.raises(Go2FootForceAdapterError, match="duplicate"):
+        load_go2_foot_force_calibration(duplicate)
+
+    unknown = tmp_path / "unknown.json"
+    unknown.write_text('{"unexpected":1}', encoding="utf-8")
+    with pytest.raises(Go2FootForceAdapterError, match="invalid.*keys"):
+        load_go2_foot_force_calibration(unknown)

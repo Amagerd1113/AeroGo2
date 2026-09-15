@@ -1,0 +1,13 @@
+{
+  "mapping_version": null,
+  "mapping_hash": null,
+  "calibration_version": null,
+  "calibration_hash": null,
+  "algorithm_leg_order": null,
+  "sdk_indices_by_leg": null,
+  "source": null,
+  "offsets_sdk_by_algorithm_leg": null,
+  "scales_n_per_sdk_unit_by_algorithm_leg": null,
+  "signs_by_algorithm_leg": null,
+  "maximum_valid_normal_force_n_by_algorithm_leg": null
+}

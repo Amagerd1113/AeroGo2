@@ -21,12 +21,19 @@ from aerogo2.common.enums import (
 )
 from aerogo2.common.models import (
     F446Status,
+    Go2FootForceFeedback,
     Go2Status,
     LandingCommand,
     LandingEstimate,
     PixhawkStatus,
     RCStatus,
     SystemSnapshot,
+)
+from aerogo2.landing.impact_aware.go2_foot_force import (
+    Go2FootForceCalibration,
+    Go2FootForceSource,
+    compute_go2_foot_force_calibration_hash,
+    compute_go2_foot_force_mapping_hash,
 )
 from aerogo2.landing.safe_descent_controller import SafeDescentController
 from aerogo2.landing.safety_filter import LandingSafetyFilter
@@ -449,17 +456,85 @@ async def manager_in_autoland(
     return manager, pixhawk, f446, go2
 
 
+@pytest.mark.parametrize(
+    ("manual_override", "auto_request"),
+    [
+        (True, AutoLandingRequest.AUTO_EXECUTE),
+        (False, AutoLandingRequest.MANUAL),
+    ],
+)
 @pytest.mark.asyncio
-async def test_manual_override_aborts_setpoints_without_disarming(
+async def test_manual_override_smoothly_reduces_setpoint_before_handoff(
+    app_config: AppConfig,
+    clock: ManualClock,
+    manual_override: bool,
+    auto_request: AutoLandingRequest,
+) -> None:
+    manager, pixhawk, f446, go2 = await manager_in_autoland(app_config, clock)
+    initial_vz = pixhawk.setpoint_history[-1].vz
+    clock.advance(0.02)
+    _refresh_autoland_inputs(manager, pixhawk, f446, go2, clock)
+    manager.accept_rc_status(
+        replace(
+            manager.snapshot.rc,
+            manual_override=manual_override,
+            auto_landing_request=auto_request,
+            timestamp=clock.monotonic(),
+        )
+    )
+
+    await manager.tick()
+
+    assert manager.state is SystemState.AUTO_LANDING
+    assert pixhawk.external_setpoints_active is True
+    assert manager.query("autoland status")["takeover"]["active"] is True
+
+    ramp_vz = []
+    for _ in range(5):
+        clock.advance(0.05)
+        _refresh_autoland_inputs(manager, pixhawk, f446, go2, clock)
+        manager.accept_rc_status(
+            replace(
+                manager.snapshot.rc,
+                manual_override=manual_override,
+                auto_landing_request=auto_request,
+                timestamp=clock.monotonic(),
+            )
+        )
+        await manager.tick()
+        ramp_vz.append(pixhawk.setpoint_history[-1].vz)
+
+    assert manager.state is SystemState.AUTO_LANDING
+    assert all(0.0 <= value <= initial_vz for value in ramp_vz)
+    assert ramp_vz == sorted(ramp_vz, reverse=True)
+    assert ramp_vz[-1] < initial_vz * 0.1
+
+    clock.advance(0.05)
+    _refresh_autoland_inputs(manager, pixhawk, f446, go2, clock)
+    manager.accept_rc_status(
+        replace(
+            manager.snapshot.rc,
+            manual_override=manual_override,
+            auto_landing_request=auto_request,
+            timestamp=clock.monotonic(),
+        )
+    )
+    await manager.tick()
+
+    assert manager.state is SystemState.FLIGHT_MANUAL
+    assert pixhawk.external_setpoints_active is False
+    assert pixhawk.get_status().armed is True
+    assert manager.last_landing_command.valid is False
+
+
+@pytest.mark.asyncio
+async def test_rc_failsafe_still_aborts_gradual_takeover_immediately(
     app_config: AppConfig,
     clock: ManualClock,
 ) -> None:
-    manager, pixhawk, _, _ = await manager_in_autoland(app_config, clock)
+    manager, pixhawk, f446, go2 = await manager_in_autoland(app_config, clock)
     clock.advance(0.02)
-    pixhawk.inject_telemetry_cycle()
-    manager.accept_landing_estimate(
-        replace(manager.snapshot.landing_estimate, timestamp=clock.monotonic())
-    )
+    _refresh_autoland_inputs(manager, pixhawk, f446, go2, clock)
     manager.accept_rc_status(
         replace(
             manager.snapshot.rc,
@@ -469,10 +544,17 @@ async def test_manual_override_aborts_setpoints_without_disarming(
         )
     )
     await manager.tick()
+    assert manager.state is SystemState.AUTO_LANDING
+
+    clock.advance(0.01)
+    _refresh_autoland_inputs(manager, pixhawk, f446, go2, clock)
+    manager.accept_rc_status(
+        replace(manager.snapshot.rc, failsafe=True, timestamp=clock.monotonic())
+    )
+    await manager.tick()
+
     assert manager.state is SystemState.FLIGHT_MANUAL
     assert pixhawk.external_setpoints_active is False
-    assert pixhawk.get_status().armed is True
-    assert manager.last_landing_command.valid is False
 
 
 @pytest.mark.asyncio
@@ -659,3 +741,74 @@ async def test_non_dry_run_never_issues_any_control_bridge_write(
 
     for call in control_calls:
         call.assert_not_awaited()
+
+
+def _test_force_calibration() -> Go2FootForceCalibration:
+    leg_order = ("RR", "LF", "LR", "RF")
+    indices = (0, 1, 2, 3)
+    mapping_hash = compute_go2_foot_force_mapping_hash("test-map-v1", leg_order, indices)
+    source = Go2FootForceSource.RAW_INT16
+    calibration_hash = compute_go2_foot_force_calibration_hash(
+        mapping_hash=mapping_hash,
+        calibration_version="test-cal-v1",
+        source=source,
+        offsets_sdk_by_algorithm_leg=(0.0, 0.0, 0.0, 0.0),
+        scales_n_per_sdk_unit_by_algorithm_leg=(0.5, 0.5, 0.5, 0.5),
+        signs_by_algorithm_leg=(1, 1, 1, 1),
+        maximum_valid_normal_force_n_by_algorithm_leg=(500.0, 500.0, 500.0, 500.0),
+    )
+    return Go2FootForceCalibration(
+        mapping_version="test-map-v1",
+        mapping_hash=mapping_hash,
+        calibration_version="test-cal-v1",
+        calibration_hash=calibration_hash,
+        algorithm_leg_order=leg_order,
+        sdk_indices_by_leg=indices,
+        source=source,
+        offsets_sdk_by_algorithm_leg=(0.0, 0.0, 0.0, 0.0),
+        scales_n_per_sdk_unit_by_algorithm_leg=(0.5, 0.5, 0.5, 0.5),
+        signs_by_algorithm_leg=(1, 1, 1, 1),
+        maximum_valid_normal_force_n_by_algorithm_leg=(500.0, 500.0, 500.0, 500.0),
+    )
+
+
+@pytest.mark.asyncio
+async def test_landing_impact_reports_deduplicated_calibrated_peak(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    manager, _, _, _ = await manager_in_autoland(app_config, clock)
+    manager._foot_force_calibration = _test_force_calibration()
+    first = Go2FootForceFeedback(
+        receipt_timestamp_s=clock.monotonic(),
+        receipt_sequence=1,
+        subscription_generation=1,
+        source_tick=10,
+        source_tick_valid=True,
+        source_tick_monotonic=True,
+        raw_sdk_int16=(10, 20, 30, 40),
+        raw_valid=True,
+    )
+    manager._observe_landing_impact_force(first)
+    manager._observe_landing_impact_force(first)
+    clock.advance(0.01)
+    second = Go2FootForceFeedback(
+        receipt_timestamp_s=clock.monotonic(),
+        receipt_sequence=2,
+        subscription_generation=1,
+        source_tick=11,
+        source_tick_valid=True,
+        source_tick_monotonic=True,
+        raw_sdk_int16=(20, 40, 60, 80),
+        raw_valid=True,
+    )
+    manager._observe_landing_impact_force(second)
+
+    report = manager.query("landing impact")
+    assert report["sample_count"] == 2
+    assert report["latest_sdk_counts"] == (20, 40, 60, 80)
+    assert report["peak_abs_sdk_counts_by_channel"] == (20, 40, 60, 80)
+    assert report["sampled_peak_total_normal_force_n"] == pytest.approx(100.0)
+    assert report["sampled_peak_normal_force_by_leg_n"] == (10.0, 20.0, 30.0, 40.0)
+    assert report["newton_output_available"] is True
+    assert report["calibration_hash"] == _test_force_calibration().calibration_hash

@@ -47,6 +47,11 @@ from aerogo2.common.models import (
 from aerogo2.common.results import GuardResult, OperationResult
 from aerogo2.landing.controller_base import LandingControllerBase
 from aerogo2.landing.impact_aware.executor import ImpactAwareLowCmdExecutor
+from aerogo2.landing.impact_aware.go2_foot_force import (
+    Go2FootForceAdapterError,
+    Go2FootForceCalibration,
+    calibrate_go2_normal_forces,
+)
 from aerogo2.landing.impact_aware.integration import Go2JointPositionCommand
 from aerogo2.landing.safety_filter import LandingSafetyFilter
 from aerogo2.manager.state_machine import StateMachine
@@ -87,6 +92,7 @@ class SystemManager:
         rc_monitor: Optional[RCMonitor] = None,
         go2_low_level: Optional[Go2LowLevelInterface] = None,
         impact_recovery_source: Optional[Callable[[], ImpactLandingRecoveryEvidence]] = None,
+        foot_force_calibration: Optional[Go2FootForceCalibration] = None,
     ) -> None:
         self.config = config
         self._pixhawk = pixhawk
@@ -94,6 +100,7 @@ class SystemManager:
         self._go2 = go2
         self._go2_low_level = go2_low_level
         self._impact_recovery_source = impact_recovery_source
+        self._foot_force_calibration = foot_force_calibration
         self._impact_lowcmd_executor: Optional[ImpactAwareLowCmdExecutor] = None
         # Serialize the background tick against LowCmd ownership transfers.
         # Shell commands are already dispatched serially; this closes the
@@ -157,6 +164,18 @@ class SystemManager:
         self._last_landing_command = LandingCommand(timestamp=now)
         self._last_landing_update: Optional[float] = None
         self._next_landing_update_at: Optional[float] = None
+        self._takeover_started_at: Optional[float] = None
+        self._takeover_start_command: Optional[LandingCommand] = None
+        self._takeover_reason: Optional[str] = None
+        self._impact_force_last_identity: Optional[Tuple[int, int, int]] = None
+        self._impact_force_sample_count = 0
+        self._impact_force_latest_raw: Optional[Tuple[int, int, int, int]] = None
+        self._impact_force_sdk_source: Optional[str] = None
+        self._impact_force_peak_abs_raw: Tuple[int, int, int, int] = (0, 0, 0, 0)
+        self._impact_force_peak_total_n: Optional[float] = None
+        self._impact_force_peak_by_leg_n: Optional[Tuple[float, float, float, float]] = None
+        self._impact_force_peak_timestamp: Optional[float] = None
+        self._impact_force_error: Optional[str] = None
         self._airborne_since: Optional[float] = None
         self._airborne_confirmed = False
         self._touchdown_since: Optional[float] = None
@@ -621,6 +640,7 @@ class SystemManager:
                     landing_session_id=self._impact_landing_session_id,
                     reason=f"impact recovery source failed: {type(exc).__name__}: {exc}",
                 )
+        self._observe_landing_impact_force(low_level.foot_force_feedback)
         if not go2.connected:
             self._operator_joint_lock_confirmed = False
         joint_lock_confirmed = go2.connected and (
@@ -3017,6 +3037,8 @@ class SystemManager:
         self._landing_controller.reset()
         self._last_landing_update = None
         self._next_landing_update_at = None
+        self._reset_gradual_takeover()
+        self._reset_impact_force_report()
         await self.refresh_snapshot()
         try:
             await self._state_machine.transition_to(
@@ -3125,13 +3147,18 @@ class SystemManager:
         if self.state is not SystemState.AUTO_LANDING or not self._autoland_active:
             return OperationResult.failure("AUTOLAND_INACTIVE", "Automatic landing is inactive")
         await self.refresh_snapshot()
-        if (
-            self._snapshot.rc.failsafe
-            or self._snapshot.rc.manual_override
-            or self._snapshot.rc.auto_landing_request is not AutoLandingRequest.AUTO_EXECUTE
-            or self._snapshot.pixhawk.failsafe
-        ):
-            return await self._abort_autoland_unlocked("manual override or flight failsafe")
+        if self._snapshot.rc.failsafe or self._snapshot.pixhawk.failsafe:
+            return await self._abort_autoland_unlocked("flight or RC failsafe")
+        operator_takeover = bool(
+            self._snapshot.rc.manual_override
+            or self._snapshot.rc.auto_landing_request is AutoLandingRequest.MANUAL
+        )
+        if operator_takeover or self._takeover_started_at is not None:
+            if self._takeover_started_at is None:
+                started = self._begin_gradual_takeover("RadioMaster takeover requested")
+                if not started.ok:
+                    return await self._abort_autoland_unlocked(started.message)
+            return await self._update_gradual_takeover_unlocked()
 
         # Revalidate every independently timed landing input before honoring a
         # not-yet-due controller period.  A previous descent setpoint must not
@@ -3230,6 +3257,92 @@ class SystemManager:
         await self.refresh_snapshot()
         return OperationResult.success("Simulated landing setpoint recorded")
 
+    def _begin_gradual_takeover(self, reason: str) -> OperationResult:
+        command = self._last_landing_command
+        if not command.valid:
+            return OperationResult.failure(
+                "AUTOLAND_TAKEOVER_NO_VALID_COMMAND",
+                "No valid automatic-landing command is available for a bounded handoff",
+            )
+        self._takeover_started_at = self._clock.monotonic()
+        self._takeover_start_command = command
+        self._takeover_reason = reason
+        self._emit(
+            "AUTOLAND_TAKEOVER_RAMP_STARTED",
+            takeover_blend_s=self.config.landing.takeover_blend_s,
+            start_command=command,
+        )
+        return OperationResult.success("Gradual RadioMaster takeover started")
+
+    async def _update_gradual_takeover_unlocked(self) -> OperationResult:
+        started_at = self._takeover_started_at
+        start = self._takeover_start_command
+        if started_at is None or start is None:
+            return await self._abort_autoland_unlocked("invalid gradual-takeover state")
+        now = self._clock.monotonic()
+        elapsed = now - started_at
+        if not math.isfinite(elapsed) or elapsed < 0.0:
+            return await self._abort_autoland_unlocked("invalid gradual-takeover clock")
+        if elapsed >= self.config.landing.takeover_blend_s:
+            return await self._abort_autoland_unlocked(
+                self._takeover_reason or "gradual RadioMaster takeover complete"
+            )
+        previous = self._last_landing_update
+        dt = 1.0 / self.config.landing.controller_hz if previous is None else now - previous
+        if not math.isfinite(dt) or dt <= 0.0 or dt > self.config.landing.controller_timeout_s:
+            return await self._abort_autoland_unlocked("gradual-takeover controller timeout")
+        due_at = self._next_landing_update_at
+        if due_at is not None and now + 1e-9 < due_at:
+            return OperationResult.success(
+                "Gradual takeover update is not due yet",
+                data={"next_update_in_s": max(0.0, due_at - now)},
+            )
+        period_s = 1.0 / self.config.landing.controller_hz
+        self._last_landing_update = now
+        self._next_landing_update_at = now + period_s
+        progress = min(max(elapsed / self.config.landing.takeover_blend_s, 0.0), 1.0)
+        remaining = 1.0 - (3.0 * progress * progress - 2.0 * progress * progress * progress)
+        candidate = LandingCommand(
+            vx_des=start.vx_des * remaining,
+            vy_des=start.vy_des * remaining,
+            vz_des=start.vz_des * remaining,
+            yaw_rate_des=start.yaw_rate_des * remaining,
+            valid=True,
+            reason="gradual RadioMaster takeover",
+            timestamp=self._snapshot.timestamp,
+        )
+        command = self._landing_safety_filter.apply_takeover(candidate, self._snapshot, dt)
+        self._last_landing_command = command
+        if not command.valid:
+            return await self._abort_autoland_unlocked(command.reason)
+        try:
+            setpoint_result = await self._pixhawk.send_velocity_setpoint(
+                command.vx_des,
+                command.vy_des,
+                command.vz_des,
+                command.yaw_rate_des,
+            )
+            if not setpoint_result.ok:
+                raise BridgeError(setpoint_result.message)
+        except (BridgeError, OSError, RuntimeError) as exc:
+            return await self._abort_autoland_unlocked(f"takeover setpoint rejected: {exc}")
+        self._setpoint_active = True
+        self._emit(
+            "AUTOLAND_TAKEOVER_RAMP_COMMAND",
+            takeover_progress=progress,
+            landing_command=command,
+        )
+        await self.refresh_snapshot()
+        return OperationResult.success(
+            "Gradual RadioMaster takeover in progress",
+            data={"progress": progress},
+        )
+
+    def _reset_gradual_takeover(self) -> None:
+        self._takeover_started_at = None
+        self._takeover_start_command = None
+        self._takeover_reason = None
+
     async def abort_autoland(self, reason: str = "operator request") -> OperationResult:
         async with self._operation_lock:
             return await self._abort_autoland_unlocked(reason)
@@ -3282,6 +3395,7 @@ class SystemManager:
             return OperationResult.failure("AUTOLAND_ABORT_FAILED", revoke_result.message)
         self._autoland_active = False
         self._next_landing_update_at = None
+        self._reset_gradual_takeover()
         self._reset_impact_landing_completion(new_session=False)
         self._last_landing_command = LandingCommand(
             valid=False, reason=reason, timestamp=self._clock.monotonic()
@@ -3420,17 +3534,20 @@ class SystemManager:
                 "RC_FAILSAFE",
                 "RC_TIMEOUT",
             }
-            takeover = (
+            hard_takeover = (
                 self._snapshot.rc.failsafe
-                or self._snapshot.rc.manual_override
-                or self._snapshot.rc.auto_landing_request is AutoLandingRequest.MANUAL
                 or self._snapshot.pixhawk.failsafe
                 or any(item.code in takeover_codes for item in violations)
             )
-            if takeover:
-                await self._abort_autoland_unlocked(
-                    "manual takeover or automatic-landing input failure"
-                )
+            if hard_takeover:
+                await self._abort_autoland_unlocked("automatic-landing input failure or failsafe")
+                return violations
+            operator_takeover = bool(
+                self._snapshot.rc.manual_override
+                or self._snapshot.rc.auto_landing_request is AutoLandingRequest.MANUAL
+            )
+            if operator_takeover and self.state is SystemState.AUTO_LANDING_READY:
+                await self._abort_autoland_unlocked("RadioMaster takeover before landing start")
                 return violations
 
         if self.state in TRANSFORM_STATES and blocking:
@@ -3812,6 +3929,8 @@ class SystemManager:
             return self._legacy_query("config")
         if normalized in {"controller status", "autoland status"}:
             return self._legacy_query("controller")
+        if normalized == "landing impact":
+            return self._impact_force_report()
         return self._semantic_query(normalized)
 
     def safety_report(self) -> Mapping[str, Any]:
@@ -3862,6 +3981,12 @@ class SystemManager:
                     self._autoland_mpc_selected and self.state is SystemState.AUTO_LANDING
                 ),
                 "hardware_output_available": False,
+                "takeover": {
+                    "active": self._takeover_started_at is not None,
+                    "blend_s": self.config.landing.takeover_blend_s,
+                    "started_at": self._takeover_started_at,
+                },
+                "impact_force": self._impact_force_report(),
                 "last_command": {
                     "vx_des": self._last_landing_command.vx_des,
                     "vy_des": self._last_landing_command.vy_des,
@@ -3872,6 +3997,103 @@ class SystemManager:
                 },
             }
         return {"error": f"unknown query '{name}'"}
+
+    def _reset_impact_force_report(self) -> None:
+        self._impact_force_last_identity = None
+        self._impact_force_sample_count = 0
+        self._impact_force_latest_raw = None
+        self._impact_force_sdk_source = None
+        self._impact_force_peak_abs_raw = (0, 0, 0, 0)
+        self._impact_force_peak_total_n = None
+        self._impact_force_peak_by_leg_n = None
+        self._impact_force_peak_timestamp = None
+        self._impact_force_error = None
+
+    def _observe_landing_impact_force(self, feedback: Any) -> None:
+        if self.state not in (SystemState.AUTO_LANDING, SystemState.TOUCHDOWN_VERIFY):
+            return
+        if not feedback.source_identity_valid or feedback.source_tick is None:
+            self._impact_force_error = "LowState foot-force sample identity is invalid"
+            return
+        identity = (
+            feedback.subscription_generation,
+            feedback.receipt_sequence,
+            feedback.source_tick,
+        )
+        if identity == self._impact_force_last_identity:
+            return
+        self._impact_force_last_identity = identity
+        calibration = self._foot_force_calibration
+        use_estimated = bool(
+            calibration is not None
+            and calibration.source.value == "LOWSTATE_FOOT_FORCE_ESTIMATED_INT16"
+        )
+        raw = (
+            feedback.estimated_sdk_int16
+            if use_estimated and feedback.estimated_valid
+            else feedback.raw_sdk_int16
+            if not use_estimated and feedback.raw_valid
+            else None
+        )
+        if raw is not None:
+            self._impact_force_latest_raw = raw
+            self._impact_force_sdk_source = (
+                "LOWSTATE_FOOT_FORCE_ESTIMATED_INT16"
+                if use_estimated
+                else "LOWSTATE_FOOT_FORCE_RAW_INT16"
+            )
+            self._impact_force_peak_abs_raw = cast(
+                Tuple[int, int, int, int],
+                tuple(
+                    max(self._impact_force_peak_abs_raw[index], abs(raw[index]))
+                    for index in range(4)
+                ),
+            )
+        self._impact_force_sample_count += 1
+        if calibration is None:
+            self._impact_force_error = (
+                "No commissioned calibration loaded; Newton output is unavailable"
+            )
+            return
+        try:
+            sample = calibrate_go2_normal_forces(feedback, calibration)
+        except (Go2FootForceAdapterError, TypeError, ValueError) as exc:
+            self._impact_force_error = str(exc)
+            return
+        total_n = sum(sample.normal_forces_n)
+        if self._impact_force_peak_total_n is None or total_n > self._impact_force_peak_total_n:
+            self._impact_force_peak_total_n = total_n
+            self._impact_force_peak_by_leg_n = sample.normal_forces_n
+            self._impact_force_peak_timestamp = sample.receipt_timestamp_s
+        self._impact_force_error = None
+
+    def _impact_force_report(self) -> Mapping[str, Any]:
+        calibration = self._foot_force_calibration
+        return {
+            "landing_session_id": self._impact_landing_session_id,
+            "sample_count": self._impact_force_sample_count,
+            "latest_sdk_counts": self._impact_force_latest_raw,
+            "sdk_count_source": self._impact_force_sdk_source,
+            "peak_abs_sdk_counts_by_channel": self._impact_force_peak_abs_raw,
+            "calibration_loaded": calibration is not None,
+            "newton_output_available": (
+                calibration is not None and self._impact_force_peak_total_n is not None
+            ),
+            "sampled_peak_total_normal_force_n": self._impact_force_peak_total_n,
+            "sampled_peak_normal_force_by_leg_n": self._impact_force_peak_by_leg_n,
+            "algorithm_leg_order": (
+                calibration.algorithm_leg_order if calibration is not None else None
+            ),
+            "peak_sample_timestamp": self._impact_force_peak_timestamp,
+            "calibration_version": (
+                calibration.calibration_version if calibration is not None else None
+            ),
+            "calibration_hash": (calibration.calibration_hash if calibration is not None else None),
+            "measurement_note": (
+                "Sampled LowState peak; sensor bandwidth may under-read the true instantaneous impact peak"
+            ),
+            "error": self._impact_force_error,
+        }
 
     def _semantic_query(self, name: str) -> Mapping[str, Any]:
         snapshot = snapshot_to_dict(self._snapshot)
@@ -4896,6 +5118,7 @@ class SystemManager:
         self._aborted_impact_touchdown_latched = False
         self._clear_aborted_impact_airborne_dwell()
         self._autoland_active = False
+        self._reset_gradual_takeover()
         completed_mpc_landing = self._autoland_mpc_selected
         self._autoland_mpc_selected = False
         self._emit(

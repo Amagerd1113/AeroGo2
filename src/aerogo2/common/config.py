@@ -135,6 +135,7 @@ _LANDING_KEYS = frozenset(
         "controller_timeout_s",
         "manual_override_deadband_us",
         "default_abort_mode",
+        "takeover_blend_s",
         "mpc_enabled",
     }
 )
@@ -184,6 +185,7 @@ _GO2_LOW_LEVEL_KEYS = frozenset(
     {
         "enabled",
         "observe_only_enabled",
+        "foot_force_calibration_path",
         *_GO2_LOW_LEVEL_ACTUATION_REQUIRED_KEYS,
     }
 )
@@ -323,6 +325,7 @@ class Go2LowLevelConfig:
     firmware_torque_limit_nm: Optional[Tuple[float, ...]] = None
     firmware_torque_clamp_verified: Optional[bool] = None
     temperature_limit_c: Optional[Tuple[float, ...]] = None
+    foot_force_calibration_path: Optional[Path] = None
 
     @property
     def observation_enabled(self) -> bool:
@@ -407,6 +410,7 @@ class LandingConfig:
     controller_timeout_s: float
     manual_override_deadband_us: int
     default_abort_mode: str
+    takeover_blend_s: float = 0.3
     mpc_enabled: bool = False
 
 
@@ -1077,6 +1081,13 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
                     "while LowCmd actuation is enabled"
                 )
 
+    if low_level.get("foot_force_calibration_path") is not None:
+        nonempty_text(
+            low_level,
+            "foot_force_calibration_path",
+            "go2.low_level.foot_force_calibration_path",
+        )
+
     low_state_topic = (
         nonempty_text(low_level, "low_state_topic", "go2.low_level.low_state_topic")
         if low_level.get("low_state_topic") is not None
@@ -1561,6 +1572,7 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
         "maximum_horizontal_speed_mps",
         "maximum_yaw_rate_rad_s",
         "controller_timeout_s",
+        "takeover_blend_s",
     ):
         finite_number(landing, key, f"landing.{key}", positive=True)
     integer(
@@ -1768,6 +1780,11 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
                 firmware_torque_limit_nm=optional_float_tuple("firmware_torque_limit_nm"),
                 firmware_torque_clamp_verified=optional_bool("firmware_torque_clamp_verified"),
                 temperature_limit_c=optional_float_tuple("temperature_limit_c"),
+                foot_force_calibration_path=(
+                    (source.parent / str(low_level["foot_force_calibration_path"])).resolve()
+                    if low_level.get("foot_force_calibration_path") is not None
+                    else None
+                ),
             ),
         ),
         rc=RCConfig(
@@ -1839,6 +1856,7 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
             controller_timeout_s=float(_required(landing, "controller_timeout_s")),
             manual_override_deadband_us=_required(landing, "manual_override_deadband_us"),
             default_abort_mode=_required(landing, "default_abort_mode"),
+            takeover_blend_s=float(_required(landing, "takeover_blend_s")),
             mpc_enabled=bool(landing.get("mpc_enabled", False)),
         ),
         esc=EscConfig(
