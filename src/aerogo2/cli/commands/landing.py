@@ -22,7 +22,13 @@ def command_specs() -> Tuple[CommandSpec, ...]:
         ),
         readonly(
             "landing impact",
-            "Show continuously sampled normal-force peaks",
+            "Show current force, short-window impulse, average, and peaks",
+            "landing",
+            "query_controller",
+        ),
+        readonly(
+            "landing impact history",
+            "Show recent force samples and peak history",
             "landing",
             "query_controller",
         ),

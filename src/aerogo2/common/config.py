@@ -136,6 +136,7 @@ _LANDING_KEYS = frozenset(
         "manual_override_deadband_us",
         "default_abort_mode",
         "takeover_blend_s",
+        "impact_force_window_s",
         "mpc_enabled",
     }
 )
@@ -411,6 +412,7 @@ class LandingConfig:
     manual_override_deadband_us: int
     default_abort_mode: str
     takeover_blend_s: float = 0.3
+    impact_force_window_s: float = 0.05
     mpc_enabled: bool = False
 
 
@@ -1573,6 +1575,7 @@ def _validate_raw(raw: Mapping[str, Any]) -> List[str]:
         "maximum_yaw_rate_rad_s",
         "controller_timeout_s",
         "takeover_blend_s",
+        "impact_force_window_s",
     ):
         finite_number(landing, key, f"landing.{key}", positive=True)
     integer(
@@ -1857,6 +1860,7 @@ def _build_config(source: Path, raw: Mapping[str, Any]) -> AppConfig:
             manual_override_deadband_us=_required(landing, "manual_override_deadband_us"),
             default_abort_mode=_required(landing, "default_abort_mode"),
             takeover_blend_s=float(_required(landing, "takeover_blend_s")),
+            impact_force_window_s=float(_required(landing, "impact_force_window_s")),
             mpc_enabled=bool(landing.get("mpc_enabled", False)),
         ),
         esc=EscConfig(

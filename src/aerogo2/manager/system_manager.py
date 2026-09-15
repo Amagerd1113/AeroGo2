@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections import deque
 from dataclasses import replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
@@ -68,6 +69,10 @@ from aerogo2.safety.safety_monitor import SafetyMonitor
 from aerogo2.safety.watchdog import timestamp_age, timestamp_is_fresh
 
 _GROUND_ARM_AUTHORIZATION_TTL_S = 30.0
+_IMPACT_FORCE_HISTORY_MAX_SAMPLES = 8192
+_IMPACT_FORCE_PEAK_HISTORY_MAX = 512
+_IMPACT_FORCE_QUERY_MAX_SAMPLES = 200
+_IMPACT_FORCE_LOG_PERIOD_S = 0.2
 
 
 class SystemManager:
@@ -177,6 +182,20 @@ class SystemManager:
         self._impact_force_peak_by_leg_n: Optional[Tuple[float, float, float, float]] = None
         self._impact_force_peak_timestamp: Optional[float] = None
         self._impact_force_error: Optional[str] = None
+        self._impact_force_latest_by_leg_n: Optional[Tuple[float, float, float, float]] = None
+        self._impact_force_latest_total_n: Optional[float] = None
+        self._impact_force_window_duration_s = 0.0
+        self._impact_force_window_sample_count = 0
+        self._impact_force_window_total_impulse_ns: Optional[float] = None
+        self._impact_force_window_average_total_n: Optional[float] = None
+        self._impact_force_history: deque[Dict[str, Any]] = deque(
+            maxlen=_IMPACT_FORCE_HISTORY_MAX_SAMPLES
+        )
+        self._impact_force_peak_history: deque[Dict[str, Any]] = deque(
+            maxlen=_IMPACT_FORCE_PEAK_HISTORY_MAX
+        )
+        self._impact_force_last_logged_at: Optional[float] = None
+        self._impact_force_log_error: Optional[str] = None
         self._airborne_since: Optional[float] = None
         self._airborne_confirmed = False
         self._touchdown_since: Optional[float] = None
@@ -3931,6 +3950,8 @@ class SystemManager:
             return self._legacy_query("controller")
         if normalized == "landing impact":
             return self._impact_force_report()
+        if normalized == "landing impact history":
+            return self._impact_force_history_report()
         return self._semantic_query(normalized)
 
     def safety_report(self) -> Mapping[str, Any]:
@@ -4008,6 +4029,16 @@ class SystemManager:
         self._impact_force_peak_by_leg_n = None
         self._impact_force_peak_timestamp = None
         self._impact_force_error = None
+        self._impact_force_latest_by_leg_n = None
+        self._impact_force_latest_total_n = None
+        self._impact_force_window_duration_s = 0.0
+        self._impact_force_window_sample_count = 0
+        self._impact_force_window_total_impulse_ns = None
+        self._impact_force_window_average_total_n = None
+        self._impact_force_history.clear()
+        self._impact_force_peak_history.clear()
+        self._impact_force_last_logged_at = None
+        self._impact_force_log_error = None
 
     def _observe_landing_impact_force(self, feedback: Any) -> None:
         """Continuously accumulate LowState force samples in every system state."""
@@ -4050,22 +4081,116 @@ class SystemManager:
                 ),
             )
         self._impact_force_sample_count += 1
+        record: Dict[str, Any] = {
+            "timestamp": feedback.receipt_timestamp_s,
+            "system_state": self.state.name,
+            "source_tick": feedback.source_tick,
+            "sdk_source": self._impact_force_sdk_source,
+            "sdk_counts": raw,
+            "normal_force_by_leg_n": None,
+            "total_normal_force_n": None,
+            "running_peak_total_normal_force_n": self._impact_force_peak_total_n,
+            "error": None,
+        }
         if calibration is None:
             self._impact_force_error = (
                 "No commissioned calibration loaded; Newton output is unavailable"
             )
+            record["error"] = self._impact_force_error
+            self._record_impact_force_history(record, new_peak=False)
             return
         try:
             sample = calibrate_go2_normal_forces(feedback, calibration)
         except (Go2FootForceAdapterError, TypeError, ValueError) as exc:
             self._impact_force_error = str(exc)
+            record["error"] = self._impact_force_error
+            self._record_impact_force_history(record, new_peak=False)
             return
         total_n = sum(sample.normal_forces_n)
-        if self._impact_force_peak_total_n is None or total_n > self._impact_force_peak_total_n:
+        self._impact_force_latest_by_leg_n = sample.normal_forces_n
+        self._impact_force_latest_total_n = total_n
+        record["normal_force_by_leg_n"] = sample.normal_forces_n
+        record["total_normal_force_n"] = total_n
+        new_peak = (
+            self._impact_force_peak_total_n is None or total_n > self._impact_force_peak_total_n
+        )
+        if new_peak:
             self._impact_force_peak_total_n = total_n
             self._impact_force_peak_by_leg_n = sample.normal_forces_n
             self._impact_force_peak_timestamp = sample.receipt_timestamp_s
+        record["running_peak_total_normal_force_n"] = self._impact_force_peak_total_n
+        if new_peak:
+            self._impact_force_peak_history.append(dict(record))
+        self._record_impact_force_history(record, new_peak=new_peak)
+        self._update_impact_force_window()
         self._impact_force_error = None
+
+    def _record_impact_force_history(
+        self,
+        record: Mapping[str, Any],
+        *,
+        new_peak: bool,
+    ) -> None:
+        stored = dict(record)
+        self._impact_force_history.append(stored)
+        timestamp = float(stored["timestamp"])
+        should_log = bool(
+            new_peak
+            or self._impact_force_last_logged_at is None
+            or timestamp - self._impact_force_last_logged_at >= _IMPACT_FORCE_LOG_PERIOD_S
+        )
+        if not should_log or self._event_logger is None:
+            return
+        try:
+            self._event_logger.emit(
+                event_type=("FOOT_FORCE_PEAK" if new_peak else "FOOT_FORCE_HISTORY_SAMPLE"),
+                system_state=self.state.name,
+                monotonic_timestamp=timestamp,
+                force_record=stored,
+            )
+            self._impact_force_last_logged_at = timestamp
+            self._impact_force_log_error = None
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self._impact_force_log_error = f"{type(exc).__name__}: {exc}"
+
+    def _update_impact_force_window(self) -> None:
+        latest_timestamp = self._impact_force_history[-1]["timestamp"]
+        cutoff = float(latest_timestamp) - self.config.landing.impact_force_window_s
+        samples = [
+            item
+            for item in self._impact_force_history
+            if item["total_normal_force_n"] is not None
+            and cutoff <= float(item["timestamp"]) <= float(latest_timestamp)
+        ]
+        self._impact_force_window_sample_count = len(samples)
+        if not samples:
+            self._impact_force_window_duration_s = 0.0
+            self._impact_force_window_total_impulse_ns = None
+            self._impact_force_window_average_total_n = None
+            return
+        if len(samples) == 1:
+            self._impact_force_window_duration_s = 0.0
+            self._impact_force_window_total_impulse_ns = 0.0
+            self._impact_force_window_average_total_n = float(samples[0]["total_normal_force_n"])
+            return
+        impulse_ns = 0.0
+        for previous, current in zip(samples, samples[1:]):
+            dt_s = float(current["timestamp"]) - float(previous["timestamp"])
+            if not math.isfinite(dt_s) or dt_s <= 0.0:
+                continue
+            impulse_ns += (
+                0.5
+                * (float(previous["total_normal_force_n"]) + float(current["total_normal_force_n"]))
+                * dt_s
+            )
+        duration_s = float(samples[-1]["timestamp"]) - float(samples[0]["timestamp"])
+        self._impact_force_window_duration_s = max(0.0, duration_s)
+        self._impact_force_window_total_impulse_ns = impulse_ns
+        self._impact_force_window_average_total_n = (
+            impulse_ns / duration_s
+            if duration_s > 0.0
+            else float(samples[-1]["total_normal_force_n"])
+        )
 
     def _impact_force_report(self) -> Mapping[str, Any]:
         calibration = self._foot_force_calibration
@@ -4077,6 +4202,15 @@ class SystemManager:
             "sample_count": self._impact_force_sample_count,
             "latest_sdk_counts": self._impact_force_latest_raw,
             "sdk_count_source": self._impact_force_sdk_source,
+            "latest_normal_force_by_leg_n": self._impact_force_latest_by_leg_n,
+            "latest_total_normal_force_n": self._impact_force_latest_total_n,
+            "short_window": {
+                "configured_window_s": self.config.landing.impact_force_window_s,
+                "actual_duration_s": self._impact_force_window_duration_s,
+                "sample_count": self._impact_force_window_sample_count,
+                "total_normal_impulse_ns": self._impact_force_window_total_impulse_ns,
+                "average_total_normal_force_n": self._impact_force_window_average_total_n,
+            },
             "peak_abs_sdk_counts_by_channel": self._impact_force_peak_abs_raw,
             "calibration_loaded": calibration is not None,
             "newton_output_available": (
@@ -4092,10 +4226,35 @@ class SystemManager:
                 calibration.calibration_version if calibration is not None else None
             ),
             "calibration_hash": (calibration.calibration_hash if calibration is not None else None),
+            "history": {
+                "retained_samples": len(self._impact_force_history),
+                "sample_capacity": _IMPACT_FORCE_HISTORY_MAX_SAMPLES,
+                "retained_peak_events": len(self._impact_force_peak_history),
+                "peak_capacity": _IMPACT_FORCE_PEAK_HISTORY_MAX,
+                "persistent_log_period_s": _IMPACT_FORCE_LOG_PERIOD_S,
+                "log_error": self._impact_force_log_error,
+            },
             "measurement_note": (
                 "All-state process-lifetime LowState peak; sensor bandwidth may under-read the true instantaneous impact peak"
             ),
             "error": self._impact_force_error,
+        }
+
+    def _impact_force_history_report(self) -> Mapping[str, Any]:
+        samples = list(self._impact_force_history)[-_IMPACT_FORCE_QUERY_MAX_SAMPLES:]
+        peaks = list(self._impact_force_peak_history)
+        return {
+            "monitoring_scope": "process_lifetime_all_states",
+            "total_retained_samples": len(self._impact_force_history),
+            "returned_samples": len(samples),
+            "samples_truncated_for_query": (len(self._impact_force_history) > len(samples)),
+            "samples": samples,
+            "peak_history": peaks,
+            "units": {
+                "normal_force": "N",
+                "total_normal_impulse": "N*s",
+                "sdk_counts": "uncalibrated integer counts",
+            },
         }
 
     def _semantic_query(self, name: str) -> Mapping[str, Any]:

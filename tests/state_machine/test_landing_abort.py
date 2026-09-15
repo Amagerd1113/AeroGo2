@@ -810,8 +810,21 @@ async def test_landing_impact_reports_deduplicated_calibrated_peak(
     assert report["peak_abs_sdk_counts_by_channel"] == (20, 40, 60, 80)
     assert report["sampled_peak_total_normal_force_n"] == pytest.approx(100.0)
     assert report["sampled_peak_normal_force_by_leg_n"] == (10.0, 20.0, 30.0, 40.0)
+    assert report["latest_normal_force_by_leg_n"] == (10.0, 20.0, 30.0, 40.0)
+    assert report["latest_total_normal_force_n"] == pytest.approx(100.0)
+    assert report["short_window"]["actual_duration_s"] == pytest.approx(0.01)
+    assert report["short_window"]["total_normal_impulse_ns"] == pytest.approx(0.75)
+    assert report["short_window"]["average_total_normal_force_n"] == pytest.approx(75.0)
     assert report["newton_output_available"] is True
     assert report["calibration_hash"] == _test_force_calibration().calibration_hash
+
+    history = manager.query("landing impact history")
+    assert history["total_retained_samples"] == 2
+    assert len(history["samples"]) == 2
+    assert len(history["peak_history"]) == 2
+    assert history["samples"][-1]["total_normal_force_n"] == pytest.approx(100.0)
+    assert history["samples"][-1]["running_peak_total_normal_force_n"] == pytest.approx(100.0)
+    assert history["units"]["total_normal_impulse"] == "N*s"
 
 
 @pytest.mark.asyncio
@@ -861,3 +874,67 @@ async def test_force_monitor_continues_in_flight_manual_and_keeps_prior_peak(
         50.0,
         50.0,
     )
+    assert report["latest_total_normal_force_n"] == pytest.approx(40.0)
+    assert report["short_window"]["total_normal_impulse_ns"] == pytest.approx(1.2)
+    assert report["short_window"]["average_total_normal_force_n"] == pytest.approx(120.0)
+    history = manager.query("landing impact history")
+    assert [item["total_normal_force_n"] for item in history["samples"]] == [
+        200.0,
+        40.0,
+    ]
+    assert [item["running_peak_total_normal_force_n"] for item in history["samples"]] == [
+        200.0,
+        200.0,
+    ]
+    assert len(history["peak_history"]) == 1
+
+
+class _ForceEventRecorder:
+    def __init__(self) -> None:
+        self.records: list[dict[str, object]] = []
+
+    def emit(self, **record: object) -> dict[str, object]:
+        stored = dict(record)
+        self.records.append(stored)
+        return stored
+
+
+@pytest.mark.asyncio
+async def test_new_maximum_is_logged_and_lower_force_never_overwrites_it(
+    app_config: AppConfig,
+    clock: ManualClock,
+) -> None:
+    manager, _, _, _ = await manager_in_autoland(app_config, clock)
+    manager._foot_force_calibration = _test_force_calibration()
+    recorder = _ForceEventRecorder()
+    manager._event_logger = recorder
+
+    for sequence, counts in enumerate(
+        ((100, 100, 100, 100), (20, 20, 20, 20), (120, 120, 120, 120)),
+        start=1,
+    ):
+        clock.advance(0.01)
+        manager._observe_landing_impact_force(
+            Go2FootForceFeedback(
+                receipt_timestamp_s=clock.monotonic(),
+                receipt_sequence=sequence,
+                subscription_generation=1,
+                source_tick=sequence,
+                source_tick_valid=True,
+                source_tick_monotonic=True,
+                raw_sdk_int16=counts,
+                raw_valid=True,
+            )
+        )
+
+    report = manager.query("landing impact")
+    assert report["sampled_peak_total_normal_force_n"] == pytest.approx(240.0)
+    history = manager.query("landing impact history")
+    assert [item["running_peak_total_normal_force_n"] for item in history["samples"]] == [
+        200.0,
+        200.0,
+        240.0,
+    ]
+    peak_records = [item for item in recorder.records if item["event_type"] == "FOOT_FORCE_PEAK"]
+    assert len(peak_records) == 2
+    assert peak_records[-1]["force_record"]["total_normal_force_n"] == pytest.approx(240.0)

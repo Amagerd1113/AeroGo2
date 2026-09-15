@@ -83,6 +83,7 @@ help
 history
 landing compliance
 landing impact
+landing impact history
 touchdown status
 log export
 log mark
